@@ -171,3 +171,12 @@ test("a first pass with no failure before is not flaky", () => {
   const a = carry(null, snap([run(1, "in_progress")]));
   assert.deepEqual(kinds(a, snap([run(1, "completed", "success")])), ["ci.workflow_succeeded:1", "ci.run_all_done"]);
 });
+
+test("run_all_done names the workflows that failed, and only those", () => {
+  const named = (id: number, name: string, status: string, conclusion?: string) => ({ ...run(id, status, conclusion), name });
+  const a = snap([named(1, "CI", "completed", "success"), named(2, "Lint", "in_progress"), named(3, "Audit", "in_progress")]);
+  const b = snap([named(1, "CI", "completed", "success"), named(2, "Lint", "completed", "failure"), named(3, "Audit", "completed", "timed_out")]);
+  assert.deepEqual(diff(a, b).find((c) => c.kind === "ci.run_all_done")?.failedWorkflows, ["Lint", "Audit"]);
+  const c = snap([named(1, "CI", "completed", "success"), named(2, "Lint", "completed", "success"), named(3, "Audit", "completed", "cancelled")]);
+  assert.deepEqual(diff(a, c).find((x) => x.kind === "ci.run_all_done")?.failedWorkflows, [], "a cancelled run is not a failed one");
+});

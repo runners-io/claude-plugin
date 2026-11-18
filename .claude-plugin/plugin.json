@@ -7,7 +7,7 @@
     "name": "runners.io",
     "url": "https://www.runners.io"
   },
-  "homepage": "https://www.runners.io/docs/integrations/claude-code",
+  "homepage": "https://www.runners.io/claude-code",
   "repository": "https://github.com/runners-io/claude-plugin",
   "license": "MIT",
   "keywords": [

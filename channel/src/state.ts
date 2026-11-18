@@ -72,8 +72,12 @@ export interface Change {
   readonly failedJobs?: readonly string[];
   /** For `ci.run_all_done`: failure, cancelled or success, the worst of the runs. */
   readonly conclusion?: string;
+  /** For `ci.run_all_done`: the names of the workflows that failed, in the order GitHub lists them. */
+  readonly failedWorkflows?: readonly string[];
   readonly labelsAdded?: readonly string[];
   readonly labelsRemoved?: readonly string[];
+  /** For `base.red` and `base.green`: every watched PR on that base, the event being about the base, not one PR. */
+  readonly prs?: readonly number[];
   /** For `base.red`: the base branch's failing workflows. */
   readonly failing?: readonly string[];
   /** For `ci.workflow_started`: how many workflows started on this head commit in the same read. */
@@ -161,7 +165,8 @@ export function diff(prev: Snapshot | null, next: Snapshot): Change[] {
     const reported = next.runs.filter((r) => outcome(r.conclusion) !== "ignored");
     const has = (o: Outcome) => reported.some((r) => outcome(r.conclusion) === o);
     const worst = has("failed") ? "failure" : has("needs_approval") ? NEEDS_APPROVAL : has("cancelled") ? "cancelled" : "success";
-    changes.push({ kind: "ci.run_all_done", snapshot: next, conclusion: worst });
+    const failedWorkflows = reported.filter((r) => outcome(r.conclusion) === "failed").map((r) => r.name);
+    changes.push({ kind: "ci.run_all_done", snapshot: next, conclusion: worst, failedWorkflows });
   }
 
   if (next.mergeableState !== "unknown" && next.mergeableState !== prev.mergeableState) {

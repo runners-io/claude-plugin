@@ -69,6 +69,9 @@ async function setup(
     heartbeatMs: opts.heartbeatMs,
     inOwnHistory: opts.inOwnHistory,
     baseEveryMs: opts.baseEveryMs ?? 0,
+    // These tests change a settled PR and expect the next pass to see it; the cadence has its own (cadence*.test.ts).
+    lookEveryMs: () => 0,
+    baseIdleMs: 0,
   });
   const tools = makeTools({ subs, gh: client, readScope: async () => scope.current, eventLog });
   return {
@@ -433,6 +436,33 @@ test("the base branch going red and green again is base.red then base.green, onc
   }
 });
 
+test("two watched PRs on the same base get ONE base.red and ONE base.green, naming both PRs", async () => {
+  const t = await setup();
+  const at = (m: number) => new Date(Date.now() - m * 60_000).toISOString();
+  try {
+    t.gh.setPull("acme/widgets", 7, { base: { ref: "main" } });
+    t.gh.setPull("acme/widgets", 8, { head: { ref: "other", sha: "e".repeat(40) }, base: { ref: "main" } });
+    t.subs.add({ repo: "acme/widgets", pr: 8, source: "tool" });
+    t.gh.setBaseRuns("acme/widgets", "main", [{ id: 1, name: "CI", status: "completed", conclusion: "success", created_at: at(10), updated_at: at(9) }]);
+    await until("both seen", () => t.subs.get("acme/widgets", 7)?.last != null && t.subs.get("acme/widgets", 8)?.last != null);
+    await until("base read", () => t.gh.requests.some((r) => r.path.includes("branch=main")));
+    await settle();
+    t.gh.setBaseRuns("acme/widgets", "main", [{ id: 2, name: "CI", status: "completed", conclusion: "failure", created_at: at(2), updated_at: at(1) }]);
+    await until("red", () => t.kinds().includes("base.red"));
+    t.gh.setBaseRuns("acme/widgets", "main", [{ id: 3, name: "CI", status: "completed", conclusion: "success", created_at: at(0), updated_at: at(0) }]);
+    await until("green", () => t.kinds().includes("base.green"));
+    await settle();
+    assert.equal(t.kinds().filter((k) => k === "base.red").length, 1, "one base.red for the base, not one per PR");
+    assert.equal(t.kinds().filter((k) => k === "base.green").length, 1, "one base.green for the base, not one per PR");
+    const red = t.messages.find((m) => m.meta.kind === "base.red");
+    assert.equal(red?.meta.prs, "7,8");
+    assert.match(red?.content ?? "", /PRs #7 and #8/);
+    assert.equal(t.messages.find((m) => m.meta.kind === "base.green")?.meta.prs, "7,8");
+  } finally {
+    await t.stop();
+  }
+});
+
 
 test("a push that starts many workflows is ONE ci.workflow_started per head commit; the rest are logged as collapsed", async () => {
   const t = await setup();
@@ -454,7 +484,7 @@ test("a push that starts many workflows is ONE ci.workflow_started per head comm
     ]);
     await until("the late one logged", () => t.records.some((r) => r.type === "event" && r.run_id === 54));
     const started = t.messages.filter((m) => m.meta.kind === "ci.workflow_started");
-    assert.equal(started.length, 1, "8 events for one push was the noise of 2026-11-18");
+    assert.equal(started.length, 1, "one push is one started event, not one per workflow");
     assert.match(started[0].content, /3 workflows/);
     assert.equal(started[0].meta.workflows, "3");
     const collapsed = t.records.filter((r) => r.type === "event" && r.kind === "ci.workflow_started" && r.reason === "collapsed");

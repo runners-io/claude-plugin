@@ -68,6 +68,7 @@ async function run(sessions: number, rounds: number) {
           await woken;
         },
         baseEveryMs: 60_000,
+        now: () => t,
       }),
     );
   }

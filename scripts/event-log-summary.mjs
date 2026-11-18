@@ -7,7 +7,7 @@
 //   - the channel processes (sessions) that wrote, and when each last spoke;
 //   - events per kind, as sent / filtered (the subscription did not want it) / error;
 //   - latency per kind, from GitHub's own time to the push: median and worst;
-//   - API errors, setup problems, and the requests made (200s cost rate limit, 304s do not);
+//   - API errors, setup problems, and the requests made (200s cost rate limit, 304s do not), per session per hour;
 //   - gaps: a live process silent for more than --gap-minutes (default 12; it writes a heartbeat every 5).
 // With --github it also asks GitHub, with the same gh login, what happened on every pull request the log
 // says was watched, and lists as a MISS each failed workflow run and each close or merge that GitHub shows
@@ -83,6 +83,7 @@ for (const r of records) {
 const gaps = [];
 let minRate = null;
 const requests = {};
+const perHour = {};
 for (const s of sessions.values()) {
   let prev = null;
   for (const r of s.records) {
@@ -96,6 +97,30 @@ for (const s of sessions.values()) {
       if (r.requests) requests[s.session] = r.requests;
     }
   }
+  const rate = requestsPerHour(s.records.filter((r) => r.type === "heartbeat" && r.requests));
+  if (rate) perHour[s.session] = rate;
+}
+
+/**
+ * What one session asked GitHub per hour, from the running totals its heartbeats carry. The totals are the
+ * process's own, so a channel restarted inside the session starts again from zero: a total lower than the one
+ * before it is counted from zero, not as a negative. Answers read from the shared store are not requests.
+ */
+function requestsPerHour(beats) {
+  if (beats.length < 2) return null;
+  const total = (q) => (q.ok ?? 0) + (q.not_modified ?? 0) + (q.other ?? 0);
+  let requests = 0;
+  let counted = 0;
+  for (let i = 1; i < beats.length; i++) {
+    const a = beats[i - 1].requests;
+    const b = beats[i].requests;
+    const reset = total(b) < total(a) || (b.ok ?? 0) < (a.ok ?? 0);
+    requests += reset ? total(b) : total(b) - total(a);
+    counted += reset ? (b.ok ?? 0) : (b.ok ?? 0) - (a.ok ?? 0);
+  }
+  const hours = (Date.parse(beats.at(-1).t) - Date.parse(beats[0].t)) / 3_600_000;
+  if (hours <= 0) return null;
+  return { requests, counted, hours: Math.round(hours * 100) / 100, per_hour: Math.round((requests / hours) * 10) / 10 };
 }
 
 // ---- events, latency, errors
@@ -144,7 +169,7 @@ const summary = {
   problems,
   send_errors: sendErrors,
   gaps,
-  api: { min_rate_remaining: minRate, requests_by_session: requests },
+  api: { min_rate_remaining: minRate, requests_by_session: requests, requests_per_hour: perHour },
   github,
 };
 const findings = gaps.length + sendErrors.length + Object.keys(problems).length + (github?.misses.length ?? 0);
@@ -317,6 +342,10 @@ function text(s) {
   }
   out.push(`API: lowest rate limit left ${s.api.min_rate_remaining ?? "unknown"}`);
   for (const [session, r] of Object.entries(s.api.requests_by_session)) out.push(`  ${session}: ${r.ok} counted, ${r.not_modified} free (304), ${r.other} other`);
+  out.push("GitHub requests per hour, per session (a quiet PR should stay under 30, a busy one under 150):");
+  for (const [session, r] of Object.entries(s.api.requests_per_hour)) {
+    out.push(`  ${session}: ${r.per_hour} requests/hour (${r.requests} in ${r.hours} h; ${r.counted} counted against the rate limit)${r.per_hour > 150 ? "  OVER 150" : ""}`);
+  }
   out.push(`API errors: ${Object.keys(s.errors).length ? Object.entries(s.errors).map(([k, v]) => `${k} x${v}`).join("; ") : "none"}`);
   out.push(`setup problems: ${Object.keys(s.problems).length ? Object.entries(s.problems).map(([k, v]) => `${k} x${v}`).join("; ") : "none"}`);
   out.push(`events that could not be sent: ${s.send_errors.length}`);

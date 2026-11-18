@@ -2,7 +2,7 @@
 
 // src/shared.ts
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -20,6 +20,7 @@ function log(message) {
 }
 
 // src/shared.ts
+var STORE_FORMAT = 1;
 var LEASE_MS = 3e4;
 var PRUNE_MS = 24 * 60 * 6e4;
 function defaultSharedRoot(env = process.env) {
@@ -27,9 +28,12 @@ function defaultSharedRoot(env = process.env) {
 }
 var SharedStore = class {
   root;
+  uid;
   logins = /* @__PURE__ */ new Map();
-  constructor(root) {
+  /** `uid` is the user the folders must belong to: this process's, unless a test says otherwise. */
+  constructor(root, options = {}) {
     this.root = root;
+    this.uid = options.uid ?? process.getuid?.();
   }
   /** The file name a request path is stored under. */
   keyFor(path) {
@@ -37,22 +41,50 @@ var SharedStore = class {
   }
   /** The store for one login, or null when it cannot be used (the session then asks GitHub itself). */
   forLogin(apiBase, token) {
-    const id = createHash("sha256").update(`${apiBase}
-${token}`).digest("hex").slice(0, 20);
+    const id = `v${STORE_FORMAT}-${createHash("sha256").update(`${apiBase}
+${token}`).digest("hex").slice(0, 20)}`;
     if (this.logins.has(id)) return this.logins.get(id) ?? null;
     let store = null;
     try {
       const dir = join(this.root, id);
-      mkdirSync(dir, { recursive: true, mode: 448 });
+      mkdirSync(this.root, { recursive: true, mode: 448 });
+      this.mustBeMine(this.root);
+      try {
+        mkdirSync(dir, { mode: 448 });
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+      }
+      this.mustBeMine(dir);
       chmodSync(this.root, 448);
       chmodSync(dir, 448);
       store = new LoginStore(dir, (path) => this.keyFor(path));
       store.prune(Date.now());
+      this.pruneLogins(id, Date.now());
     } catch (error) {
       log(`the shared store cannot be used, so this session asks GitHub itself: ${error.message}`);
     }
     this.logins.set(id, store);
     return store;
+  }
+  /** Throws unless `dir` is a real folder (not a symlink) owned by this user. */
+  mustBeMine(dir) {
+    const s = lstatSync(dir);
+    if (s.isSymbolicLink() || !s.isDirectory()) throw new Error(`${dir} is not a plain folder`);
+    if (this.uid !== void 0 && s.uid !== this.uid) throw new Error(`${dir} belongs to another user`);
+  }
+  /** Deletes the other logins' folders (and any old format's) in which nothing has been written for a day. */
+  pruneLogins(keep, now) {
+    for (const name of readdirSync(this.root)) {
+      if (name === keep || !/^v\d+-[0-9a-f]{20}$|^[0-9a-f]{20}$/.test(name)) continue;
+      const dir = join(this.root, name);
+      try {
+        const s = lstatSync(dir);
+        if (!s.isDirectory() || s.isSymbolicLink() || this.uid !== void 0 && s.uid !== this.uid) continue;
+        const newest = Math.max(s.mtimeMs, ...readdirSync(dir).map((f) => lstatSync(join(dir, f)).mtimeMs));
+        if (now - newest > PRUNE_MS) rmSync(dir, { recursive: true, force: true });
+      } catch {
+      }
+    }
   }
 };
 var LoginStore = class {
@@ -605,6 +637,27 @@ function startMcp(opts) {
   };
 }
 
+// src/cadence.ts
+var PENDING_MS = 6e4;
+var FINISHED_MS = 12e4;
+var FINISHED_MAX_MS = 3e5;
+var PENDING_WINDOW_MS = 5 * 6e4;
+var RUNS_EVERY_MS = 10 * 6e4;
+var RUNNING = /* @__PURE__ */ new Set(["queued", "in_progress"]);
+function phaseOf(s, headSeenAt, now) {
+  if (s.state !== "open") return "finished";
+  if (s.runs.some((r) => RUNNING.has(r.status))) return "running";
+  if (s.runs.some((r) => r.status !== "completed")) return "pending";
+  if (s.mergeableState === "unknown") return "pending";
+  if (s.runs.length === 0 && now - headSeenAt < PENDING_WINDOW_MS) return "pending";
+  return "finished";
+}
+function lookEveryMs(phase, pollMs, quietLooks) {
+  if (phase === "running") return pollMs;
+  if (phase === "pending") return Math.max(pollMs, PENDING_MS);
+  return Math.max(pollMs, Math.min(FINISHED_MAX_MS, FINISHED_MS * 1.5 ** quietLooks));
+}
+
 // src/state.ts
 var EVENT_KINDS = [
   "ci.workflow_started",
@@ -686,7 +739,8 @@ function diff(prev, next) {
     const reported = next.runs.filter((r) => outcome(r.conclusion) !== "ignored");
     const has = (o) => reported.some((r) => outcome(r.conclusion) === o);
     const worst = has("failed") ? "failure" : has("needs_approval") ? NEEDS_APPROVAL : has("cancelled") ? "cancelled" : "success";
-    changes.push({ kind: "ci.run_all_done", snapshot: next, conclusion: worst });
+    const failedWorkflows = reported.filter((r) => outcome(r.conclusion) === "failed").map((r) => r.name);
+    changes.push({ kind: "ci.run_all_done", snapshot: next, conclusion: worst, failedWorkflows });
   }
   if (next.mergeableState !== "unknown" && next.mergeableState !== prev.mergeableState) {
     if (next.mergeableState === "dirty") changes.push({ kind: "pr.conflict", snapshot: next });
@@ -777,7 +831,7 @@ function toMessage(c) {
       content = `CI is waiting for approval: "${workflow}" on ${at} is held for a deployment review. A person must approve it on GitHub; do not try to approve it yourself. ${runUrl}`;
       break;
     case "ci.run_all_done":
-      content = `All CI workflows finished on ${at}: ${clean(c.conclusion, 30) || "finished"}. ${prUrl}`;
+      content = `All CI workflows finished on ${at}: ${clean(c.conclusion, 30) || "finished"}${jobs(c.failedWorkflows) ? `, failed: ${jobs(c.failedWorkflows)}` : ""}. ${prUrl}`;
       break;
     case "pr.conflict":
       content = `PR #${s.pr}${branch ? ` (${branch})` : ""} has a merge conflict with its base branch. ${prUrl}`;
@@ -815,7 +869,7 @@ function toMessage(c) {
       break;
     case "base.red": {
       const base = clean(s.baseRef, 60) || "the base branch";
-      content = `The base branch ${base} is red: failing ${jobs(c.failing) || "workflows"}. A failure on PR #${s.pr} may be ${base}'s, not the PR's: check ${base} before changing code, and do not merge while it is red. ${baseLink(s)}`;
+      content = `The base branch ${base} is red: failing ${jobs(c.failing) || "workflows"}. A failure on ${prList(c.prs, s.pr)} may be ${base}'s, not the PR's: check ${base} before changing code, and do not merge while it is red. ${baseLink(s)}`;
       break;
     }
     case "base.green":
@@ -835,9 +889,16 @@ function toMessage(c) {
   add("labels_added", labelList(c.labelsAdded));
   add("labels_removed", labelList(c.labelsRemoved));
   add("failing", jobs(c.failing));
+  add("failed", jobs(c.failedWorkflows));
+  add("prs", (c.prs ?? []).filter((n) => Number.isInteger(n) && n > 0).slice(0, 20).join(","));
   add("base", c.failing || c.kind === "base.green" ? clean(s.baseRef, 100) : "");
   if (c.workflows) meta.workflows = String(c.workflows);
   return { content: content.trim(), meta };
+}
+function prList(prs, fallback) {
+  const list = (prs?.length ? prs : [fallback]).slice(0, 10).map((n) => `#${n}`);
+  if (list.length === 1) return `PR ${list[0]}`;
+  return `PRs ${list.slice(0, -1).join(", ")} and ${list.at(-1)}`;
 }
 function labelList(names) {
   return (names ?? []).map((n) => clean(n, 40)).filter(Boolean).slice(0, 10).join(", ");
@@ -969,13 +1030,16 @@ var Subscriptions = class {
 };
 
 // src/poller.ts
-async function fetchSnapshot(gh, repo, pr) {
+async function fetchSnapshot(gh, repo, pr, reuseRunsOf = null) {
   const pull = await gh.getPull(repo, pr);
   if (pull.kind !== "ok") return pull;
   const p = pull.value;
   const state = p.merged ? "merged" : p.state === "closed" ? "closed" : "open";
   let runs = [];
-  if (state === "open" && p.headSha) {
+  const unchanged = reuseRunsOf !== null && reuseRunsOf.headSha === p.headSha && reuseRunsOf.updatedAt === p.updatedAt && p.updatedAt !== void 0;
+  if (state === "open" && p.headSha && unchanged) {
+    runs = reuseRunsOf.runs;
+  } else if (state === "open" && p.headSha) {
     const r = await gh.runsForSha(repo, p.headSha);
     if (r.kind !== "ok") return r;
     runs = r.value;
@@ -1049,6 +1113,13 @@ async function runPoller(deps) {
     }
   };
   const baseEveryMs = deps.baseEveryMs ?? 6e4;
+  const baseIdleMs = Math.max(baseEveryMs, deps.baseIdleMs ?? 6e5);
+  const now = deps.now ?? Date.now;
+  const lookEvery = deps.lookEveryMs ?? lookEveryMs;
+  const looks = /* @__PURE__ */ new Map();
+  let findLabel = "";
+  let findSince = 0;
+  let foundAt = Number.NEGATIVE_INFINITY;
   const bases = /* @__PURE__ */ new Map();
   let saidProblem = null;
   let lastScope = "";
@@ -1074,7 +1145,8 @@ async function runPoller(deps) {
     for (const key of bases.keys()) if (!targets.has(key)) bases.delete(key);
     for (const [key, entries] of targets) {
       const known = bases.get(key);
-      if (known && Date.now() - known.readAt < baseEveryMs) continue;
+      const busy = entries.some((e) => looks.get(e.key)?.phase !== "finished");
+      if (known && now() - known.readAt < (busy ? baseEveryMs : baseIdleMs)) continue;
       const first = entries[0];
       const base = first.last?.baseRef;
       const r = await gh.baseRuns(first.repo, base, baseEveryMs);
@@ -1083,13 +1155,16 @@ async function runPoller(deps) {
         continue;
       }
       const v = baseVerdict(r.value);
-      bases.set(key, { red: v.red, readAt: Date.now() });
+      bases.set(key, { red: v.red, readAt: now() });
       if (!known || known.red === v.red) continue;
-      for (const e of entries) {
-        if (!e.last) continue;
-        const change = { kind: v.red ? "base.red" : "base.green", snapshot: e.last, failing: v.failing, ...v.at ? { at: v.at } : {} };
-        await send(toMessage(change), change, wants(e, change.kind));
-      }
+      const kind = v.red ? "base.red" : "base.green";
+      const seen = entries.filter((e) => e.last !== null);
+      const wanting = seen.filter((e) => wants(e, kind));
+      const about = wanting[0] ?? seen[0];
+      if (!about?.last) continue;
+      const prs = [...new Set((wanting.length ? wanting : seen).map((e) => e.pr))].sort((a, b) => a - b);
+      const change = { kind, snapshot: about.last, failing: v.failing, prs, ...v.at ? { at: v.at } : {} };
+      await send(toMessage(change), change, wanting.length > 0);
     }
   };
   while (!signal.aborted) {
@@ -1110,7 +1185,18 @@ async function runPoller(deps) {
         lastScope = label2;
       }
       let current = null;
-      if (scope.repo && scope.branch) {
+      if (label2 !== findLabel) {
+        findLabel = label2;
+        findSince = now();
+        foundAt = Number.NEGATIVE_INFINITY;
+      }
+      const repo = scope.repo?.toLowerCase();
+      const watched = subs.list().some((e) => e.source === "auto" && e.repo.toLowerCase() === repo && e.last?.state === "open" && e.last.headRef === scope.branch);
+      const findEvery = now() - findSince < 5 * 6e4 ? lookEvery("pending", 0, 0) : lookEvery("finished", 0, 99);
+      if (scope.repo && scope.branch && (watched || now() - foundAt < findEvery)) {
+        current = "keep";
+      } else if (scope.repo && scope.branch) {
+        foundAt = now();
         const found = await gh.findOpenPull(scope.repo, scope.branch);
         if (found.kind === "auth") {
           await problem(found.auth);
@@ -1133,9 +1219,13 @@ async function runPoller(deps) {
         }
       }
     }
+    for (const key of looks.keys()) if (!subs.list().some((e) => e.key === key)) looks.delete(key);
     for (const entry of subs.list()) {
       if (signal.aborted) break;
-      const r = await fetchSnapshot(gh, entry.repo, entry.pr);
+      const look = looks.get(entry.key);
+      if (look && now() < look.next) continue;
+      const reuse = look?.phase === "finished" && now() - look.runsReadAt < RUNS_EVERY_MS ? entry.last : null;
+      const r = await fetchSnapshot(gh, entry.repo, entry.pr, reuse);
       if (r.kind === "auth") {
         await problem(r.auth);
         break;
@@ -1189,6 +1279,14 @@ async function runPoller(deps) {
         await send(toMessage(full), full);
       }
       if (first && live.source === "auto" && needsAttention(snap)) await send(currentState(snap), null);
+      {
+        const t = now();
+        const headSeenAt = look && look.headSha === snap.headSha ? look.headSeenAt : t;
+        const phase = phaseOf(snap, headSeenAt, t);
+        const quiet2 = changes.length === 0 && look?.phase === "finished" && phase === "finished" ? look.quiet + 1 : 0;
+        const runsReadAt = look && reuse !== null && snap.runs === reuse.runs ? look.runsReadAt : t;
+        looks.set(entry.key, { next: t + lookEvery(phase, config.pollSeconds * 1e3, quiet2), quiet: quiet2, phase, headSha: snap.headSha, headSeenAt, runsReadAt });
+      }
       live.last = carry(live.last, snap);
       if (snap.state !== "open") unsubscribe(live, snap.state);
     }

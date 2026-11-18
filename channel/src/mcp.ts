@@ -14,7 +14,7 @@
  *   v2.1.234 read `false` as declared (channels-reference, "Server options").
  *
  * THE PROTOCOL IS PINNED below revision 2026-07-28. On Claude Code's v2 MCP
- * client a channel server that negotiates 2026-07-28 is not registered as a
+ * client a channel server that negotiates revision 2026-07-28 is not registered as a
  * channel, because that revision cannot carry channel messages (mcp.md, "Push
  * messages with channels"). `MCP_PROTOCOL_NEGOTIATION=legacy` fixes that from
  * the CLIENT side, which a plugin cannot set for the user; answering
@@ -28,7 +28,7 @@ import type { ChannelMessage } from "./format.ts";
 import { log } from "./log.ts";
 import type { ToolHost } from "./tools.ts";
 
-/** Newest first. 2026-07-28 is deliberately absent. */
+/** Newest first. Revision 2026-07-28 is deliberately absent. */
 export const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"] as const;
 
 export function chooseProtocol(requested: unknown): string {

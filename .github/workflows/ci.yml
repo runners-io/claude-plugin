@@ -44,6 +44,9 @@ jobs:
           npm run build
           git diff --exit-code --stat -- dist/
 
+      - name: zsh, so the claude-gh detection is tested against a real zsh (macOS's default shell)
+        run: command -v zsh || { sudo apt-get update -qq && sudo apt-get install -y -qq zsh; }
+
       - name: Tests (Node 24)
         working-directory: channel
         run: npm test

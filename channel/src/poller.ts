@@ -11,8 +11,13 @@
  * - RATE LIMITS: an unchanged resource costs nothing (ETags, github.ts); the
  *   interval stretches fourfold when fewer than 200 requests are left this
  *   hour, and a rate-limit answer is waited out.
+ * - EACH PR HAS ITS OWN CADENCE (cadence.ts): every pass while its CI runs,
+ *   up to five minutes once it has settled. The branch's PR is looked for only
+ *   while none is watched, and a base branch is read every minute only while
+ *   one of its PRs is busy.
  */
 import type { Config } from "./config.ts";
+import { type Phase, RUNS_EVERY_MS, lookEveryMs, phaseOf } from "./cadence.ts";
 import { type ChannelMessage, clean, describe, scopeMessage, setupMessage, toMessage } from "./format.ts";
 import type { GitScope } from "./git.ts";
 import { type EventLog, NO_EVENT_LOG } from "./eventlog.ts";
@@ -22,13 +27,20 @@ import { baseVerdict } from "./rules.mjs";
 import { type Change, type EventKind, type Snapshot, carry, diff, needsAttention } from "./state.ts";
 import { type Entry, type Subscriptions, wants } from "./subscriptions.ts";
 
-export async function fetchSnapshot(gh: GitHubClient, repo: string, pr: number): Promise<ApiResult<Snapshot>> {
+/**
+ * The PR and its head's runs. `reuseRunsOf`: a snapshot whose runs stand in for a fresh read when the PR has not
+ * changed since (same head, same updated time), so a settled PR costs one request a look, not two.
+ */
+export async function fetchSnapshot(gh: GitHubClient, repo: string, pr: number, reuseRunsOf: Snapshot | null = null): Promise<ApiResult<Snapshot>> {
   const pull = await gh.getPull(repo, pr);
   if (pull.kind !== "ok") return pull;
   const p = pull.value;
   const state = p.merged ? "merged" : p.state === "closed" ? "closed" : "open";
   let runs: Snapshot["runs"] = [];
-  if (state === "open" && p.headSha) {
+  const unchanged = reuseRunsOf !== null && reuseRunsOf.headSha === p.headSha && reuseRunsOf.updatedAt === p.updatedAt && p.updatedAt !== undefined;
+  if (state === "open" && p.headSha && unchanged) {
+    runs = reuseRunsOf.runs;
+  } else if (state === "open" && p.headSha) {
     const r = await gh.runsForSha(repo, p.headSha);
     if (r.kind !== "ok") return r;
     runs = r.value;
@@ -73,8 +85,14 @@ export interface PollerDeps {
    * Asked only for PRs in the session's own repository.
    */
   readonly inOwnHistory?: (sha: string) => Promise<boolean | null>;
-  /** How often each watched base branch is read; a minute by default. Its result changes all day on a busy main. */
+  /** How often each watched base branch is read while one of its PRs is busy; a minute by default. */
   readonly baseEveryMs?: number;
+  /** How often a base branch is read while all its PRs have settled; ten minutes by default. */
+  readonly baseIdleMs?: number;
+  /** Test seam: the clock the cadence runs on. */
+  readonly now?: () => number;
+  /** Test seam: how often a PR in a phase is looked at (cadence.ts); `() => 0` looks at every PR every pass. */
+  readonly lookEveryMs?: (phase: Phase, pollMs: number, quietLooks: number) => number;
 }
 
 function realSleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -137,6 +155,14 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
     }
   };
   const baseEveryMs = deps.baseEveryMs ?? 60_000;
+  const baseIdleMs = Math.max(baseEveryMs, deps.baseIdleMs ?? 600_000);
+  const now = deps.now ?? Date.now;
+  const lookEvery = deps.lookEveryMs ?? lookEveryMs;
+  /** Per watched PR: when it is next looked at, and what the cadence needs to know. */
+  const looks = new Map<string, { next: number; quiet: number; phase: Phase; headSha: string; headSeenAt: number; runsReadAt: number }>();
+  let findLabel = "";
+  let findSince = 0;
+  let foundAt = Number.NEGATIVE_INFINITY;
   const bases = new Map<string, { red: boolean; readAt: number }>();
   let saidProblem: GhProblem["kind"] | null = null;
   let lastScope = "";
@@ -165,7 +191,8 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
     for (const key of bases.keys()) if (!targets.has(key)) bases.delete(key);
     for (const [key, entries] of targets) {
       const known = bases.get(key);
-      if (known && Date.now() - known.readAt < baseEveryMs) continue;
+      const busy = entries.some((e) => looks.get(e.key)?.phase !== "finished");
+      if (known && now() - known.readAt < (busy ? baseEveryMs : baseIdleMs)) continue;
       const first = entries[0];
       const base = first.last?.baseRef as string;
       const r = await gh.baseRuns(first.repo, base, baseEveryMs);
@@ -174,13 +201,18 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
         continue;
       }
       const v = baseVerdict(r.value);
-      bases.set(key, { red: v.red, readAt: Date.now() });
+      bases.set(key, { red: v.red, readAt: now() });
       if (!known || known.red === v.red) continue;
-      for (const e of entries) {
-        if (!e.last) continue;
-        const change: Change = { kind: v.red ? "base.red" : "base.green", snapshot: e.last, failing: v.failing, ...(v.at ? { at: v.at } : {}) };
-        await send(toMessage(change), change, wants(e, change.kind));
-      }
+      // ONE event per base and transition, naming every watched PR on it: it is about the base, and one per PR
+      // said "main is green again" once for each.
+      const kind = v.red ? "base.red" : "base.green";
+      const seen = entries.filter((e) => e.last !== null);
+      const wanting = seen.filter((e) => wants(e, kind));
+      const about = wanting[0] ?? seen[0];
+      if (!about?.last) continue;
+      const prs = [...new Set((wanting.length ? wanting : seen).map((e) => e.pr))].sort((a, b) => a - b);
+      const change: Change = { kind, snapshot: about.last, failing: v.failing, prs, ...(v.at ? { at: v.at } : {}) };
+      await send(toMessage(change), change, wanting.length > 0);
     }
   };
 
@@ -205,7 +237,20 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
         lastScope = label;
       }
       let current: string | null = null;
-      if (scope.repo && scope.branch) {
+      if (label !== findLabel) {
+        findLabel = label;
+        findSince = now();
+        foundAt = Number.NEGATIVE_INFINITY;
+      }
+      // The branch's PR is looked for only while none is watched: every minute for five minutes after a branch
+      // change, then every five. A watched one that merges or closes is unwatched below, and the looking resumes.
+      const repo = scope.repo?.toLowerCase();
+      const watched = subs.list().some((e) => e.source === "auto" && e.repo.toLowerCase() === repo && e.last?.state === "open" && e.last.headRef === scope.branch);
+      const findEvery = now() - findSince < 5 * 60_000 ? lookEvery("pending", 0, 0) : lookEvery("finished", 0, 99);
+      if (scope.repo && scope.branch && (watched || now() - foundAt < findEvery)) {
+        current = "keep";
+      } else if (scope.repo && scope.branch) {
+        foundAt = now();
         const found = await gh.findOpenPull(scope.repo, scope.branch);
         if (found.kind === "auth") {
           await problem(found.auth);
@@ -231,9 +276,13 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       }
     }
 
+    for (const key of looks.keys()) if (!subs.list().some((e) => e.key === key)) looks.delete(key);
     for (const entry of subs.list()) {
       if (signal.aborted) break;
-      const r = await fetchSnapshot(gh, entry.repo, entry.pr);
+      const look = looks.get(entry.key);
+      if (look && now() < look.next) continue;
+      const reuse = look?.phase === "finished" && now() - look.runsReadAt < RUNS_EVERY_MS ? entry.last : null;
+      const r = await fetchSnapshot(gh, entry.repo, entry.pr, reuse);
       if (r.kind === "auth") {
         await problem(r.auth);
         break;
@@ -295,6 +344,14 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
         await send(toMessage(full), full);
       }
       if (first && live.source === "auto" && needsAttention(snap)) await send(currentState(snap), null);
+      {
+        const t = now();
+        const headSeenAt = look && look.headSha === snap.headSha ? look.headSeenAt : t;
+        const phase = phaseOf(snap, headSeenAt, t);
+        const quiet = changes.length === 0 && look?.phase === "finished" && phase === "finished" ? look.quiet + 1 : 0;
+        const runsReadAt = look && reuse !== null && snap.runs === reuse.runs ? look.runsReadAt : t;
+        looks.set(entry.key, { next: t + lookEvery(phase, config.pollSeconds * 1000, quiet), quiet, phase, headSha: snap.headSha, headSeenAt, runsReadAt });
+      }
       live.last = carry(live.last, snap);
       if (snap.state !== "open") unsubscribe(live, snap.state);
     }

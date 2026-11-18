@@ -172,3 +172,28 @@ test("no log at all is 'could not evaluate' (exit 2), never an all-clear", async
   assert.equal(r.code, 2);
   assert.match(r.stdout + r.stderr, /no records/);
 });
+
+test("requests per hour, per session: what each session asked GitHub between its heartbeats, a restart's reset included", async () => {
+  const req = (ok, nm, other = 0, shared = 0) => ({ requests: { ok, not_modified: nm, other, shared } });
+  const dir = writeLog([
+    { ...base, t: ago(130), type: "start", version: "0.2.0" },
+    beat(120, req(2, 8)),
+    beat(60, req(10, 40)), // +8 counted, +32 free in the first hour
+    // the channel restarted inside the same session: its counters began again at zero
+    beat(30, req(1, 4)),
+    beat(0.5, req(3, 12, 1, 50)), // +5 +20 +1 since the restart; 50 served from the shared store cost nothing
+    { session: "quiet", project: "/w/other", t: ago(90), type: "heartbeat", subscriptions: 1, rate_remaining: 4000, ...req(0, 1) },
+    { session: "quiet", project: "/w/other", t: ago(30), type: "heartbeat", subscriptions: 1, rate_remaining: 4000, ...req(0, 10) },
+  ]);
+  const r = await run(["--dir", dir, "--since", "24h", "--json"]);
+  const s = JSON.parse(r.stdout);
+  const per = s.api.requests_per_hour;
+  // s1: 8+32 + 1+4 (the restart's first reading) + 2+8+1 = 56 requests over 119.5 minutes
+  assert.equal(per.s1.requests, 56);
+  assert.equal(per.s1.counted, 8 + 1 + 2);
+  assert.equal(per.s1.hours, 1.99);
+  assert.equal(per.s1.per_hour, 28.1);
+  assert.equal(per.quiet.per_hour, 9);
+  const text = (await run(["--dir", dir, "--since", "24h"])).stdout;
+  assert.match(text, /s1: 28\.1 requests\/hour \(56 in 1\.99 h; 11 counted against the rate limit\)/);
+});

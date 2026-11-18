@@ -55,11 +55,16 @@ claude --dangerously-load-development-channels plugin:runners-io@runners-io
 Claude Code shows a warning first. Choose **I am using this for local development** to continue. Neither flag
 appears in `claude --help` during the preview, and both work anyway.
 
-**A shorter command: `claude-gh`.** Ask Claude to run `/runners-io:setup-github`. After asking you, it adds a separate
+**A shorter command: `claude-gh`.** While you have no `claude-gh`, Claude offers to set it up at the start of each
+session; say yes, or run `/runners-io:setup-github` yourself. After asking you, it adds a separate
 `claude-gh` command to your shell's rc file (zsh, bash or fish), between `# >>> runners.io claude channel >>>` and
 `# <<< runners.io claude channel <<<` markers, so it can be taken out exactly. `claude` itself is unchanged. Then
 `claude-gh` starts a session with the channel on, and `claude-gh --resume <session id>` reopens one with it on. Until
-the plugin is on the allowlist, `claude-gh` uses the development flag, so the warning shows at every launch.
+the plugin is on the allowlist, `claude-gh` uses the development flag, so the warning shows at every launch. To
+tell whether you have one, the plugin asks your own shell (zsh, bash or fish), which runs your shell's startup
+files, so a `claude-gh` you defined yourself anywhere they read counts. Once found, that is remembered for a day, so
+your shell is not started at every launch. On Windows or another shell it never offers. Set `RUNNERS_IO_NO_CLAUDE_GH_OFFER=1` if you
+never want the offer.
 
 Without either flag, the tools and the hook still load, but nothing is pushed: Claude can call `ci_status` to read a
 pull request's state on demand. **The plugin tells you so at launch**, in one line with the command that relaunches
@@ -126,7 +131,7 @@ CI failed: "CI" on PR #123 (fix-login @ 3f2a9c1), failed jobs: lint, test-unit. 
 | `ci.workflow_started` | CI starts on a new head commit: one event per push, with how many workflows started (`workflows`); further starts on the same commit, re-runs included, are logged but not sent |
 | `ci.workflow_succeeded`, `ci.workflow_failed`, `ci.workflow_cancelled` | a run finishes (failed covers failure, timed out and startup failure) |
 | `ci.approval_waiting` | a run waits for an environment's required reviewers, or a fork's run waits for a maintainer to approve it |
-| `ci.run_all_done` | every run for the head commit has finished: one summary, with the worst result |
+| `ci.run_all_done` | every run for the head commit has finished: one summary, with the worst result and, in `failed`, the workflows that failed |
 | `pr.conflict`, `pr.conflict_resolved` | the pull request starts or stops conflicting with its base branch |
 | `pr.merged`, `pr.closed` | the pull request is merged or closed; the channel stops watching it |
 | `ci.current_state` | once, when the automatic watch starts on a pull request that is already failing, waiting or conflicted |
@@ -135,11 +140,20 @@ CI failed: "CI" on PR #123 (fix-login @ 3f2a9c1), failed jobs: lint, test-unit. 
 | `pr.labels_changed` | labels were added or removed (the names are sent, cleaned) |
 | `pr.ready_for_review`, `pr.converted_to_draft` | the pull request left or entered draft |
 | `pr.body_edited` | the description changed; only the fact is sent, never the text |
-| `base.red`, `base.green` | the base branch's latest push runs turned red, or green again; read once a minute |
+| `base.red`, `base.green` | the base branch's latest push runs turned red, or green again: one event per base, naming every watched pull request on it in `prs`; read once a minute while one of them is busy, every 10 minutes otherwise |
 
-The channel looks at GitHub every 20 seconds per watched pull request. It sends GitHub the previous answer's ETag,
-and GitHub does not count an unchanged answer against your hourly API limit. When fewer than 200 requests are left in
-the hour, it looks four times less often.
+How often the channel looks at a watched pull request depends on what it is doing:
+
+| the pull request | looked at |
+|---|---|
+| CI running | every 20 seconds |
+| a run waiting for approval, a push whose CI has not started yet, or a merge check GitHub is still computing | every minute |
+| everything finished | after 2 minutes, then a little less often each time nothing has changed, down to every 5 minutes; its runs are read again only when the PR changes, or every 10 minutes for a re-run |
+
+So a push to a settled pull request is seen within 5 minutes, and from then on every 20 seconds until its CI finishes.
+A quiet pull request costs about 24 GitHub requests an hour. The channel sends GitHub the previous answer's ETag, and
+GitHub does not count an unchanged answer against your hourly API limit. When fewer than 200 requests are left in the
+hour, it looks four times less often.
 
 ## What is sent, and what is never sent
 
@@ -176,6 +190,17 @@ line of the event log and of the channel's own log goes through a redaction of G
 headers first, which `channel/test/secrets.test.ts` and `channel/test/eventlog.test.ts` check. The events sent to
 Claude are built from named fields of GitHub's answers and never include it.
 
+**What it keeps on your disk.** So that several Claude Code sessions watching the same pull request ask GitHub once
+between them, the channel keeps a small cache in `~/.cache/runners-io` (or `$XDG_CACHE_HOME/runners-io`). It holds no
+token and no pull-request text, but it does hold names from your repositories: repository, branch, workflow, job and
+label names, head commits, links to GitHub and CI results, plus each answer's ETag and the rate limit left. So:
+
+- the folder is `0700` and every file `0600`, with one folder per GitHub login, so two logins never share;
+- the channel refuses a cache folder that is a symlink or belongs to another user, and asks GitHub directly instead;
+- a login's folder in which nothing has been written for a day is deleted, with everything in it.
+
+Delete the folder whenever you like: the next look at GitHub rebuilds what it needs.
+
 **What the development-channels flag allows.** During the research preview, Claude Code loads only allowlisted
 channels unless it is started with `--dangerously-load-development-channels plugin:runners-io@<marketplace>`. That flag
 lifts the allowlist **for this one entry** and nothing else: it does not turn off permission prompts, it does not
@@ -184,7 +209,9 @@ Enterprise plans, an admin can instead approve this plugin in `allowedChannelPlu
 before you choose either.
 
 **What the plugin runs on your machine.** `gh auth token`, `git` (to read the folder's remote, branch and commits),
-`ps` (to see whether the session was started with the channel flag), and `node`. Each is started with a fixed list of
+`ps` (to see whether the session was started with the channel flag), `node`, and, once at the start of a session,
+your own shell as a login shell to ask whether `claude-gh` exists (`$SHELL -lic 'command -v claude-gh'`; fish:
+`type -q claude-gh`), stopped after 4 seconds; whatever it started in the background is stopped with it. Each is started with a fixed list of
 arguments, never through a shell with text from GitHub, and nothing from an event is ever run or evaluated. The
 setup-github skill edits your shell's rc file only after asking you, and shows the lines first.
 
@@ -196,7 +223,8 @@ These are read from the environment you start Claude Code from. None is needed.
 
 | variable | default | what it does |
 |---|---|---|
-| `RUNNERS_IO_POLL_SECONDS` | `20` | seconds between looks at GitHub, 5 to 300 |
+| `RUNNERS_IO_NO_CLAUDE_GH_OFFER` | unset | `1`: Claude never offers to set up `claude-gh` at the start of a session |
+| `RUNNERS_IO_POLL_SECONDS` | `20` | seconds between looks at a pull request whose CI is running, 5 to 300; the slower looks are never shorter than this |
 | `RUNNERS_IO_RATE_FLOOR` | `200` | below this many GitHub requests left in the hour, look four times less often. Raise it when the same `gh` login also drives other tools |
 | `RUNNERS_IO_EVENT_LOG_DIR` | off | an absolute directory for the event log (below) |
 

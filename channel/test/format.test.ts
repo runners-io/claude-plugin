@@ -131,3 +131,12 @@ test("a branch name goes into a suggested command only when it is plain: a fork 
     for (const bad of ["$(", "`", ";rm", "|b", "&&", ">b"]) assert.equal(text.includes(bad), false, `${evil}: ${text}`);
   }
 });
+
+test("run_all_done says which workflows failed, in the text and as failed=", () => {
+  const m = toMessage({ ...failed, kind: "ci.run_all_done", run: undefined, failedJobs: undefined, conclusion: "failure", failedWorkflows: ["Lint", 'Audit"><x'] });
+  assert.match(m.content, /^All CI workflows finished on PR #123 \(fix-login @ 0123456\): failure, failed: Lint, Audit'x\. /);
+  assert.equal(m.meta.failed, "Lint, Audit'x");
+  const passed = toMessage({ ...failed, kind: "ci.run_all_done", run: undefined, failedJobs: undefined, conclusion: "success", failedWorkflows: [] });
+  assert.equal("failed" in passed.meta, false, "no failed= when nothing failed");
+  assert.match(passed.content, /: success\. /);
+});

@@ -69,7 +69,7 @@ test("the bundle is a one-way channel with the subscribe tools, and pushes a fai
     s.send({ id: 1, method: "initialize", params: { protocolVersion: "2026-07-28", capabilities: {}, clientInfo: { name: "test" } } });
     await s.until("initialize", () => s.messages.length >= 1);
     const init = s.messages[0].result;
-    assert.equal(init.protocolVersion, "2025-06-18", "pinned below 2026-07-28");
+    assert.equal(init.protocolVersion, "2025-06-18", "pinned below revision 2026-07-28");
     assert.deepEqual(init.capabilities, { tools: {}, experimental: { "claude/channel": {} } });
     assert.equal(init.serverInfo.name, "runners-io");
     s.send({ method: "notifications/initialized" });

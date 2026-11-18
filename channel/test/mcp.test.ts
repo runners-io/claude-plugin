@@ -52,7 +52,7 @@ test("initialize declares the channel and nothing else: no tools, no permission 
   assert.equal(r.result.instructions, "test");
 });
 
-test("the protocol is pinned below 2026-07-28, which cannot carry channel messages", () => {
+test("the protocol is pinned below revision 2026-07-28, which cannot carry channel messages", () => {
   assert.equal(chooseProtocol("2026-07-28"), "2025-06-18");
   assert.equal(chooseProtocol("2099-01-01"), "2025-06-18");
   assert.equal(chooseProtocol(undefined), "2025-06-18");

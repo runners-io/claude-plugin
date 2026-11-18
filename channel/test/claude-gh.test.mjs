@@ -3,7 +3,7 @@
 // without duplicating and taken out exactly. It never overrides `claude`.
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -127,4 +127,143 @@ test("show says up front that add would refuse a file whose claude-gh it did not
   const added = spawnSync(process.execPath, [SCRIPT, "add"], { env, encoding: "utf8" });
   assert.equal(added.status, 3);
   assert.equal(readFileSync(rc, "utf8"), text);
+});
+
+// ZSH (above): the macOS default; on Linux CI the workflows install it (claude-plugin.yml, ci.yml).
+
+test("without zsh installed, a SHELL of zsh is no answer, so no offer", async () => {
+  const { claudeGhPresent } = await import("../../skills/setup-github/claude-gh.mjs");
+  if (process.env.CI) assert.ok(ZSH, "zsh is not installed: the CI workflow must install it, or the next test checks nothing");
+  const missing = "/nonexistent/bin/zsh";
+  assert.equal(await claudeGhPresent({ HOME: "/nowhere", SHELL: missing, PATH: "/usr/bin:/bin" }), null);
+});
+
+test("claude-gh is looked for in the user's own login shell: an alias, a function or a command, wherever it is defined", async () => {
+  const { claudeGhPresent } = await import("../../skills/setup-github/claude-gh.mjs");
+  if (!ZSH) {
+    assert.equal(process.env.CI, undefined, "CI must have zsh");
+    return; // a machine without zsh: the test above checks the answer it gets
+  }
+  const home = mkdtempSync(join(tmpdir(), "claude-gh-"));
+  const env = { HOME: home, ZDOTDIR: home, SHELL: ZSH, PATH: "/usr/bin:/bin" };
+  assert.equal(await claudeGhPresent(env), false, "nowhere");
+  writeFileSync(join(home, ".zshrc"), addBlock("# mine\n", blockFor("zsh", CACHED, null)));
+  assert.equal(await claudeGhPresent(env), true, "our block in .zshrc");
+  writeFileSync(join(home, ".zshrc"), "# mine\n");
+  writeFileSync(join(home, ".zprofile"), "alias claude-gh='claude --channels x'\n");
+  assert.equal(await claudeGhPresent(env), true, "an alias in .zprofile");
+  writeFileSync(join(home, ".zprofile"), "");
+  writeFileSync(join(home, "more.zsh"), "claude-gh() { claude \"$@\"; }\n");
+  writeFileSync(join(home, ".zshrc"), `source ${join(home, "more.zsh")}\n`);
+  assert.equal(await claudeGhPresent(env), true, "a function in a file .zshrc sources");
+  const bin = mkdtempSync(join(tmpdir(), "claude-gh-bin-"));
+  writeFileSync(join(home, ".zshrc"), "# mine\n");
+  writeFileSync(join(bin, "claude-gh"), "#!/bin/sh\n", { mode: 0o755 });
+  assert.equal(await claudeGhPresent({ ...env, PATH: `${bin}:/usr/bin:/bin` }), true, "an executable on PATH");
+});
+
+test("bash: found in .bashrc as well as in the login files", async () => {
+  const { claudeGhPresent } = await import("../../skills/setup-github/claude-gh.mjs");
+  const home = mkdtempSync(join(tmpdir(), "claude-gh-"));
+  const env = { HOME: home, SHELL: "/bin/bash", PATH: "/usr/bin:/bin" };
+  assert.equal(await claudeGhPresent(env), false);
+  writeFileSync(join(home, ".bashrc"), "alias claude-gh='claude --channels x'\n");
+  assert.equal(await claudeGhPresent(env), true, ".bashrc, which a login bash does not read by itself");
+});
+
+test("no answer, so no offer: Windows, a shell other than zsh, bash or fish, a shell that fails or hangs", async () => {
+  const { claudeGhPresent } = await import("../../skills/setup-github/claude-gh.mjs");
+  const env = { HOME: "/nowhere", SHELL: "/bin/zsh", PATH: "/nonexistent" };
+  const calls = [];
+  const run = (status) => (file, args) => {
+    calls.push([file, ...args]);
+    return status;
+  };
+  assert.equal(await claudeGhPresent(env, { platform: "win32", run: run(1) }), null, "Windows");
+  assert.equal(await claudeGhPresent({ ...env, SHELL: "/bin/tcsh" }, { run: run(1) }), null, "tcsh");
+  assert.equal(await claudeGhPresent({ ...env, SHELL: undefined }, { run: run(1) }), null, "no SHELL");
+  assert.deepEqual(calls, [], "no shell was started for any of them");
+  assert.equal(await claudeGhPresent(env, { run: run(null) }), null, "timed out or could not start");
+  assert.equal(await claudeGhPresent(env, { run: run(127) }), null, "the shell's own failure");
+  assert.equal(await claudeGhPresent(env, { run: run(0) }), true);
+  assert.equal(await claudeGhPresent(env, { run: run(1) }), false);
+  calls.length = 0;
+  await claudeGhPresent({ ...env, SHELL: "/usr/local/bin/fish" }, { run: run(1) });
+  assert.deepEqual(calls, [["/usr/local/bin/fish", "-lic", "type -q claude-gh"]], "fish: its own builtin, fixed arguments");
+  calls.length = 0;
+  await claudeGhPresent(env, { run: run(1) });
+  assert.deepEqual(calls, [["/bin/zsh", "-lic", "command -v claude-gh >/dev/null 2>&1"]]);
+});
+
+test("a claude-gh found is remembered for a day, so the shell is not started at every launch; one missing is asked every time", async () => {
+  const { claudeGhForOffer } = await import("../../skills/setup-github/claude-gh.mjs");
+  const cacheRoot = join(mkdtempSync(join(tmpdir(), "claude-gh-cache-")), "runners-io");
+  const env = { SHELL: "/bin/zsh" };
+  let asked = 0;
+  let answer = false;
+  const present = () => {
+    asked++;
+    return answer;
+  };
+  const t0 = 1_700_000_000_000;
+  assert.equal(await claudeGhForOffer(env, present, { now: t0, cacheRoot }), false);
+  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 1000, cacheRoot }), false);
+  assert.equal(asked, 2, "missing: asked at every launch");
+  answer = true;
+  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 2000, cacheRoot }), true);
+  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 60 * 60_000, cacheRoot }), true);
+  assert.equal(asked, 3, "found: not asked again within the day");
+  assert.equal(statSync(cacheRoot).mode & 0o777, 0o700);
+  for (const f of readdirSync(cacheRoot)) assert.equal(statSync(join(cacheRoot, f)).mode & 0o777, 0o600, f);
+  assert.equal(await claudeGhForOffer({ SHELL: "/bin/bash" }, present, { now: t0 + 3000, cacheRoot }), true);
+  assert.equal(asked, 4, "another shell is asked for itself");
+  answer = false;
+  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 25 * 60 * 60_000, cacheRoot }), false, "a day later it is asked again");
+  assert.equal(asked, 5);
+});
+
+test("the remembered answer is ignored in a symlinked cache folder", async () => {
+  const { claudeGhForOffer } = await import("../../skills/setup-github/claude-gh.mjs");
+  const base = mkdtempSync(join(tmpdir(), "claude-gh-cache-"));
+  const target = join(base, "elsewhere");
+  mkdirSync(target);
+  symlinkSync(target, join(base, "runners-io"));
+  let asked = 0;
+  const present = () => (asked++, true);
+  await claudeGhForOffer({ SHELL: "/bin/zsh" }, present, { now: 1, cacheRoot: join(base, "runners-io") });
+  await claudeGhForOffer({ SHELL: "/bin/zsh" }, present, { now: 2, cacheRoot: join(base, "runners-io") });
+  assert.equal(asked, 2);
+  assert.deepEqual(readdirSync(target), [], "nothing written through the link");
+});
+
+test("RUNNERS_IO_NO_CLAUDE_GH_OFFER=1 turns the offer off without starting a shell", async () => {
+  const { claudeGhForOffer } = await import("../../skills/setup-github/claude-gh.mjs");
+  let asked = 0;
+  const present = () => {
+    asked++;
+    return false;
+  };
+  assert.equal(await claudeGhForOffer({ RUNNERS_IO_NO_CLAUDE_GH_OFFER: "1" }, present), null);
+  assert.equal(asked, 0);
+  assert.equal(await claudeGhForOffer({}, present), false);
+});
+
+test("nothing the shell's startup files start outlives the check: on a timeout, or after a normal exit", async () => {
+  const { claudeGhPresent } = await import("../../skills/setup-github/claude-gh.mjs");
+  const left = (tag) => execFileSync("/bin/ps", ["-eo", "args="], { encoding: "utf8" }).split("\n").filter((l) => l.trim() === tag).length; // the whole command, never a line that mentions it
+  const home = mkdtempSync(join(tmpdir(), "claude-gh-group-"));
+  const env = { HOME: home, SHELL: "/bin/bash", PATH: "/usr/bin:/bin" };
+  // a hang: a background job, then a wait the check gives up on
+  writeFileSync(join(home, ".bash_profile"), "sleep 61.1231 &\nsleep 30.4567\n");
+  const started = Date.now();
+  assert.equal(await claudeGhPresent(env, { timeoutMs: 500 }), null, "timed out: no answer");
+  assert.ok(Date.now() - started < 3000, "it gave up at the limit");
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(left("sleep 61.1231"), 0, "the background job was killed with the shell");
+  assert.equal(left("sleep 30.4567"), 0, "and the wait too");
+  // a normal exit that leaves a background job behind
+  writeFileSync(join(home, ".bash_profile"), "sleep 61.1232 &\n");
+  assert.equal(await claudeGhPresent(env, { timeoutMs: 4000 }), false);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(left("sleep 61.1232"), 0, "a job left running by a shell that exited is killed too");
 });

@@ -59,3 +59,43 @@ test("run as Claude Code runs it, it exits 0 and prints JSON or nothing, whateve
     if (r.stdout.trim()) assert.doesNotThrow(() => JSON.parse(r.stdout));
   }
 });
+
+// ---- the claude-gh offer: asked at every launch while claude-gh is missing, whatever the
+// user answered before; silent once it exists, and never in a headless run.
+
+const ROOT = "/Users/me/.claude/plugins/cache/runners-io/runners-io/0.2.0";
+
+test("channel on and no claude-gh: Claude is asked to offer it once in this session, with nothing shown to the user directly", () => {
+  const out = noticeFor(input(), { state: "on" }, ROOT, { claudeGh: false });
+  assert.equal(out.systemMessage, undefined);
+  const ctx = out.hookSpecificOutput.additionalContext;
+  assert.match(ctx, /Set up `claude-gh` so live CI events are on whenever you start Claude Code with it\?/);
+  assert.match(ctx, /setup-github/);
+  assert.match(ctx, /once in this session/i);
+  assert.match(ctx, /no/i);
+});
+
+test("claude-gh already exists, or whether it does cannot be told: no offer", () => {
+  assert.equal(noticeFor(input(), { state: "on" }, ROOT, { claudeGh: true }), null);
+  assert.equal(noticeFor(input(), { state: "on" }, ROOT, { claudeGh: null }), null);
+});
+
+test("the offer is made again on a later launch: there is no remembered no", () => {
+  const first = noticeFor(input("startup"), { state: "on" }, ROOT, { claudeGh: false });
+  const later = noticeFor(input("resume"), { state: "on" }, ROOT, { claudeGh: false });
+  assert.ok(first && later);
+});
+
+test("never in a headless run, and not after /clear or /compact", () => {
+  assert.equal(noticeFor(input(), { state: "headless" }, ROOT, { claudeGh: false }), null);
+  assert.equal(noticeFor(input("clear"), { state: "on" }, ROOT, { claudeGh: false }), null);
+  assert.equal(noticeFor(input("compact"), { state: "off" }, ROOT, { claudeGh: false }), null);
+});
+
+test("channel off and no claude-gh: the user sees the relaunch line, and Claude offers claude-gh and then gives the relaunch with it", () => {
+  const out = noticeFor(input(), { state: "off" }, ROOT, { claudeGh: false });
+  assert.match(out.systemMessage, /live CI events are OFF/);
+  const ctx = out.hookSpecificOutput.additionalContext;
+  assert.match(ctx, /Set up `claude-gh`/);
+  assert.match(ctx, new RegExp(`claude-gh --resume ${SID}`));
+});

@@ -2,13 +2,13 @@
 // be asked once, not once per session. The sessions share one store per GitHub login (shared.ts); whichever asks
 // first holds that request's lease and asks GitHub, and the others read its answer.
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { after, test } from "node:test";
 
 import { GitHubClient, type GhAuth } from "../src/github.ts";
-import { SharedStore } from "../src/shared.ts";
+import { STORE_FORMAT, SharedStore } from "../src/shared.ts";
 import { type FakeGitHub, startFakeGitHub } from "./fake-github.mjs";
 
 const TOKEN = "ghp_sharedtestsharedtestsharedtest00";
@@ -24,9 +24,10 @@ async function fake(): Promise<FakeGitHub> {
   return gh;
 }
 
-function client(gh: FakeGitHub, root: string, opts: { token?: string; now?: () => number; freshMs?: number } = {}): GitHubClient {
+function client(gh: FakeGitHub, root: string, opts: { token?: string; now?: () => number; freshMs?: number; uid?: number } = {}): GitHubClient {
   const auth: GhAuth = { kind: "ok", token: opts.token ?? TOKEN, source: "env" };
-  const c = new GitHubClient(gh.base, async () => auth, fetch, { shared: new SharedStore(root), ...(opts.now ? { now: opts.now } : {}) });
+  const shared = new SharedStore(root, opts.uid === undefined ? {} : { uid: opts.uid });
+  const c = new GitHubClient(gh.base, async () => auth, fetch, { shared, ...(opts.now ? { now: opts.now } : {}) });
   c.freshMs = opts.freshMs ?? 20_000;
   return c;
 }
@@ -153,4 +154,68 @@ test("a store that cannot be written is not an outage: the session asks GitHub i
   const r = await client(gh, file).getPull("octo-org/example", 7);
   assert.equal(r.kind, "ok");
   assert.equal(pulls(gh).length, 1);
+});
+
+test("a login's folder is named for the store's format, so a plugin that changes the format never reads the old one", async () => {
+  const gh = await fake();
+  const root = mkdtempSync(join(tmpdir(), "rio-shared-"));
+  await client(gh, root).getPull("octo-org/example", 7);
+  const [dir] = readdirSync(root);
+  assert.match(dir, new RegExp(`^v${STORE_FORMAT}-[0-9a-f]{20}$`));
+});
+
+test("the folders of logins not used for a day are deleted, and a recent one is kept", async () => {
+  const gh = await fake();
+  const root = mkdtempSync(join(tmpdir(), "rio-shared-"));
+  const old = Date.now() / 1000 - 2 * 24 * 60 * 60;
+  for (const name of ["v0-00000000000000000000", "v1-11111111111111111111"]) {
+    mkdirSync(join(root, name));
+    writeFileSync(join(root, name, "x.json"), "{}");
+    utimesSync(join(root, name, "x.json"), old, old);
+    utimesSync(join(root, name), old, old);
+  }
+  mkdirSync(join(root, "v1-22222222222222222222"));
+  writeFileSync(join(root, "v1-22222222222222222222", "x.json"), "{}");
+  await client(gh, root).getPull("octo-org/example", 7);
+  const left = readdirSync(root).sort();
+  assert.equal(left.includes("v0-00000000000000000000"), false, "an old format's folder, unused for two days");
+  assert.equal(left.includes("v1-11111111111111111111"), false, "another login's folder, unused for two days");
+  assert.equal(left.includes("v1-22222222222222222222"), true, "another login's folder in use today");
+  assert.equal(left.length, 2, "and this login's own");
+});
+
+test("a cache folder that is a symlink is refused: the session asks GitHub itself and writes nothing through it", async () => {
+  const gh = await fake();
+  const base = mkdtempSync(join(tmpdir(), "rio-shared-"));
+  const target = join(base, "elsewhere");
+  mkdirSync(target);
+  symlinkSync(target, join(base, "root"));
+  const r = await client(gh, join(base, "root")).getPull("octo-org/example", 7);
+  assert.equal(r.kind, "ok");
+  assert.equal(pulls(gh).length, 1);
+  assert.deepEqual(readdirSync(target), []);
+});
+
+test("a login's folder replaced by a symlink is refused too", async () => {
+  const gh = await fake();
+  const root = mkdtempSync(join(tmpdir(), "rio-shared-"));
+  await client(gh, root).getPull("octo-org/example", 7);
+  const [dir] = readdirSync(root);
+  const target = mkdtempSync(join(tmpdir(), "rio-shared-target-"));
+  renameSync(join(root, dir), join(root, `${dir}.moved`));
+  symlinkSync(target, join(root, dir));
+  const r = await client(gh, root).getPull("octo-org/example", 7);
+  assert.equal(r.kind, "ok");
+  assert.equal(pulls(gh).length, 2, "it asked GitHub instead of reading through the link");
+  assert.deepEqual(readdirSync(target), []);
+});
+
+test("a cache folder owned by another user is refused", async () => {
+  const gh = await fake();
+  const root = mkdtempSync(join(tmpdir(), "rio-shared-"));
+  const someoneElse = (process.getuid?.() ?? 0) + 1;
+  const r = await client(gh, root, { uid: someoneElse }).getPull("octo-org/example", 7);
+  assert.equal(r.kind, "ok");
+  assert.equal(existsSync(root) && readdirSync(root).length, 0, "nothing was written into it");
+  assert.equal(basename(root).startsWith("rio-shared-"), true);
 });

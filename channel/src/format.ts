@@ -106,7 +106,7 @@ export function toMessage(c: Change): ChannelMessage {
         `A person must approve it on GitHub; do not try to approve it yourself. ${runUrl}`;
       break;
     case "ci.run_all_done":
-      content = `All CI workflows finished on ${at}: ${clean(c.conclusion, 30) || "finished"}. ${prUrl}`;
+      content = `All CI workflows finished on ${at}: ${clean(c.conclusion, 30) || "finished"}${jobs(c.failedWorkflows) ? `, failed: ${jobs(c.failedWorkflows)}` : ""}. ${prUrl}`;
       break;
     case "pr.conflict":
       content = `PR #${s.pr}${branch ? ` (${branch})` : ""} has a merge conflict with its base branch. ${prUrl}`;
@@ -152,7 +152,7 @@ export function toMessage(c: Change): ChannelMessage {
     case "base.red": {
       const base = clean(s.baseRef, 60) || "the base branch";
       content =
-        `The base branch ${base} is red: failing ${jobs(c.failing) || "workflows"}. A failure on PR #${s.pr} may be ${base}'s, not the PR's: ` +
+        `The base branch ${base} is red: failing ${jobs(c.failing) || "workflows"}. A failure on ${prList(c.prs, s.pr)} may be ${base}'s, not the PR's: ` +
         `check ${base} before changing code, and do not merge while it is red. ${baseLink(s)}`;
       break;
     }
@@ -174,9 +174,18 @@ export function toMessage(c: Change): ChannelMessage {
   add("labels_added", labelList(c.labelsAdded));
   add("labels_removed", labelList(c.labelsRemoved));
   add("failing", jobs(c.failing));
+  add("failed", jobs(c.failedWorkflows));
+  add("prs", (c.prs ?? []).filter((n) => Number.isInteger(n) && n > 0).slice(0, 20).join(","));
   add("base", c.failing || c.kind === "base.green" ? clean(s.baseRef, 100) : "");
   if (c.workflows) meta.workflows = String(c.workflows);
   return { content: content.trim(), meta };
+}
+
+/** "PR #7", "PRs #7 and #8", "PRs #7, #8 and #9". */
+function prList(prs: readonly number[] | undefined, fallback: number): string {
+  const list = (prs?.length ? prs : [fallback]).slice(0, 10).map((n) => `#${n}`);
+  if (list.length === 1) return `PR ${list[0]}`;
+  return `PRs ${list.slice(0, -1).join(", ")} and ${list.at(-1)}`;
 }
 
 function labelList(names: readonly string[] | undefined): string {
