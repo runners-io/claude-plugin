@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { NAMES_LABEL } from "../src/format.ts";
 import { parseReviewRequests, requestChanges, requestMessage } from "../src/requests.ts";
 
 const T0 = Date.parse("2026-01-01T00:00:00Z");
@@ -94,4 +95,18 @@ test("a review request is reported to the user, and the pull request is read onl
   assert.match(text, /tell the user/i);
   assert.match(text, /only if the user asks/i);
   assert.doesNotMatch(text, /before deciding anything/);
+});
+
+// Logins and team names are chosen by their owners; like every other name they follow the label, quoted.
+test("the requester and the team appear only after the label, quoted", () => {
+  const r = parseReviewRequests(answer([pr("acme/api", 9, [event("E4", 4, team("acme", "TEAMNAME"), { login: "REQLOGIN", __typename: "User" })])]));
+  assert.ok(r);
+  const text = requestMessage(r.requests[0]).content;
+  const label = text.indexOf(NAMES_LABEL);
+  assert.ok(label >= 0, text);
+  for (const name of ["REQLOGIN", "TEAMNAME"]) {
+    const at = text.indexOf(name);
+    assert.ok(at > label, `${name} before the label: ${text}`);
+    assert.equal(text[at - 1] === '"' || text.slice(at - 6, at) === '"acme/', true, `${name} unquoted: ${text}`);
+  }
 });

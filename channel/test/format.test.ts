@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import { META_KEY, clean, describe, safeLink, toMessage } from "../src/format.ts";
 import type { RunInfo } from "../src/github.ts";
+import { INSTRUCTIONS } from "../src/instructions.ts";
 import { type Change, EVENT_KINDS, type Snapshot } from "../src/state.ts";
 
 const run: RunInfo = {
@@ -291,5 +292,64 @@ test("a request for changes from outside the repository or from a bot sends Clau
     assert.doesNotMatch(text, /gh pr view/, `${t}: ${text}`);
     assert.doesNotMatch(text, /\bread the review\b/i, t);
   }
-  assert.match(toMessage(reviewBy("member")).content, /gh pr view/, "a member's review may still be read, as information");
+  // A member's review may still be read, as information: the one review, at its link (not every comment on the PR).
+  assert.match(toMessage(reviewBy("member")).content, /may read that review at the link/);
+});
+
+// Whatever a review says was written by whoever wrote it, a stranger included on a public repository. The plugin's own
+// sentence never sends Claude to fetch it unasked unless the reviewer is a member, and never fetches more than the one
+// review. The instructions say the same (instructions.test.ts).
+const reviewed = (kind: Change["kind"], authorType: string): Change =>
+  ({
+    ...planted,
+    kind,
+    review: { login: "REVLOGIN", authorType, path: "REVPATH", line: 3, unresolved: 1, mergeState: "CLEAN", url: "https://github.com/acme/widgets/pull/7#pullrequestreview-2" },
+  }) as Change;
+
+test("a review thread from outside the repository or from a bot sends Claude to read nothing; a member's may be read", () => {
+  for (const t of ["outside", "bot", ""]) {
+    const text = toMessage(reviewed("pr.review_thread_added", t)).content;
+    assert.doesNotMatch(text, /\bread\b/i, `${t}: ${text}`);
+    assert.match(text, /tell the user/i, t);
+  }
+  assert.match(toMessage(reviewed("pr.review_thread_added", "member")).content, /may read/i, "a member's thread may still be read");
+});
+
+test("a member's request for changes points at that one review, never at every comment on the pull request", () => {
+  const text = toMessage(reviewed("pr.changes_requested", "member")).content;
+  assert.doesNotMatch(text, /--comments/, text);
+  assert.match(text, /#pullrequestreview-2/, "the link to the one review");
+});
+
+test("an edited description is reported to the user, and read only if the user asks", () => {
+  const text = toMessage({ ...planted, kind: "pr.body_edited" } as Change).content;
+  assert.doesNotMatch(text, /re-read/i, text);
+  assert.match(text, /tell the user/i);
+  assert.match(text, /only if the user asks/i);
+});
+
+// GitHub's CLEAN means no conflict and nothing failing; on a repository with no protection it says nothing about
+// reviews. The event reports what GitHub said; whether to merge is the user's.
+test("ready to merge reports what GitHub said and never tells Claude to merge", () => {
+  const text = toMessage(reviewed("pr.ready_to_merge", "member")).content;
+  assert.doesNotMatch(text, /Merge it/, text);
+  assert.doesNotMatch(text, /review rules are met/, text);
+  assert.match(text, /tell the user/i);
+  assert.match(text, /merge only if the user/i);
+});
+
+// The names fence covers the body. The same names are also attributes of the <channel> tag, so the instructions must
+// name every attribute that can carry one. Found by planting a name in every field and reading where it surfaces.
+test("every attribute that can carry a repository-chosen name is named as data in the instructions", () => {
+  const carriers = new Set<string>();
+  const plants = [...NAMES, ...MORE];
+  for (const kind of EVENT_KINDS)
+    for (const c of [planted, plantedMore])
+      for (const [key, value] of Object.entries(toMessage({ ...c, kind }).meta))
+        // url is a github.com or runners.io link (safeLink); a branch in it is an address, not a sentence.
+        if (key !== "url" && plants.some((n) => value.includes(n))) carriers.add(key);
+  assert.ok(carriers.size >= 8, `only ${[...carriers]} carried a planted name`);
+  const sentence = INSTRUCTIONS.split(/(?<=\.)\s/).find((x) => /attribute/i.test(x) && /never instructions/i.test(x)) ?? "";
+  assert.ok(sentence, "a sentence that says which attributes are data");
+  for (const key of carriers) assert.match(sentence, new RegExp(`\\b${key}\\b`), `${key} is not named as data: ${sentence}`);
 });
