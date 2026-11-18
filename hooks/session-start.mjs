@@ -22,7 +22,9 @@ import { channelFlags, findLaunch, shellWord } from "./launch.mjs";
 const LAUNCHES = new Set(["startup", "resume", "fork"]);
 const SESSION_ID = /^[A-Za-z0-9-]{8,64}$/;
 
-export const OFFER_QUESTION = "Set up `claude-gh` so live CI events are on whenever you start Claude Code with it?";
+export const OFFER_QUESTION =
+  "Set up `claude-gh` so live CI events are on whenever you start Claude Code with it? It starts Claude Code with " +
+  "its development flag for channels, which shows a confirmation screen at every launch; `claude` itself is unchanged.";
 
 /**
  * The hook's output, or null. `launch` is findLaunch()'s answer; `pluginRoot` is CLAUDE_PLUGIN_ROOT;

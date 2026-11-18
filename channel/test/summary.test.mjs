@@ -31,7 +31,7 @@ function writeLog(records) {
 
 function run(args, env = {}) {
   return new Promise((resolve) => {
-    execFile(process.execPath, [SCRIPT, ...args], { env: { ...process.env, GH_TOKEN: TOKEN, RUNNERS_IO_TEST_FAKE_GITHUB: "1", ...env } }, (error, stdout, stderr) => {
+    execFile(process.execPath, [SCRIPT, ...args], { env: { ...process.env, RUNNERS_IO_TEST_GITHUB_TOKEN: TOKEN, RUNNERS_IO_TEST_FAKE_GITHUB: "1", ...env } }, (error, stdout, stderr) => {
       resolve({ code: error ? error.code : 0, stdout, stderr });
     });
   });
@@ -126,6 +126,22 @@ test("--github-api sends the github.com login nowhere but api.github.com, or thi
   const off = await run(["--dir", dir, "--since", "24h", "--json", "--github", "--github-api", "https://example.com"]);
   assert.equal(off.code, 2, "the switch admits this machine only, never another host");
   assert.equal(gh.requests.length, 0, "the fake GitHub on this machine was never asked");
+});
+
+// The switch is an environment variable, so anything that sets one can set it. Under it this machine gets only the
+// tests' own token: never the user's GH_TOKEN, GITHUB_TOKEN or gh login.
+test("under the tests' switch the user's real github.com login is never sent to this machine", async () => {
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  gh.setPull("acme/widgets", 7, { head: { sha: "a".repeat(40), ref: "feat" }, state: "open" });
+  const dir = writeLog([{ ...base, t: ago(30), type: "subscribe", repo: "acme/widgets", pr: 7, source: "auto" }, beat(15)]);
+  const args = ["--dir", dir, "--since", "24h", "--json", "--github", "--github-api", gh.base];
+  const r = await run(args, { RUNNERS_IO_TEST_GITHUB_TOKEN: "", GH_TOKEN: TOKEN, GITHUB_TOKEN: TOKEN, PATH: "/nonexistent" });
+  assert.equal(r.code, 2, r.stderr);
+  assert.equal(gh.requests.length, 0, "no request reached the listener on this machine");
+  // The control: with the tests' own token the same run does ask the fake, so the zero above is not vacuous.
+  await run(args);
+  assert.ok(gh.requests.length > 0, "the tests' own token reaches the fake GitHub");
 });
 
 test("with --github, a session that ended without a stop record watched until its last record, and is listed", async () => {

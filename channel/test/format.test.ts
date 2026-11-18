@@ -270,3 +270,26 @@ test("a name holding a quote or a backslash cannot end its quotes early: the nam
   const parsed = [...names.matchAll(new RegExp(quoted, "g"))].map((x) => JSON.parse(x[0]));
   assert.deepEqual(parsed, [clean(evil.workflow), clean(evil.branch, 60), clean(evil.job, 60), "plain"]);
 });
+
+// A request for changes can come from anyone who can review on GitHub, a stranger included. The plugin's own sentence
+// must never send Claude to change code and push on the strength of it: that is the user's call.
+const reviewBy = (authorType: string): Change =>
+  ({ ...planted, kind: "pr.changes_requested", review: { login: "REVLOGIN", authorType } }) as Change;
+
+test("a request for changes never tells Claude to fix, push and reply: changing code or pushing waits for the user", () => {
+  for (const t of ["member", "outside", "bot", ""]) {
+    const text = toMessage(reviewBy(t)).content;
+    assert.doesNotMatch(text, /\bpush\b(?![^.]*only if)/i, `${t}: ${text}`);
+    assert.doesNotMatch(text, /fix, push and reply/, t);
+    assert.match(text, /tell the user/i, t);
+  }
+});
+
+test("a request for changes from outside the repository or from a bot sends Claude to read nothing", () => {
+  for (const t of ["outside", "bot"]) {
+    const text = toMessage(reviewBy(t)).content;
+    assert.doesNotMatch(text, /gh pr view/, `${t}: ${text}`);
+    assert.doesNotMatch(text, /\bread the review\b/i, t);
+  }
+  assert.match(toMessage(reviewBy("member")).content, /gh pr view/, "a member's review may still be read, as information");
+});

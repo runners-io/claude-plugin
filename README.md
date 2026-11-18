@@ -28,29 +28,34 @@ in to github.com. If you don't have `gh`, the plugin's `setup-github` skill walk
 your agreement, and you sign in with `! gh auth login --web --scopes repo`.
 
 ```bash
+claude plugin marketplace add runners-io/claude-plugin#v0.2.4
+claude plugin install runners-io@runners-io
+```
+
+This installs exactly one release: every release has a new version and a tag of its own (`v0.2.4` is this one), and
+the `#` and tag pin the marketplace to it. We do not move a release tag once it is published, so updating that
+marketplace never takes you past the release you chose. To move to a newer release, run
+`claude plugin marketplace remove runners-io` (which uninstalls the plugin), then the two commands above with the newer
+tag. `claude plugin list` shows the version you have.
+
+### Following main
+
+To take every release as it is published instead, leave out the tag. That install follows `main`, so each later
+update reaches you without a new choice, together with the development flag `claude-gh` uses (see Security):
+
+```bash
 claude plugin marketplace add runners-io/claude-plugin
 claude plugin install runners-io@runners-io
 ```
 
 Or from inside a session: `/plugin marketplace add runners-io/claude-plugin`, then `/plugin install runners-io@runners-io`.
 
-### Pinned install
+### From a copy you have read
 
-The commands above follow `main`. Every release has a new version and a tag of its own (`v0.2.3` is this one), so you
-can install exactly the release you have read instead: add `#` and the tag to the marketplace source.
-
-```bash
-claude plugin marketplace add runners-io/claude-plugin#v0.2.3
-claude plugin install runners-io@runners-io
-```
-
-A tag does not move, so updating that marketplace never takes you past the release you chose. To move to a newer
-release, run `claude plugin marketplace remove runners-io` (which uninstalls the plugin), then the two commands above
-with the newer tag. `claude plugin list` shows the version you have. To install from a copy you have checked out and
-read yourself:
+To install from a copy you have checked out and read yourself:
 
 ```bash
-git clone --branch v0.2.3 --depth 1 https://github.com/runners-io/claude-plugin.git
+git clone --branch v0.2.4 --depth 1 https://github.com/runners-io/claude-plugin.git
 claude plugin marketplace add ./claude-plugin
 claude plugin install runners-io@runners-io
 ```
@@ -254,8 +259,11 @@ in memory, and never writes it to a file or a log.
 `GH_TOKEN` / `GITHUB_TOKEN` if you set one. It keeps it in memory only. It sends it in one place: the
 `Authorization` header of its requests to `https://api.github.com`. For GitHub Enterprise Server, set
 `RUNNERS_IO_GITHUB_API` to your server's https API address: the channel then reads that server's own login
-(`GH_ENTERPRISE_TOKEN`, or `gh auth token --hostname <your server>`), never your github.com token, so a token only
-ever goes to the host it belongs to. It never writes it to disk, never puts it on a command line, and never prints or logs it: every
+(`gh auth token --hostname <your server>`, or `GH_ENTERPRISE_TOKEN` / `GITHUB_ENTERPRISE_TOKEN` only when `GH_HOST`
+names that same server, since those two variables name no host of their own), never your github.com token, so a token
+only ever goes to the host it belongs to. `RUNNERS_IO_TEST_FAKE_GITHUB=1` is for the plugin's own tests: it lets
+`RUNNERS_IO_GITHUB_API` name a fake GitHub on this machine, which is then given `RUNNERS_IO_TEST_GITHUB_TOKEN` and
+never your login. It never writes it to disk, never puts it on a command line, and never prints or logs it: every
 line of the event log and of the channel's own log goes through a redaction of GitHub token shapes and bearer
 headers first, which `channel/test/secrets.test.ts` and `channel/test/eventlog.test.ts` check. The events sent to
 Claude are built from named fields of GitHub's answers and never include it.
@@ -274,7 +282,7 @@ Delete the folder whenever you like: the next look at GitHub rebuilds what it ne
 **What the development-channels flag allows.** The risk, plainly: Anthropic has not reviewed this channel, so the
 flag lets code that no one but us has checked put text into your session; and it applies to every later update of
 the plugin too, not only the version you read. To review each change before it runs, use a
-[Pinned install](#pinned-install) and move the pin yourself. During the research preview, Claude Code loads only allowlisted
+[Pinned install](#install) (the one Install leads with) and move the pin yourself. During the research preview, Claude Code loads only allowlisted
 channels unless it is started with `--dangerously-load-development-channels plugin:runners-io@<marketplace>`. That flag
 lifts the allowlist **for this one entry** and nothing else: it does not turn off permission prompts, it does not
 apply to any other plugin or server, and your organisation's `channelsEnabled` policy still applies. On Team and

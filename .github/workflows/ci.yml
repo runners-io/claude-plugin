@@ -18,6 +18,9 @@ concurrency:
 jobs:
   check:
     name: manifest, bundle and tests
+    # A pull request from a fork runs nothing here: only pushes, a person's dispatch, and pull requests from a branch
+    # of this repository (which is how a release is published).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

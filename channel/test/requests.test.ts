@@ -84,3 +84,14 @@ test("the message names the repository, the number, who asked and a link, and ho
   assert.equal(m.content.includes("<script>"), false);
   assert.equal(m.content.includes("IGNORE"), false);
 });
+
+// Whoever asked for the review wrote the pull request; the instructions say to read it only if the user asks, and the
+// event's own sentence must not say otherwise.
+test("a review request is reported to the user, and the pull request is read only if the user asks", () => {
+  const r = parseReviewRequests(answer([pr("acme/api", 9, [event("E4", 4, team("acme", "core"), { login: "bob", __typename: "User" })])]));
+  assert.ok(r);
+  const text = requestMessage(r.requests[0]).content;
+  assert.match(text, /tell the user/i);
+  assert.match(text, /only if the user asks/i);
+  assert.doesNotMatch(text, /before deciding anything/);
+});

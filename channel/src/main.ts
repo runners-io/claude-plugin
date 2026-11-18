@@ -23,7 +23,7 @@ import { makeTools } from "./tools.ts";
 import { NO_EVENT_LOG, openEventLog } from "./eventlog.ts";
 import { findLaunch, pollsIn } from "../../hooks/launch.mjs";
 
-export const VERSION = "0.2.3";
+export const VERSION = "0.2.4";
 
 function serve(): void {
   const config = loadConfig();

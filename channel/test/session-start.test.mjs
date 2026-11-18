@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { noticeFor } from "../../hooks/session-start.mjs";
+import { OFFER_QUESTION, noticeFor } from "../../hooks/session-start.mjs";
 
 const HOOK = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "hooks", "session-start.mjs");
 const SID = "3f2a9c1e-0b7d-4c55-9a51-6c8e2f0d4b11";
@@ -106,4 +106,11 @@ test("channel off and no claude-gh: the user sees the relaunch line, and Claude 
   const ctx = out.hookSpecificOutput.additionalContext;
   assert.match(ctx, /Set up `claude-gh`/);
   assert.match(ctx, new RegExp(`claude-gh --resume ${SID}`));
+});
+
+// The user answers the offer's question and nothing else they are shown, so the question itself says what claude-gh
+// does: it starts Claude Code with the development flag, which allows a channel not yet on Claude Code's approved list.
+test("the offer's question says claude-gh uses Claude Code's development flag, and what that shows at each launch", () => {
+  assert.match(OFFER_QUESTION, /development flag/);
+  assert.match(OFFER_QUESTION, /every launch|each launch/);
 });

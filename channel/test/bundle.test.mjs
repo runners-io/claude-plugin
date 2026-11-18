@@ -64,7 +64,7 @@ test("the bundle is a one-way channel with the subscribe tools, and pushes a fai
   gh.setPull("acme/widgets", 7, { head: { ref: "feat", sha: SHA } });
   gh.setRuns("acme/widgets", SHA, [{ id: 51, name: "CI", status: "in_progress" }]);
   const root = mkdtempSync(join(tmpdir(), "rio-bundle-"));
-  const s = start({ HOME: root, GH_TOKEN: TOKEN, RUNNERS_IO_GITHUB_API: gh.base }, repo(root));
+  const s = start({ HOME: root, RUNNERS_IO_TEST_GITHUB_TOKEN: TOKEN, RUNNERS_IO_GITHUB_API: gh.base }, repo(root));
   try {
     s.send({ id: 1, method: "initialize", params: { protocolVersion: "2026-07-28", capabilities: {}, clientInfo: { name: "test" } } });
     await s.until("initialize", () => s.messages.length >= 1);
