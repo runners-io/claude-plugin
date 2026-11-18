@@ -9,6 +9,6 @@ export function findLaunch(
 
 export function pollsIn(state: LaunchState): boolean;
 
-export function shellWord(s: string): string;
+export function shellWord(s: string, shell?: string): string;
 
-export function channelFlags(pluginRoot: string): string[];
+export function channelFlags(pluginRoot: string, shell?: string): string[];

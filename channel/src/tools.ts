@@ -9,12 +9,12 @@
  */
 import { NO_EVENT_LOG } from "./eventlog.ts";
 import type { EventLog } from "./eventlog.ts";
-import { describe, setupText } from "./format.ts";
+import { clean, describe, setupText } from "./format.ts";
 import type { GitScope } from "./git.ts";
 import type { GitHubClient } from "./github.ts";
 import { fetchSnapshot } from "./poller.ts";
 import { EVENT_KINDS, type EventKind, isEventKind } from "./state.ts";
-import type { Subscriptions } from "./subscriptions.ts";
+import { MAX_SUBSCRIPTIONS, type Subscriptions } from "./subscriptions.ts";
 
 export const TOOL_NAMES = ["subscribe", "unsubscribe", "list_subscriptions", "ci_status"] as const;
 
@@ -111,7 +111,8 @@ async function resolveTarget(deps: Deps, args: Record<string, unknown>): Promise
   const found = await deps.gh.findOpenPull(repo, scope.branch);
   if (found.kind === "auth") return { ok: false, text: setupText(found.auth) };
   if (found.kind !== "ok") return { ok: false, text: `Could not ask GitHub for the branch's pull request (${found.kind}); pass pr.` };
-  if (found.value === null) return { ok: false, text: `There is no open pull request for branch ${scope.branch} in ${repo}: pass pr.` };
+  // The local branch's name is chosen by whoever named it (a fetched fork's branch included), so it is cleaned like any name.
+  if (found.value === null) return { ok: false, text: `There is no open pull request for branch ${clean(scope.branch, 100)} in ${repo}: pass pr.` };
   return { ok: true, repo, pr: found.value };
 }
 
@@ -151,6 +152,12 @@ export function makeTools(deps: Deps): ToolHost {
           if (!events.ok) return err(events.text);
           const t = await resolveTarget(deps, args);
           if (!t.ok) return err(t.text);
+          if (!deps.subs.get(t.repo, t.pr) && deps.subs.list().length >= MAX_SUBSCRIPTIONS) {
+            return err(
+              `This session already watches ${MAX_SUBSCRIPTIONS} pull requests, the most it will. ` +
+                "Call unsubscribe for one it no longer needs (list_subscriptions shows them), then subscribe again.",
+            );
+          }
           const snap = await read(t.repo, t.pr);
           if ("text" in snap) return snap;
           if (snap.state !== "open") return { text: `${describe(snap)}\nThe pull request is ${snap.state}, so it is not subscribed.` };

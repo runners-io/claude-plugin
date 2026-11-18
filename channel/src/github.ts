@@ -14,7 +14,11 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 
+import { fakeGitHubAllowed, isLoopback } from "./config.ts";
 import { log } from "./log.ts";
+import { REVIEW_QUERY, type ReviewState, graphqlRate, parseReviewState } from "./reviews.ts";
+import { type Annotation, type JobInfo, parseAnnotations, parseJobs } from "./jobs.ts";
+import { REQUESTS_QUERY, REQUESTS_SEARCH, type RequestsReading, parseReviewRequests } from "./requests.ts";
 import type { LoginStore, SharedStore, Stored } from "./shared.ts";
 
 export type GhAuth =
@@ -45,20 +49,19 @@ const runCommand: Runner = (command, args) =>
 type Env = Record<string, string | undefined>;
 
 /**
- * The GitHub host whose login is used for an API address: github.com for api.github.com (and for loopback, the
- * tests' fake GitHub), otherwise the address's own host (GitHub Enterprise Server). A token is only ever read
- * for the host it is sent to, so pointing RUNNERS_IO_GITHUB_API somewhere else can never carry a github.com
- * token there.
+ * The GitHub host whose login is used for an API address: github.com for api.github.com (and for this machine only
+ * under RUNNERS_IO_TEST_FAKE_GITHUB=1, the tests' fake GitHub), otherwise the address's own host (GitHub Enterprise
+ * Server). A token is only ever read for the host it is sent to, so pointing RUNNERS_IO_GITHUB_API somewhere else,
+ * a local port included, can never carry a github.com token there.
  */
-export function loginHost(apiBase: string): string {
+export function loginHost(apiBase: string, env: Env = process.env): string {
   const host = new URL(apiBase).hostname;
-  return host === "api.github.com" || LOOPBACK_HOSTS.has(host) ? "github.com" : host;
+  return host === "api.github.com" || (isLoopback(host) && fakeGitHubAllowed(env)) ? "github.com" : host;
 }
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 
 /** The token for the API address's host, the way gh picks it: the host's environment variables, then gh's login. */
 export async function readGhAuth(env: Env = process.env, run: Runner = runCommand, apiBase = "https://api.github.com"): Promise<GhAuth> {
-  const host = loginHost(apiBase);
+  const host = loginHost(apiBase, env);
   const names = host === "github.com" ? (["GH_TOKEN", "GITHUB_TOKEN"] as const) : (["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"] as const);
   for (const name of names) {
     const value = env[name]?.trim();
@@ -85,6 +88,10 @@ export interface PullInfo {
   readonly htmlUrl: string;
   /** When it was merged or closed, GitHub's time; for the event log's latency. */
   readonly closedAt?: string;
+  /** When it was opened, GitHub's time: a PR the hook handed over is watched only if this is recent. */
+  readonly createdAt?: string;
+  /** Who opened it (GitHub's login): a PR the hook handed over is watched only if the signed-in login opened it. */
+  readonly author?: string;
   readonly updatedAt?: string;
   readonly baseRef?: string;
   readonly draft?: boolean;
@@ -134,6 +141,8 @@ interface GhPullJson {
   mergeable?: boolean | null;
   mergeable_state?: string;
   html_url?: string;
+  user?: { login?: string };
+  created_at?: string;
   updated_at?: string;
   draft?: boolean;
   labels?: unknown;
@@ -170,6 +179,9 @@ export interface ClientOptions {
   readonly now?: () => number;
 }
 
+/** One `x-ratelimit-*` reading: when it was taken, and the reset as epoch milliseconds. */
+type RateReading = { remaining: number; at: number; limit?: number; reset?: number };
+
 export class GitHubClient {
   /**
    * How old a stored answer may be and still be used instead of asking GitHub, when a shared store is set. The
@@ -183,12 +195,13 @@ export class GitHubClient {
    */
   scopes: string[] | null = null;
   /** Answers since start, for the event log's heartbeat: 200s, 304s (free) and anything else. */
-  readonly requests = { ok: 0, not_modified: 0, other: 0, shared: 0 };
+  readonly requests = { ok: 0, not_modified: 0, other: 0, shared: 0, graphql: 0 };
+  private ownGraphqlRate: RateReading | null = null;
   private readonly cache = new Map<string, { etag: string; value: unknown }>();
   private readonly shared: SharedStore | null;
   private readonly now: () => number;
   private store: LoginStore | null = null;
-  private ownRate: { remaining: number; at: number } | null = null;
+  private ownRate: RateReading | null = null;
   private auth: { value: GhAuth; at: number } | null = null;
   private readonly base: string;
   private readonly readAuth: () => Promise<GhAuth>;
@@ -207,9 +220,42 @@ export class GitHubClient {
    * own without a shared store), or null before the first: the backoff is one for the whole machine.
    */
   get rateRemaining(): number | null {
-    const other = this.store?.readRate() ?? null;
-    const newest = other && (!this.ownRate || other.at >= this.ownRate.at) ? other : this.ownRate;
-    return newest ? newest.remaining : null;
+    return this.newestRate()?.remaining ?? null;
+  }
+
+  /** `x-ratelimit-limit` of the same answer as rateRemaining: what the remaining is a share of, or null. */
+  get rateLimit(): number | null {
+    return this.newestRate()?.limit ?? null;
+  }
+
+  /**
+   * The newest reading, or null. GitHub refills the limit only at `x-ratelimit-reset`, so a reading is void once
+   * that time has passed: a session that backed off and stopped asking would otherwise never see the refill.
+   */
+  private newestRate(file = "rate.json", own = this.ownRate): RateReading | null {
+    const other = this.store?.readRate(file) ?? null;
+    const newest = other && (!own || other.at >= own.at) ? other : own;
+    return newest && newest.reset !== undefined && this.now() >= newest.reset ? null : newest;
+  }
+
+  /** GraphQL's own budget (points), as the newest review read on this machine reported it, or null. */
+  get graphqlRemaining(): number | null {
+    return this.newestRate("rate-graphql.json", this.ownGraphqlRate)?.remaining ?? null;
+  }
+
+  get graphqlLimit(): number | null {
+    return this.newestRate("rate-graphql.json", this.ownGraphqlRate)?.limit ?? null;
+  }
+
+  /**
+   * The signed-in login's name ("" when GitHub gives none), read rarely: it changes only with `gh auth login`, and the
+   * shared store keys its answers by login.
+   */
+  async viewerLogin(): Promise<ApiResult<string>> {
+    return this.get("/user", 6 * 60 * 60_000, (j) => {
+      const login = (j as { login?: unknown }).login;
+      return typeof login === "string" ? login : "";
+    });
   }
 
   /** The login as it stands now: read again when older than five minutes, or when `fresh`. */
@@ -234,6 +280,8 @@ export class GitHubClient {
         mergeableState: mergeability(p),
         htmlUrl: String(p.html_url ?? ""),
         ...(typeof (p.merged_at ?? p.closed_at) === "string" ? { closedAt: String(p.merged_at ?? p.closed_at) } : {}),
+        ...(typeof p.created_at === "string" ? { createdAt: p.created_at } : {}),
+        ...(typeof p.user?.login === "string" ? { author: p.user.login } : {}),
         ...(typeof p.updated_at === "string" ? { updatedAt: p.updated_at } : {}),
         ...(typeof p.base?.ref === "string" ? { baseRef: p.base.ref } : {}),
         ...(typeof p.draft === "boolean" ? { draft: p.draft } : {}),
@@ -271,7 +319,8 @@ export class GitHubClient {
 
   /** The latest push runs on a branch: the base branch's health (rules.mjs `baseVerdict`). */
   baseRuns(repo: string, branch: string, freshMs = this.freshMs): Promise<ApiResult<BaseRunInfo[]>> {
-    const q = new URLSearchParams({ branch, event: "push", per_page: "30" });
+    // 100, the most one request returns: main fires dozens of workflows a push, and 30 runs is two pushes.
+    const q = new URLSearchParams({ branch, event: "push", per_page: "100" });
     return this.get(`/repos/${repo}/actions/runs?${q}`, freshMs, (j) => {
       const runs = ((j as { workflow_runs?: unknown }).workflow_runs ?? []) as GhRunJson[];
       return runs.map((r) => ({
@@ -285,11 +334,126 @@ export class GitHubClient {
     });
   }
 
+  /** A run's jobs (jobs.ts), with an ETag through the shared store: an unchanged answer is a 304. */
+  runJobs(repo: string, runId: number): Promise<ApiResult<JobInfo[]>> {
+    return this.get(`/repos/${repo}/actions/runs/${runId}/jobs?per_page=100`, this.freshMs, parseJobs);
+  }
+
+  /** A job's annotations, path, line and level only (jobs.ts): a job is a check run, and has the same id. */
+  jobAnnotations(repo: string, jobId: number): Promise<ApiResult<Annotation[]>> {
+    return this.get(`/repos/${repo}/check-runs/${jobId}/annotations?per_page=50`, this.freshMs, parseAnnotations);
+  }
+
   failedJobs(repo: string, runId: number): Promise<ApiResult<string[]>> {
     return this.get(`/repos/${repo}/actions/runs/${runId}/jobs?per_page=100`, this.freshMs, (j) => {
       const jobs = ((j as { jobs?: unknown }).jobs ?? []) as { name?: unknown; conclusion?: unknown }[];
       return jobs.filter((x) => typeof x.conclusion === "string" && FAILED_JOB.has(x.conclusion)).map((x) => String(x.name));
     });
+  }
+
+  /**
+   * One pull request's reviews, threads and merge state (reviews.ts), in ONE GraphQL query: 1 point of GraphQL's
+   * own budget. GraphQL has no conditional requests, so the shared store is what stops N sessions paying N times:
+   * an answer younger than `freshMs` from any session is used as it is.
+   */
+  async reviewState(repo: string, pr: number, freshMs = 60_000): Promise<ApiResult<ReviewState>> {
+    const [owner, name] = repo.split("/");
+    return this.graphql(`graphql:review:${repo.toLowerCase()}#${pr}`, freshMs, REVIEW_QUERY, { owner, name, number: pr }, parseReviewState);
+  }
+
+  /**
+   * This login's open review requests (requests.ts): one GraphQL search, shared by every session for `freshMs`.
+   * Not about a watched pull request; the poller reads it only when review requests are on.
+   */
+  async reviewRequests(freshMs = 120_000): Promise<ApiResult<RequestsReading>> {
+    return this.graphql("graphql:review-requests", freshMs, REQUESTS_QUERY, { q: REQUESTS_SEARCH }, parseReviewRequests);
+  }
+
+  /**
+   * One GraphQL query, through the shared store like a GET: GraphQL's own rate reading is recorded apart from
+   * REST's (rate-graphql.json), and an answer `parse` finds nothing in is not_found.
+   */
+  private async graphql<T>(key: string, freshMs: number, query: string, variables: Record<string, unknown>, parse: (body: unknown) => T | null): Promise<ApiResult<T>> {
+    const auth = await this.login();
+    if (auth.kind !== "ok") return { kind: "auth", auth };
+    return this.viaStore<T>(key, freshMs, async (store) => {
+      let res: Response;
+      try {
+        res = await this.fetchImpl(`${this.base.replace(/\/v3$/, "")}/graphql`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${auth.token}`, "content-type": "application/json", "user-agent": "runners-io-claude-channel" },
+          body: JSON.stringify({ query, variables }),
+          signal: AbortSignal.timeout(20_000),
+          redirect: "error",
+        });
+      } catch (error) {
+        const e = error as Error;
+        return { kind: "retry", reason: e.name === "TimeoutError" ? "GitHub timed out" : e.message };
+      }
+      this.requests.graphql++;
+      if (res.status === 401) {
+        await res.body?.cancel();
+        await this.login(true);
+        return { kind: "retry", reason: "GitHub refused the login (HTTP 401)" };
+      }
+      if (res.status === 403 || res.status === 429) {
+        const wait = rateLimitWait(res.headers) ?? (await secondaryLimitWait(res)) ?? 60_000;
+        await res.body?.cancel().catch(() => undefined);
+        return { kind: "retry", reason: `GitHub rate limit (HTTP ${res.status})`, afterMs: wait };
+      }
+      if (res.status !== 200) {
+        await res.body?.cancel();
+        return { kind: "retry", reason: `GitHub answered HTTP ${res.status}` };
+      }
+      let body: unknown;
+      try {
+        body = await res.json();
+      } catch {
+        return { kind: "retry", reason: "GitHub answered something that is not JSON" };
+      }
+      const now = this.now();
+      const rate = graphqlRate(body);
+      if (rate) {
+        this.ownGraphqlRate = { remaining: rate.remaining, at: now, limit: rate.limit, reset: rate.reset };
+        store?.writeRate(rate.remaining, now, rate.limit, rate.reset, "rate-graphql.json");
+      }
+      const value = parse(body);
+      if (value === null) return { kind: "not_found" };
+      store?.write({ path: key, etag: "", value, at: now });
+      return { kind: "ok", value };
+    });
+  }
+
+  /**
+   * With a shared store and a freshness window, a stored answer young enough is used as it is; otherwise this
+   * session takes the key's lease (or waits briefly for the session that holds it) and runs `fresh`.
+   */
+  private async viaStore<T>(key: string, freshMs: number, fresh: (store: LoginStore | null, stored: Stored<T> | null) => Promise<ApiResult<T>>): Promise<ApiResult<T>> {
+    const store = freshMs > 0 ? this.store : null;
+    if (!store) return fresh(null, null);
+    const usable = (): Stored<T> | null => {
+      const s = store.read<T>(key);
+      return s && this.now() - s.at < freshMs ? s : null;
+    };
+    let hit = usable();
+    let release = hit ? null : store.lease(key, this.now());
+    const waitUntil = Date.now() + LEASE_WAIT_MS;
+    while (!hit && !release && Date.now() < waitUntil) {
+      await new Promise((r) => setTimeout(r, 50));
+      hit = usable();
+      if (!hit) release = store.lease(key, this.now());
+    }
+    if (!hit && release) hit = usable(); // answered while this session was taking the lease
+    if (hit) {
+      release?.();
+      this.requests.shared++;
+      return { kind: "ok", value: hit.value };
+    }
+    try {
+      return await fresh(store, store.read<T>(key));
+    } finally {
+      release?.();
+    }
   }
 
   /**
@@ -300,31 +464,7 @@ export class GitHubClient {
   private async get<T>(path: string, freshMs: number, map: (json: unknown) => T): Promise<ApiResult<T>> {
     const auth = await this.login();
     if (auth.kind !== "ok") return { kind: "auth", auth };
-    const store = freshMs > 0 ? this.store : null;
-    if (!store) return this.ask(path, auth, map, null, null);
-    const usable = (): Stored<T> | null => {
-      const s = store.read<T>(path);
-      return s && this.now() - s.at < freshMs ? s : null;
-    };
-    let hit = usable();
-    let release = hit ? null : store.lease(path, this.now());
-    const waitUntil = Date.now() + LEASE_WAIT_MS;
-    while (!hit && !release && Date.now() < waitUntil) {
-      await new Promise((r) => setTimeout(r, 50));
-      hit = usable();
-      if (!hit) release = store.lease(path, this.now());
-    }
-    if (!hit && release) hit = usable(); // answered while this session was taking the lease
-    if (hit) {
-      release?.();
-      this.requests.shared++;
-      return { kind: "ok", value: hit.value };
-    }
-    try {
-      return await this.ask(path, auth, map, store, store.read<T>(path));
-    } finally {
-      release?.();
-    }
+    return this.viaStore<T>(path, freshMs, (store, stored) => this.ask(path, auth, map, store, stored));
   }
 
   private async ask<T>(
@@ -355,9 +495,17 @@ export class GitHubClient {
     const scopeHeader = res.headers.get("x-oauth-scopes");
     this.scopes = scopeHeader === null ? null : scopeHeader.split(",").map((x) => x.trim()).filter(Boolean);
     const remaining = Number(res.headers.get("x-ratelimit-remaining"));
-    if (res.headers.has("x-ratelimit-remaining") && Number.isFinite(remaining)) {
-      this.ownRate = { remaining, at: now };
-      store?.writeRate(remaining, now);
+    const resource = res.headers.get("x-ratelimit-resource");
+    if (res.headers.has("x-ratelimit-remaining") && Number.isFinite(remaining) && (resource === null || resource === "core")) {
+      const header = (name: string) => {
+        const n = Number(res.headers.get(name));
+        return res.headers.has(name) && Number.isFinite(n) && n > 0 ? n : undefined;
+      };
+      const limit = header("x-ratelimit-limit");
+      const resetS = header("x-ratelimit-reset");
+      const reset = resetS === undefined ? undefined : resetS * 1000;
+      this.ownRate = { remaining, at: now, ...(limit ? { limit } : {}), ...(reset ? { reset } : {}) };
+      store?.writeRate(remaining, now, limit, reset);
     }
 
     if (res.status === 304 && known) {

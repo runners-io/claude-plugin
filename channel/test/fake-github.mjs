@@ -10,21 +10,28 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
     pulls: new Map(), // "o/r#n" -> pull
     runs: new Map(), // "o/r@sha" -> runs[]
     jobs: new Map(), // runId -> jobs[]
+    annotations: new Map(), // job (check run) id -> annotations[]
     commits: new Map(), // "o/r#n" -> [{ sha }]
     baseRuns: new Map(), // "o/r@branch" -> runs[] (push runs on a branch)
     issueEvents: new Map(), // "o/r#n" -> [{ event, created_at, label? }]
     attempts: new Map(), // "runId/attempt" -> run
     rateLimited: null, // null | { resetEpoch }
+    rate: { remaining: 4999, limit: 5000, reset: null }, // the x-ratelimit-* headers of every answer (reset: epoch s)
     secondaryLimited: false, // a 403 with no rate-limit headers, only the message
     scopes: "repo, workflow", // x-oauth-scopes; null = a fine-grained token (no header)
     failNext: [], // [{ pattern: RegExp, status, count }]
+    restReviews: new Map(), // "o/r#n" -> [{ id, state, submitted_at }] (REST pulls/{n}/reviews)
+    reviewComments: new Map(), // "o/r#n" -> [{ id, created_at, in_reply_to_id? }] (REST pulls/{n}/comments)
+    reviewRequests: { viewer: "octocat", nodes: [] }, // what the review-requested:@me search answers
+    reviewPulls: new Map(), // "o/r#n" -> the GraphQL pullRequest node the review query answers with
+    graphqlRate: { remaining: 4990, limit: 5000 }, // GraphQL's own budget, separate from REST's
   };
   const requests = [];
 
   const send = (req, res, status, body, extra = {}) => {
     const text = body === undefined ? "" : JSON.stringify(body);
     const etag = `"${createHash("sha1").update(text).digest("hex")}"`;
-    const headers = { "content-type": "application/json", "x-ratelimit-remaining": "4999", ...extra };
+    const headers = { "content-type": "application/json", "x-ratelimit-remaining": String(state.rate.remaining), "x-ratelimit-limit": String(state.rate.limit), ...(state.rate.reset ? { "x-ratelimit-reset": String(state.rate.reset) } : {}), ...extra };
     if (state.scopes !== null) headers["x-oauth-scopes"] = state.scopes;
     if (status === 200) {
       headers.etag = etag;
@@ -49,17 +56,51 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
     if (state.secondaryLimited) {
       return send(req, res, 403, { message: "You have exceeded a secondary rate limit. Please wait a few minutes before you try again." });
     }
+    if (req.method === "POST" && url.pathname === "/graphql") {
+      let raw = "";
+      req.on("data", (d) => (raw += d));
+      req.on("end", () => {
+        let body;
+        try {
+          body = JSON.parse(raw);
+        } catch {
+          return send(req, res, 400, { message: "Problems parsing JSON" });
+        }
+        const v = body.variables ?? {};
+        const node = state.reviewPulls.get(`${v.owner}/${v.name}#${v.number}`) ?? null;
+        const resetAt = new Date(Date.now() + 3_600_000).toISOString();
+        const rate = { cost: 1, remaining: state.graphqlRate.remaining, limit: state.graphqlRate.limit, resetAt };
+        requests.push({ path: "/graphql", status: 200, query: String(body.query ?? ""), variables: v });
+        const data = String(body.query ?? "").includes("search(")
+          ? { rateLimit: rate, viewer: { login: state.reviewRequests.viewer }, search: { nodes: state.reviewRequests.nodes } }
+          : { rateLimit: rate, repository: node ? { pullRequest: node } : { pullRequest: null } };
+        res
+          .writeHead(200, {
+            "content-type": "application/json",
+            "x-ratelimit-resource": "graphql",
+            "x-ratelimit-remaining": String(state.graphqlRate.remaining),
+            "x-ratelimit-limit": String(state.graphqlRate.limit),
+          })
+          .end(JSON.stringify({ data }));
+      });
+      return;
+    }
     if (state.rateLimited) {
       return send(req, res, 403, { message: "API rate limit exceeded" }, {
         "x-ratelimit-remaining": "0",
         "x-ratelimit-reset": String(state.rateLimited.resetEpoch),
       });
     }
+    if (url.pathname === "/user") return send(req, res, 200, { login: state.reviewRequests.viewer });
     let m = /^\/repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)$/.exec(url.pathname);
     if (m) {
       const pull = state.pulls.get(`${m[1]}/${m[2]}#${m[3]}`);
       return pull ? send(req, res, 200, pull) : send(req, res, 404, { message: "Not Found" });
     }
+    m = /^\/repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)\/reviews$/.exec(url.pathname);
+    if (m) return send(req, res, 200, state.restReviews.get(`${m[1]}/${m[2]}#${m[3]}`) ?? []);
+    m = /^\/repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)\/comments$/.exec(url.pathname);
+    if (m) return send(req, res, 200, state.reviewComments.get(`${m[1]}/${m[2]}#${m[3]}`) ?? []);
     m = /^\/repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)\/commits$/.exec(url.pathname);
     if (m) return send(req, res, 200, state.commits.get(`${m[1]}/${m[2]}#${m[3]}`) ?? []);
     m = /^\/repos\/([^/]+)\/([^/]+)\/pulls$/.exec(url.pathname);
@@ -84,6 +125,8 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
       const a = state.attempts.get(`${m[3]}/${m[4]}`);
       return a ? send(req, res, 200, a) : send(req, res, 404, { message: "Not Found" });
     }
+    m = /^\/repos\/([^/]+)\/([^/]+)\/check-runs\/(\d+)\/annotations$/.exec(url.pathname);
+    if (m) return send(req, res, 200, state.annotations.get(Number(m[3])) ?? []);
     m = /^\/repos\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)\/jobs$/.exec(url.pathname);
     if (m) {
       const jobs = state.jobs.get(Number(m[3])) ?? [];
@@ -109,6 +152,7 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
         mergeable_state: "clean",
         html_url: `https://github.com/${repo}/pull/${number}`,
         head: { sha: "a".repeat(40), ref: "fix-login" },
+        user: { login: state.reviewRequests.viewer }, // opened by the signed-in login unless a test says otherwise
         ...prev,
         ...fields,
       };
@@ -143,6 +187,28 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
     },
     setAttempt(runId, attempt, run) {
       state.attempts.set(`${runId}/${attempt}`, run);
+    },
+    setRate(remaining, limit = 5000, reset = null) {
+      state.rate = { remaining, limit, reset };
+    },
+    /** The GraphQL pullRequest node (headRefOid, mergeStateStatus, latestOpinionatedReviews, reviewThreads, ...). */
+    setReviews(repo, number, reviews) {
+      state.restReviews.set(`${repo}#${number}`, reviews);
+    },
+    setReviewComments(repo, number, comments) {
+      state.reviewComments.set(`${repo}#${number}`, comments);
+    },
+    setReviewRequests(nodes, viewer = "octocat") {
+      state.reviewRequests = { viewer, nodes };
+    },
+    setReviewPull(repo, number, node) {
+      state.reviewPulls.set(`${repo}#${number}`, node);
+    },
+    setGraphqlRate(remaining, limit = 5000) {
+      state.graphqlRate = { remaining, limit };
+    },
+    setAnnotations(jobId, list) {
+      state.annotations.set(jobId, list);
     },
     setJobs(runId, jobs) {
       state.jobs.set(runId, jobs);

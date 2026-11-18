@@ -87,15 +87,19 @@ async function quietPr() {
   return gh;
 }
 
-test("a pull request whose CI has finished costs under 30 GitHub requests an hour", async () => {
+test("a pull request whose CI has finished costs under 30 REST requests an hour, and about 60 GraphQL points", async () => {
   const gh = await quietPr();
   const s = await session(gh);
   await s.step(3); // the first look and its baseline
   const before = gh.requests.length;
   await s.step(180); // an hour
   await s.stop();
-  const hour = gh.requests.slice(before);
-  if (process.env.SHOW_COUNTS) console.log(`quiet hour: ${hour.length} requests`);
+  // REST and GraphQL are separate hourly budgets; the review read (reviews.ts) is GraphQL's, about once a minute.
+  const all = gh.requests.slice(before);
+  const hour = all.filter((r) => r.path !== "/graphql");
+  const graphql = all.length - hour.length;
+  if (process.env.SHOW_COUNTS) console.log(`quiet hour: ${hour.length} REST requests, ${graphql} GraphQL`);
+  assert.ok(graphql >= 55 && graphql <= 61, `${graphql} GraphQL reads in an hour`);
   assert.ok(hour.length < 30, `${hour.length} requests in a quiet hour: ${[...new Set(hour.map((r) => r.path.split("?")[0]))].join(", ")}`);
 });
 
@@ -136,4 +140,109 @@ test("while CI runs, the PR is looked at every pass", async () => {
   await s.stop();
   const after = gh.requests.filter((r) => r.path === "/repos/octo-org/example/pulls/7").length;
   assert.equal(after - before, 30);
+});
+
+test("with 15% of the rate limit left, a finished PR is read less often; with plenty it is read as before", async () => {
+  const hourAt = async (remaining: number) => {
+    const gh = await quietPr();
+    gh.setRate(remaining);
+    const s = await session(gh);
+    await s.step(3);
+    const before = gh.requests.length;
+    await s.step(180);
+    await s.stop();
+    return gh.requests.length - before;
+  };
+  const plenty = await hourAt(4000);
+  const low = await hourAt(750);
+  if (process.env.SHOW_COUNTS) console.log(`quiet hour: ${plenty} requests with plenty left, ${low} at 15%`);
+  assert.ok(low < plenty, `${low} at 15% left, ${plenty} with plenty`);
+  assert.ok(low >= plenty / 2, `15% left stretches by a third, not more: ${low} vs ${plenty}`);
+});
+
+test("at 10% left, a finished PR, its base and the search for a new PR pause, and resume when the limit resets", async () => {
+  const gh = await quietPr();
+  const s = await session(gh);
+  await s.step(3);
+  const resetAt = 1_700_000_000 + 25 * 60; // the session's clock starts at 1_700_000_000 s
+  gh.setRate(400, 5000, resetAt); // 8%
+  // the reading changes only with an answer: wait for the next look at the finished PR to bring it
+  const rest = () => gh.requests.filter((r) => r.path !== "/graphql").length;
+  const asked = rest();
+  for (let i = 0; i < 20 && rest() === asked; i++) await s.step(1);
+  assert.ok(rest() > asked, "the PR was looked at again");
+  await s.step(1);
+  const before = gh.requests.length;
+  const pausedFor = resetAt * 1000 - 1_700_000_000_000 - s.passes * PASS_MS - PASS_MS;
+  await s.step(Math.floor(pausedFor / PASS_MS)); // until just before the reset
+  const paused = gh.requests.slice(before).filter((r) => r.path !== "/graphql"); // GraphQL's budget is its own
+  assert.deepEqual(paused.map((r) => r.path), [], "nothing read for a finished PR while paused");
+  // GitHub refills the limit only at x-ratelimit-reset, and nothing paused asks it again, so the reading is void
+  // once that time passes: without that, a paused session would stay paused for ever.
+  gh.setRate(4999, 5000, resetAt + 3600);
+  await s.step(30);
+  await s.stop();
+  assert.ok(gh.requests.length > before, "reads resumed after the reset");
+});
+
+test("at 10% left, a PR whose CI is running is still read, at a stretched pace, and its failure still arrives", async () => {
+  const gh = await quietPr();
+  gh.setRuns("octo-org/example", A, [{ id: 41, name: "CI", status: "in_progress" }]);
+  const s = await session(gh);
+  await s.step(3);
+  gh.setRate(250); // 5%: four times slower
+  await s.step(2);
+  const pulls = () => gh.requests.filter((r) => r.path === "/repos/octo-org/example/pulls/7").length;
+  const bases = () => gh.requests.filter((r) => r.path.includes("branch=main")).length;
+  const p0 = pulls();
+  const b0 = bases();
+  await s.step(40);
+  const read = pulls() - p0;
+  assert.ok(read >= 8 && read <= 12, `read ${read} times in 40 passes, four times slower than every pass`);
+  assert.equal(bases() - b0, 0, "the base is not read while paused");
+  gh.setRuns("octo-org/example", A, [{ id: 41, name: "CI", status: "completed", conclusion: "failure" }]);
+  await s.step(5);
+  await s.stop();
+  assert.ok(s.inbox.some((m) => m.meta.kind === "ci.workflow_failed"), "the failure arrived while paused");
+});
+
+const quietReviews = (gh: FakeGitHub, over: Record<string, unknown> = {}) =>
+  gh.setReviewPull("octo-org/example", 7, { headRefOid: A, mergeStateStatus: "BLOCKED", reviewDecision: null, latestOpinionatedReviews: { nodes: [] }, reviewThreads: { nodes: [] }, ...over });
+
+test("reviews are read about once a minute, and an approval arrives within about a minute", async () => {
+  const gh = await quietPr();
+  quietReviews(gh);
+  const s = await session(gh);
+  await s.step(3);
+  const before = gh.requests.filter((r) => r.path === "/graphql").length;
+  await s.step(30); // ten minutes
+  const reads = gh.requests.filter((r) => r.path === "/graphql").length - before;
+  assert.ok(reads >= 9 && reads <= 11, `${reads} GraphQL reads in ten minutes`);
+  let approvedAt = -1;
+  await s.step(1, (p) => {
+    approvedAt = p;
+    quietReviews(gh, { latestOpinionatedReviews: { nodes: [{ id: "R1", state: "APPROVED", authorAssociation: "MEMBER", author: { login: "alice", __typename: "User" } }] } });
+  });
+  let seenAt = -1;
+  for (let i = 0; i < 6 && seenAt < 0; i++) {
+    if (s.inbox.some((m) => m.meta.kind === "pr.approved")) seenAt = s.passes;
+    else await s.step(1);
+  }
+  await s.stop();
+  assert.ok(seenAt > 0 && (seenAt - approvedAt) * PASS_MS <= 80_000, `seen ${(seenAt - approvedAt) * 20} s later`);
+});
+
+test("at 10% of GraphQL's own budget the review reads pause, and the REST reads go on", async () => {
+  const gh = await quietPr();
+  quietReviews(gh);
+  gh.setGraphqlRate(400);
+  gh.setRuns("octo-org/example", A, [{ id: 41, name: "CI", status: "in_progress" }]);
+  const s = await session(gh);
+  await s.step(3); // the first review read brings the reading
+  const g0 = gh.requests.filter((r) => r.path === "/graphql").length;
+  const p0 = gh.requests.filter((r) => r.path === "/repos/octo-org/example/pulls/7").length;
+  await s.step(30);
+  await s.stop();
+  assert.equal(gh.requests.filter((r) => r.path === "/graphql").length - g0, 0, "no review read while GraphQL's budget is low");
+  assert.equal(gh.requests.filter((r) => r.path === "/repos/octo-org/example/pulls/7").length - p0, 30, "the PR's REST reads are unaffected");
 });

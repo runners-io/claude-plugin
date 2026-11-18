@@ -36,13 +36,43 @@ const gapMinutes = Number(opt("--gap-minutes", "12"));
 const asJson = flag("--json");
 const githubApi = opt("--github-api", "https://api.github.com").replace(/\/+$/, "");
 
+// A record's text (a session, a project, an event kind, an error's reason, a workflow name) is printed to a
+// terminal. Whoever names a workflow or a branch chooses those characters, and an ESC or C1 sequence printed raw
+// can clear the screen, rewrite earlier lines or set the window title. So every printed line goes through
+// printable(), and the JSON form escapes what JSON.stringify leaves raw.
+const ESCAPE_SEQUENCE = /\u001b\[[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|\u001b[@-_]|\u009b[0-?]*[ -/]*[@-~]|\u009d[^\u0007\u009c]*[\u0007\u009c]?/g;
+// C0 (but the newline), DEL, C1, the line and paragraph separators, and the bidirectional overrides that reorder
+// what a terminal shows.
+const CONTROL = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028-\u202e\u2066-\u2069]/g;
+
+function printable(text) {
+  return String(text).replace(ESCAPE_SEQUENCE, "").replace(CONTROL, "");
+}
+
+/** JSON.stringify escapes C0 but not DEL, C1, the separators or the bidirectional overrides; those sit only inside strings. */
+function printableJson(value) {
+  return JSON.stringify(value, null, 2).replace(/[\u007f-\u009f\u2028-\u202e\u2066-\u2069]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
 function couldNotEvaluate(why) {
-  process.stderr.write(`could not evaluate: ${why}\n`);
-  process.stdout.write(`could not evaluate: ${why}\n`);
+  process.stderr.write(`could not evaluate: ${printable(why)}\n`);
+  process.stdout.write(`could not evaluate: ${printable(why)}\n`);
   process.exit(2);
 }
 
 if (!dir) couldNotEvaluate("pass --dir, or set RUNNERS_IO_EVENT_LOG_DIR");
+// The github.com login goes to api.github.com only. This machine is accepted under RUNNERS_IO_TEST_FAKE_GITHUB=1,
+// for the tests' fake GitHub; any other address, a local port included, would be handed the user's token.
+if (githubApi !== "https://api.github.com") {
+  let host = "";
+  try {
+    const u = new URL(githubApi);
+    host = u.protocol === "http:" || u.protocol === "https:" ? u.hostname : "";
+  } catch {}
+  const local = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(host);
+  if (!(local && process.env.RUNNERS_IO_TEST_FAKE_GITHUB === "1"))
+    couldNotEvaluate(`--github-api accepts only https://api.github.com, so your github.com login goes nowhere else: ${githubApi}`);
+}
 const rel = /^(\d+)([hd])$/.exec(sinceArg);
 const since = rel ? Date.now() - Number(rel[1]) * (rel[2] === "h" ? 3_600_000 : 86_400_000) : Date.parse(sinceArg);
 if (!Number.isFinite(since)) couldNotEvaluate(`--since ${sinceArg} is neither like 24h nor a time`);
@@ -80,6 +110,16 @@ for (const r of records) {
   s.records.push(r);
   sessions.set(r.session, s);
 }
+// A session that wrote nothing for longer than a heartbeat interval (5 min, plus slack) and has no stop record has
+// ENDED: killed or crashed. It watched until its last record, not until now -- counting it as watching for
+// ever turned every later event on its PRs into a false MISS. It is listed, so a crash is seen; it is not a finding
+// on its own, because a session ended with a signal (a harness, a closed terminal) looks the same.
+const ENDED_AFTER_MS = 6 * 60_000;
+const endedWithoutStop = [...sessions.values()]
+  .filter((s) => !s.stopped && Date.now() - Date.parse(s.last) > ENDED_AFTER_MS)
+  .map((s) => ({ session: s.session, project: s.project, last: s.last }));
+const ended = new Set(endedWithoutStop.map((e) => e.session));
+
 const gaps = [];
 let minRate = null;
 const requests = {};
@@ -169,12 +209,13 @@ const summary = {
   problems,
   send_errors: sendErrors,
   gaps,
+  ended_without_stop: endedWithoutStop,
   api: { min_rate_remaining: minRate, requests_by_session: requests, requests_per_hour: perHour },
   github,
 };
 const findings = gaps.length + sendErrors.length + Object.keys(problems).length + (github?.misses.length ?? 0);
 
-if (asJson) process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+if (asJson) process.stdout.write(`${printableJson(summary)}\n`);
 else process.stdout.write(text(summary));
 process.exit(findings ? 1 : 0);
 
@@ -206,20 +247,42 @@ async function checkGitHub() {
   // When each PR was watched: from each subscribe to its unsubscribe (or now), across all sessions.
   const windows = new Map();
   const open = new Map();
+  // A subscription older than the window has no subscribe record in it, and once opened no window, so the
+  // check covered nothing and said "0 misses". A heartbeat's `watching` list names what its session watched; a PR it
+  // names with no window open was subscribed before the window, and counts from the window's start. An unsubscribe
+  // with nothing open closes such a window.
+  const windowStart = new Date(since).toISOString();
+  const close = (key, from, to) => (windows.get(key) ?? windows.set(key, []).get(key)).push([from, to]);
+  const closed = new Set();
+  let saidWatching = false;
   for (const r of records) {
+    if (r.type === "heartbeat") {
+      if (Number(r.subscriptions) > 0) saidWatching = true;
+      for (const key of Array.isArray(r.watching) ? r.watching : []) {
+        const sk = `${r.session}|${key}`;
+        if (!open.has(sk) && !closed.has(sk)) open.set(sk, windowStart);
+      }
+      continue;
+    }
     if (!r.repo || !r.pr) continue;
     const key = `${r.repo}#${r.pr}`;
     const sk = `${r.session}|${key}`;
     if (r.type === "subscribe" && !open.has(sk)) open.set(sk, r.t);
-    if (r.type === "unsubscribe" && open.has(sk)) {
-      (windows.get(key) ?? windows.set(key, []).get(key)).push([open.get(sk), r.t]);
+    if (r.type === "unsubscribe") {
+      close(key, open.get(sk) ?? (closed.has(sk) ? r.t : windowStart), r.t);
       open.delete(sk);
+      closed.add(sk);
     }
   }
-  const lastBySession = new Map([...sessions.values()].map((s) => [s.session, s.stopped ? s.last : new Date().toISOString()]));
+  const lastBySession = new Map([...sessions.values()].map((s) => [s.session, s.stopped || ended.has(s.session) ? s.last : new Date().toISOString()]));
   for (const [sk, from] of open) {
     const [session, key] = sk.split("|");
     (windows.get(key) ?? windows.set(key, []).get(key)).push([from, lastBySession.get(session)]);
+  }
+  if (saidWatching && windows.size === 0) {
+    // An older build's heartbeat carries how many PRs it watched but not which: "0 misses" here would be a check of
+    // nothing, so it is not an all-clear.
+    couldNotEvaluate("heartbeats say a PR was watched, but no subscribe record or watching list in the window names it");
   }
   const inside = (key, t) => (windows.get(key) ?? []).some(([a, b]) => t >= a && t <= b);
   const sent = new Set(records.filter((r) => r.type === "event" && r.outcome === "sent").map((r) => `${r.repo}#${r.pr}|${r.kind}|${r.run_id ?? ""}`));
@@ -285,6 +348,19 @@ async function checkGitHub() {
         if (kind && ev.created_at) expect(kind, ev.created_at);
       }
 
+      // Reviews: every review that approved or requested changes (REST keeps them all, the first 100).
+      const REVIEW_KINDS = { APPROVED: "pr.approved", CHANGES_REQUESTED: "pr.changes_requested" };
+      for (const rv of await gh(`/repos/${repo}/pulls/${pr}/reviews?per_page=100`, auth)) {
+        const kind = REVIEW_KINDS[rv.state];
+        if (kind && rv.submitted_at) expect(kind, rv.submitted_at, { review_id: rv.id }, (r) => String(r.review_url ?? "").endsWith(`#pullrequestreview-${rv.id}`));
+      }
+      // A new review thread is a review comment that replies to none (the first 100).
+      for (const cm of await gh(`/repos/${repo}/pulls/${pr}/comments?per_page=100`, auth)) {
+        if (!cm.in_reply_to_id && cm.created_at) {
+          expect("pr.review_thread_added", cm.created_at, { comment_id: cm.id }, (r) => String(r.review_url ?? "").endsWith(`#discussion_r${cm.id}`));
+        }
+      }
+
       // Flaky: a re-run on the head commit that passed after its previous attempt failed.
       for (const [sha, runs] of runsBySha) {
         for (const run of runs) {
@@ -322,7 +398,7 @@ async function checkGitHub() {
     misses,
     superseded,
     not_checked:
-      "merge conflicts (GitHub keeps no history of them), pr.head_moved (whether this machine had the commit) and pr.body_edited (REST keeps no edit history)",
+      "merge conflicts (GitHub keeps no history of them), pr.head_moved (whether this machine had the commit), pr.body_edited (REST keeps no edit history), pr.review_thread_resolved and pr.ready_to_merge (no history of either), ci.job_failed and ci.job_stuck_queued (a job's history does not say what the run was doing at the time) and review.requested (not tied to a watched pull request)",
   };
 }
 
@@ -351,6 +427,8 @@ function text(s) {
   out.push(`events that could not be sent: ${s.send_errors.length}`);
   out.push(`sessions started without the channel flag (channel_inactive): ${s.channel_inactive.sessions}`);
   out.push(`gaps over ${gapMinutes} min: ${s.gaps.length}`);
+  out.push(`ended without a stop record: ${s.ended_without_stop.length}`);
+  for (const e of s.ended_without_stop) out.push(`  ${e.session} ${e.project}: last record ${e.last}`);
   for (const g of s.gaps) out.push(`  ${g.session} ${g.project}: ${g.from} .. ${g.to} (${g.minutes} min)`);
   if (s.github) {
     out.push(`GitHub check: ${s.github.checked_prs} PR(s), ${s.github.misses.length} miss(es), ${s.github.superseded} superseded failure(s) rightly not sent; not checked: ${s.github.not_checked}`);
@@ -358,5 +436,5 @@ function text(s) {
       out.push(`  MISS ${m.kind} ${m.repo}#${m.pr}${m.run_id ? ` run ${m.run_id} "${m.workflow}"` : ""}${m.state ? ` ${m.state}` : ""} at ${m.github_at}`);
     }
   }
-  return `${out.join("\n")}\n`;
+  return `${out.map(printable).join("\n")}\n`;
 }

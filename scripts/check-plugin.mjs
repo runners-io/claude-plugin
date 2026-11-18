@@ -4,17 +4,32 @@
 // a server that exists, the remote MCP address, a bundle that is really there,
 // a bundle that never declares the permission relay and offers only the four
 // subscription tools, a channel that reads GitHub and not runners.io, and the
-// PR hook pointing at a script that exists.
+// PR hook pointing at a script that exists. And one version: every field that names the plugin's version names the
+// same one, and, with --against, a plugin that changed since <git ref> carries a newer version than it had there,
+// because an installed copy is cached by its version and a release that keeps the old one is a release nobody can
+// tell apart from the last.
 //
-//   node scripts/check-plugin.mjs [plugin-root]
+//   node scripts/check-plugin.mjs [plugin-root] [--against <git ref>]
 //
-// Runs with no dependencies on Node 20 or later. Exit 1 names every failure.
+// Runs with no dependencies on Node 20 or later (and git, for --against). Exit 1 names every failure.
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = resolve(process.argv[2] ?? join(dirname(fileURLToPath(import.meta.url)), ".."));
 const failures = [];
+let rootArg;
+let against;
+for (let i = 2; i < process.argv.length; i++) {
+  const a = process.argv[i];
+  if (a === "--against") {
+    against = process.argv[++i];
+    if (!against || against.startsWith("-")) failures.push("--against needs a git ref after it");
+  } else if (a.startsWith("-")) failures.push(`unknown option ${a}`);
+  else if (rootArg === undefined) rootArg = a;
+  else failures.push(`more than one plugin root: ${rootArg} and ${a}`);
+}
+const root = resolve(rootArg ?? join(dirname(fileURLToPath(import.meta.url)), ".."));
 const check = (ok, what) => {
   if (!ok) failures.push(what);
 };
@@ -29,6 +44,59 @@ const entry = (market.plugins ?? []).find((p) => p.name === plugin.name);
 check(entry, "marketplace.json lists no plugin named like plugin.json");
 check(entry?.source === "./", `the marketplace entry's source is ${JSON.stringify(entry?.source)}, not "./" (the repository root)`);
 check(plugin.version && /^\d+\.\d+\.\d+$/.test(plugin.version), "plugin.json has no x.y.z version");
+
+// ONE VERSION. plugin.json's is the one Claude Code installs and caches by; the others must say the same, or the
+// channel reports one version in its log and `version` command while the plugin was installed as another. The
+// channel's VERSION is a literal in its source (esbuild inlines it into the bundle, and CI requires the committed
+// bundle to equal a fresh build), so the source is what is checked here.
+const pkg = json("channel/package.json");
+const lock = json("channel/package-lock.json");
+const mainSrc = readFileSync(join(root, "channel/src/main.ts"), "utf8");
+const mainVersion = mainSrc.match(/^export const VERSION = "([^"]*)";$/m)?.[1];
+check(mainVersion !== undefined, 'channel/src/main.ts has no `export const VERSION = "x.y.z";` line');
+const versions = [
+  ...(entry && "version" in entry ? [["the marketplace entry's version", entry.version]] : []),
+  ["channel/package.json version", pkg.version],
+  ["channel/package-lock.json version", lock.version],
+  ['channel/package-lock.json packages[""].version', lock.packages?.[""]?.version],
+  ...(mainVersion !== undefined ? [["channel/src/main.ts VERSION", mainVersion]] : []),
+];
+for (const [field, v] of versions) {
+  check(v === plugin.version, `${field} is ${v ?? "missing"}, not ${plugin.version} as in .claude-plugin/plugin.json: every version field must name the same version`);
+}
+
+// A RELEASE IS A NEW VERSION. With --against <ref>: when anything under the plugin differs from the ref (a tracked
+// file changed, added or removed, or a new untracked file), plugin.json's version must be newer than at the ref.
+// A ref git cannot resolve is a failure, never a pass: a shallow checkout that lacks the base would otherwise
+// prove nothing.
+if (against && !against.startsWith("-")) {
+  const git = (...args) => spawnSync("git", ["-C", root, ...args], { encoding: "utf8" });
+  const prefix = git("rev-parse", "--show-prefix");
+  const base = git("rev-parse", "--verify", "--quiet", `${against}^{commit}`);
+  if (prefix.status !== 0) {
+    failures.push(`--against ${against}: ${root} is not in a git repository`);
+  } else if (base.status !== 0) {
+    failures.push(`--against ${against}: git cannot resolve ${against} to a commit here (in CI, a checkout deep enough to hold it, such as fetch-depth: 0)`);
+  } else {
+    const diff = git("diff", "--name-only", against, "--", ".");
+    const untracked = git("ls-files", "--others", "--exclude-standard", "--", ".");
+    if (diff.status !== 0 || untracked.status !== 0) {
+      failures.push(`--against ${against}: git could not list what changed: ${(diff.stderr + untracked.stderr).trim()}`);
+    } else {
+      const changed = [...new Set(`${diff.stdout}${untracked.stdout}`.split("\n").filter(Boolean))].sort();
+      const before = git("show", `${against}:${prefix.stdout.trim()}.claude-plugin/plugin.json`);
+      // No plugin.json at the ref: the plugin is new there, so any version is a new one.
+      const was = before.status === 0 ? JSON.parse(before.stdout).version : undefined;
+      if (changed.length && was !== undefined) {
+        const shown = changed.slice(0, 10).join(", ") + (changed.length > 10 ? `, and ${changed.length - 10} more` : "");
+        check(
+          newer(plugin.version, was),
+          `${changed.length} file(s) under the plugin changed since ${against} (${shown}), but its version is ${plugin.version}, not newer than ${was} there: a release must be a new version, so raise every version field`,
+        );
+      }
+    }
+  }
+}
 
 const servers = plugin.mcpServers ?? {};
 const remote = servers["runners-io-mcp"];
@@ -46,6 +114,9 @@ check(arg.startsWith("${CLAUDE_PLUGIN_ROOT}/"), "the channel server's path does 
 const bundlePath = join(root, arg.replace("${CLAUDE_PLUGIN_ROOT}/", ""));
 check(existsSync(bundlePath), `the channel bundle ${bundlePath} does not exist`);
 check(local?.env?.RUNNERS_IO_AUTO_SUBSCRIBE === "${user_config.auto_subscribe}", "the channel's env does not pass the auto_subscribe option as RUNNERS_IO_AUTO_SUBSCRIBE");
+check(local?.env?.RUNNERS_IO_REVIEW_REQUESTS === "${user_config.review_requests}", "the channel's env does not pass the review_requests option as RUNNERS_IO_REVIEW_REQUESTS");
+const requests = channel.userConfig?.review_requests;
+check(JSON.stringify(requests?.options) === JSON.stringify(["off", "on"]) && requests?.default === "off", "the channel's review_requests option is not off|on with default off");
 const auto = channel.userConfig?.auto_subscribe;
 check(JSON.stringify(auto?.options) === JSON.stringify(["pr", "off"]) && auto?.default === "pr", "the channel's auto_subscribe option is not pr|off with default pr");
 for (const [k, v] of Object.entries(local?.env ?? {})) {
@@ -84,8 +155,18 @@ for (const name of readdirSync(skills)) {
 }
 for (const name of ["fix-failing-ci", "watch-this-pr", "sign-in", "setup-github"]) check(existsSync(join(skills, name, "SKILL.md")), `the ${name} skill is missing`);
 
+/** True when x.y.z version `now` is greater than `was`, comparing each part as a number (1.10.0 > 1.2.3). */
+function newer(now, was) {
+  const parts = (v) => (/^\d+\.\d+\.\d+$/.test(v ?? "") ? v.split(".").map(Number) : undefined);
+  const a = parts(now);
+  const b = parts(was);
+  if (!a || !b) return a !== undefined && now !== was;
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] > b[i];
+  return false;
+}
+
 if (failures.length) {
   console.error(`check-plugin: ${failures.length} problem(s):\n- ${failures.join("\n- ")}`);
   process.exit(1);
 }
-console.log(`check-plugin: ${root} is consistent (plugin ${plugin.name} ${plugin.version}, channel ${channel.server})`);
+console.log(`check-plugin: ${root} is consistent (plugin ${plugin.name} ${plugin.version}, channel ${channel.server}${against ? `, a new version since ${against} or no change` : ""})`);

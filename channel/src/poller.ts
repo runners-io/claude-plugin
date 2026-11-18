@@ -17,15 +17,19 @@
  *   one of its PRs is busy.
  */
 import type { Config } from "./config.ts";
-import { type Phase, RUNS_EVERY_MS, lookEveryMs, phaseOf } from "./cadence.ts";
-import { type ChannelMessage, clean, describe, scopeMessage, setupMessage, toMessage } from "./format.ts";
+import { type Phase, REQUESTS_EVERY_MS, REVIEW_EVERY_MS, RUNS_EVERY_MS, lookEveryMs, phaseOf, ratePressure } from "./cadence.ts";
+import { type JobsSeen, jobChanges } from "./jobs.ts";
+import { type RequestsSeen, requestChanges, requestMessage } from "./requests.ts";
+import { type ReviewState, reviewChanges } from "./reviews.ts";
+import { type ChannelMessage, clean, describe, safeLink, scopeMessage, setupMessage, toMessage } from "./format.ts";
 import type { GitScope } from "./git.ts";
 import { type EventLog, NO_EVENT_LOG } from "./eventlog.ts";
-import type { ApiResult, GhProblem, GitHubClient } from "./github.ts";
+import type { BaseRunInfo, ApiResult, GhProblem, GitHubClient } from "./github.ts";
 import { log } from "./log.ts";
-import { baseVerdict } from "./rules.mjs";
+import { baseVerdict, latestPerWorkflow } from "./rules.mjs";
 import { type Change, type EventKind, type Snapshot, carry, diff, needsAttention } from "./state.ts";
-import { type Entry, type Subscriptions, wants } from "./subscriptions.ts";
+import type { HookRequest } from "./hookrequests.ts";
+import { type Entry, MAX_HOOK_SUBSCRIPTIONS, MAX_SUBSCRIPTIONS, type Subscriptions, wants } from "./subscriptions.ts";
 
 /**
  * The PR and its head's runs. `reuseRunsOf`: a snapshot whose runs stand in for a fresh read when the PR has not
@@ -57,6 +61,8 @@ export async function fetchSnapshot(gh: GitHubClient, repo: string, pr: number, 
       prUrl: p.htmlUrl,
       runs,
       ...(p.closedAt ? { closedAt: p.closedAt } : {}),
+      ...(p.createdAt ? { createdAt: p.createdAt } : {}),
+      ...(p.author ? { author: p.author } : {}),
       ...(p.updatedAt ? { updatedAt: p.updatedAt } : {}),
       ...(p.baseRef ? { baseRef: p.baseRef } : {}),
       ...(p.draft !== undefined ? { draft: p.draft } : {}),
@@ -93,6 +99,13 @@ export interface PollerDeps {
   readonly now?: () => number;
   /** Test seam: how often a PR in a phase is looked at (cadence.ts); `() => 0` looks at every PR every pass. */
   readonly lookEveryMs?: (phase: Phase, pollMs: number, quietLooks: number) => number;
+  /** How often a watched open PR's reviews are read (cadence.ts REVIEW_EVERY_MS); tests set 0. */
+  readonly reviewEveryMs?: number;
+  /** How often this login's review requests are searched, when on (cadence.ts REQUESTS_EVERY_MS); tests set 0. */
+  readonly requestsEveryMs?: number;
+  /** PRs the PostToolUse hook handed over since the last pass (hookrequests.ts takeRequests); none by default. */
+  readonly takeHookRequests?: () => readonly HookRequest[];
+  readonly limits?: Partial<typeof DEFAULT_LIMITS>;
 }
 
 function realSleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -130,6 +143,34 @@ function currentState(s: Snapshot): ChannelMessage {
  */
 export const NOT_FOUND_LIMIT = 3;
 
+/**
+ * A PR the hook handed over is kept only if GitHub says it was opened at most this long before the hook
+ * saw it. Any tool output that names a PR is handed over (a script's log, `gh pr view`), and only a PR just opened
+ * is one this session made; an older one is dropped after its first look, without a word.
+ */
+export const HOOK_NEW_MS = 15 * 60_000;
+
+/** The limits a session watches within (deps.limits overrides any of them, for tests). */
+export const DEFAULT_LIMITS = {
+  total: MAX_SUBSCRIPTIONS,
+  hook: MAX_HOOK_SUBSCRIPTIONS,
+  eventsPerPr: 20,
+  eventWindowMs: 10 * 60_000,
+};
+
+/** Said once when a PR's events pass the budget; nothing more is pushed for it until the window moves on. */
+function throttled(repo: string, pr: string, windowMs: number): ChannelMessage {
+  return {
+    content:
+      `${repo} PR #${pr} changed more often than this session is told about in ${Math.round(windowMs / 60_000)} minutes, ` +
+      "so further events for it are held back for now. Call ci_status for its current state.",
+    meta: { kind: "channel_throttled", repo, pr },
+  };
+}
+
+/** How long a base keeps a workflow's last run once it has left the window read. */
+export const CARRY_BASE_RUN_MS = 24 * 60 * 60_000;
+
 export async function runPoller(deps: PollerDeps): Promise<void> {
   const { config, gh, subs, signal } = deps;
   // The head commit each PR's ci.workflow_started was last sent for: a push starts many workflows, and one
@@ -138,14 +179,32 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
   const sleep = deps.sleep ?? realSleep;
   const events = deps.eventLog ?? NO_EVENT_LOG;
   const heartbeatMs = deps.heartbeatMs ?? 300_000;
+  const limits = { ...DEFAULT_LIMITS, ...deps.limits };
+  // Per PR, when each event of the current window was sent: past limits.eventsPerPr, one channel_throttled and then
+  // nothing for that PR until the window moves on. A PR whose CI changes faster than a person reads is noise, and
+  // every event carries text from the repository.
+  const sentAt = new Map<string, number[]>();
   let lastBeat = 0;
   const unsubscribe = (e: Entry, reason: string) => {
     subs.remove(e.repo, e.pr);
     events.write("unsubscribe", { repo: e.repo, pr: e.pr, source: e.source, reason });
   };
-  const send = async (message: ChannelMessage, change: Change | null, wanted = true, reason?: string) => {
-    const fields = eventFields(message, change);
+  const send = async (message: ChannelMessage, change: Change | null, wanted = true, reason?: string, extra: Record<string, unknown> = {}) => {
+    let fields = { ...eventFields(message, change), ...extra };
     if (!wanted) return events.write("event", { ...fields, outcome: "filtered", ...(reason ? { reason } : {}) });
+    const meta = message.meta as Record<string, unknown>;
+    if (typeof meta.repo === "string" && typeof meta.pr === "string") {
+      const key = `${meta.repo.toLowerCase()}#${meta.pr}`;
+      const recent = (sentAt.get(key) ?? []).filter((t) => now() - t < limits.eventWindowMs);
+      sentAt.set(key, recent);
+      if (recent.length > limits.eventsPerPr) return events.write("event", { ...fields, outcome: "filtered", reason: "throttled" });
+      recent.push(now());
+      if (recent.length > limits.eventsPerPr) {
+        events.write("event", { ...fields, outcome: "filtered", reason: "throttled" });
+        message = throttled(meta.repo, meta.pr, limits.eventWindowMs);
+        fields = { ...eventFields(message, null), ...extra };
+      }
+    }
     try {
       await deps.notify(message);
       events.write("event", { ...fields, outcome: "sent" });
@@ -159,15 +218,21 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
   const now = deps.now ?? Date.now;
   const lookEvery = deps.lookEveryMs ?? lookEveryMs;
   /** Per watched PR: when it is next looked at, and what the cadence needs to know. */
+  /** The rate limit's back-off, from the newest reading any session on this machine got (cadence.ts). */
+  const pressure = () => ratePressure(gh.rateRemaining, gh.rateLimit);
+  let rateLevel: "normal" | "slowed" | "paused" = "normal";
   const looks = new Map<string, { next: number; quiet: number; phase: Phase; headSha: string; headSeenAt: number; runsReadAt: number }>();
   let findLabel = "";
   let findSince = 0;
   let foundAt = Number.NEGATIVE_INFINITY;
-  const bases = new Map<string, { red: boolean; readAt: number }>();
+  /** Per base: its verdict, when it was read, and each workflow's newest completed run so far. */
+  const bases = new Map<string, { red: boolean; readAt: number; runs: BaseRunInfo[] }>();
   let saidProblem: GhProblem["kind"] | null = null;
   let lastScope = "";
   let saidScope = false;
   const misses = new Map<string, number>();
+  /** Per PR the hook handed over and not yet looked at: when the hook saw it (HOOK_NEW_MS). */
+  const hookSeenAt = new Map<string, number>();
 
   const problem = async (p: GhProblem) => {
     if (saidProblem !== p.kind) {
@@ -178,9 +243,105 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
     }
   };
 
+  const reviewEveryMs = deps.reviewEveryMs ?? REVIEW_EVERY_MS;
+  /** Per watched PR: the last review reading (null until the first) and when to read again. */
+  const reviews = new Map<string, { state: ReviewState | null; next: number }>();
+  const REVIEW_KINDS: EventKind[] = ["pr.approved", "pr.changes_requested", "pr.review_thread_added", "pr.review_thread_resolved", "pr.ready_to_merge"];
+  /**
+   * Each watched open PR whose subscription wants a review kind: one GraphQL read about once a minute
+   * (reviews.ts). GraphQL's budget is its own, so its own reading decides the back-off and the pause.
+   */
+  const checkReviews = async () => {
+    for (const key of reviews.keys()) if (!subs.list().some((e) => e.key === key)) reviews.delete(key);
+    const p = ratePressure(gh.graphqlRemaining, gh.graphqlLimit);
+    if (p.pause) return;
+    for (const entry of subs.list()) {
+      if (signal.aborted) return;
+      if (entry.last?.state !== "open" || !REVIEW_KINDS.some((k) => wants(entry, k))) continue;
+      const seen = reviews.get(entry.key);
+      if (seen && now() < seen.next) continue;
+      const r = await gh.reviewState(entry.repo, entry.pr, reviewEveryMs);
+      if (r.kind === "auth") {
+        await problem(r.auth);
+        return;
+      }
+      if (r.kind !== "ok") {
+        if (r.kind === "retry") events.write("api_error", { repo: entry.repo, pr: entry.pr, result: "retry", reason: r.reason, api: "graphql" });
+        reviews.set(entry.key, { state: seen?.state ?? null, next: now() + Math.max(reviewEveryMs, r.kind === "retry" ? (r.afterMs ?? 0) : 0) });
+        continue;
+      }
+      const live = subs.get(entry.repo, entry.pr);
+      if (!live?.last) continue;
+      const { changes, keep } = reviewChanges(seen?.state ?? null, r.value, live.last);
+      reviews.set(entry.key, { state: keep, next: now() + reviewEveryMs * p.stretch });
+      for (const change of changes) await send(toMessage(change), change, wants(live, change.kind));
+    }
+  };
+
+  /** Per watched PR: the jobs already reported failed or stuck (jobs.ts); absent until the PR's first look. */
+  const jobsSeen = new Map<string, JobsSeen>();
+  const JOB_KINDS: EventKind[] = ["ci.job_failed", "ci.job_stuck_queued"];
+  /**
+   * The jobs of each run on the head that has not finished, when the subscription wants a job kind: one GET per
+   * such run per look, a 304 when nothing changed. The PR's first look is a baseline (jobs.ts).
+   */
+  const checkJobs = async (entry: Entry, snap: Snapshot) => {
+    for (const key of jobsSeen.keys()) if (!subs.list().some((e) => e.key === key)) jobsSeen.delete(key);
+    if (!JOB_KINDS.some((k) => wants(entry, k))) return;
+    let seen = jobsSeen.get(entry.key) ?? null;
+    for (const run of snap.runs) {
+      if (run.status === "completed" || signal.aborted) continue;
+      const r = await gh.runJobs(entry.repo, run.id);
+      if (r.kind === "auth") return problem(r.auth);
+      if (r.kind !== "ok") continue;
+      const { changes, keep } = jobChanges(seen, run, r.value, snap, now());
+      seen = keep;
+      jobsSeen.set(entry.key, keep);
+      for (const change of changes) {
+        let full = change;
+        if (change.kind === "ci.job_failed" && change.job && wants(entry, change.kind)) {
+          const a = await gh.jobAnnotations(entry.repo, change.job.id);
+          if (a.kind === "ok") full = { ...change, job: { ...change.job, annotations: a.value } };
+        }
+        await send(toMessage(full), full, wants(entry, change.kind));
+      }
+    }
+    // No run left to read: the baseline is "nothing", so a later run's first failure is news. A read that failed
+    // leaves the baseline for the next look.
+    if (!jobsSeen.has(entry.key) && snap.runs.every((r) => r.status === "completed")) jobsSeen.set(entry.key, { failed: new Set(), stuck: new Set() });
+  };
+
+  const requestsEveryMs = deps.requestsEveryMs ?? REQUESTS_EVERY_MS;
+  let requests: { seen: RequestsSeen | null; next: number } = { seen: null, next: 0 };
+  /** This login's review requests (requests.ts), when on: one shared GraphQL search every few minutes. */
+  const checkReviewRequests = async () => {
+    if (!config.reviewRequests || now() < requests.next) return;
+    const p = ratePressure(gh.graphqlRemaining, gh.graphqlLimit);
+    if (p.pause) return;
+    const r = await gh.reviewRequests(requestsEveryMs > 0 ? requestsEveryMs - 1_000 : 0);
+    if (r.kind === "auth") return problem(r.auth);
+    if (r.kind !== "ok") {
+      if (r.kind === "retry") events.write("api_error", { result: "retry", reason: r.reason, api: "graphql", what: "review_requests" });
+      requests = { ...requests, next: now() + Math.max(requestsEveryMs, r.kind === "retry" ? (r.afterMs ?? 0) : 0) };
+      return;
+    }
+    const { fresh, keep } = requestChanges(requests.seen, r.value, now());
+    requests = { seen: keep, next: now() + requestsEveryMs * p.stretch };
+    for (const q of fresh) {
+      const at = Date.parse(q.at);
+      await send(requestMessage(q), null, true, undefined, {
+        review_url: safeLink(q.url) || null,
+        github_at: q.at || null,
+        latency_ms: Number.isFinite(at) ? Math.max(0, Date.now() - at) : null,
+      });
+    }
+  };
+
   const BASE_KINDS: EventKind[] = ["base.red", "base.green"];
   /** Each base branch a subscription wants news of, read at most every `baseEveryMs`; red <-> green is pushed. */
   const checkBases = async () => {
+    if (pressure().pause) return; // a base is news, not the PR's own CI: it waits for the limit to refill
+    const stretch = pressure().stretch;
     const targets = new Map<string, Entry[]>();
     for (const e of subs.list()) {
       const base = e.last?.state === "open" ? e.last.baseRef : undefined;
@@ -192,7 +353,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
     for (const [key, entries] of targets) {
       const known = bases.get(key);
       const busy = entries.some((e) => looks.get(e.key)?.phase !== "finished");
-      if (known && now() - known.readAt < (busy ? baseEveryMs : baseIdleMs)) continue;
+      if (known && now() - known.readAt < (busy ? baseEveryMs : baseIdleMs) * stretch) continue;
       const first = entries[0];
       const base = first.last?.baseRef as string;
       const r = await gh.baseRuns(first.repo, base, baseEveryMs);
@@ -200,8 +361,12 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
         if (r.kind === "retry") events.write("api_error", { repo: first.repo, base, result: "retry", reason: r.reason });
         continue;
       }
-      const v = baseVerdict(r.value);
-      bases.set(key, { red: v.red, readAt: now() });
+      // A workflow missing from this window keeps its last run, for a day: long enough for the slowest
+      // workflow on a busy main, short enough that a workflow deleted while red does not hold the base red for ever.
+      const carried = (known?.runs ?? []).filter((x) => now() - Date.parse(x.created_at ?? "") < CARRY_BASE_RUN_MS);
+      const runs = latestPerWorkflow([...carried, ...r.value]);
+      const v = baseVerdict(runs);
+      bases.set(key, { red: v.red, readAt: now(), runs });
       if (!known || known.red === v.red) continue;
       // ONE event per base and transition, naming every watched PR on it: it is about the base, and one per PR
       // said "main is green again" once for each.
@@ -221,7 +386,21 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
     const belowFloor = () => gh.rateRemaining !== null && gh.rateRemaining < config.rateFloor;
     // With other sessions on this machine (shared.ts), an answer younger than one interval is read from the
     // shared store instead of asking GitHub again, so N sessions cost what one does.
-    gh.freshMs = belowFloor() ? waitMs * 4 : waitMs;
+    gh.freshMs = waitMs * Math.max(belowFloor() ? 4 : 1, pressure().stretch);
+    {
+      const p = pressure();
+      const level = p.pause ? "paused" : p.stretch > 1 ? "slowed" : "normal";
+      if (level !== rateLevel) {
+        if (rateLevel !== "normal" || level !== "normal") {
+          log(`GitHub rate limit: ${gh.rateRemaining} of ${gh.rateLimit} left, reads ${level}`);
+          // Why the level changed: below 20% left ("low"), a reading back above it ("recovered"), or the reading
+          // went void at x-ratelimit-reset ("reset"), when remaining is null until the next answer.
+          const reason = level !== "normal" ? "low" : gh.rateRemaining === null ? "reset" : "recovered";
+          events.write("rate_backoff", { level, reason, remaining: gh.rateRemaining, limit: gh.rateLimit, stretch: p.stretch });
+        }
+        rateLevel = level;
+      }
+    }
     const auth = await gh.login();
     if (auth.kind !== "ok") {
       await problem(auth);
@@ -247,7 +426,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       const repo = scope.repo?.toLowerCase();
       const watched = subs.list().some((e) => e.source === "auto" && e.repo.toLowerCase() === repo && e.last?.state === "open" && e.last.headRef === scope.branch);
       const findEvery = now() - findSince < 5 * 60_000 ? lookEvery("pending", 0, 0) : lookEvery("finished", 0, 99);
-      if (scope.repo && scope.branch && (watched || now() - foundAt < findEvery)) {
+      if (scope.repo && scope.branch && (watched || pressure().pause || now() - foundAt < findEvery * pressure().stretch)) {
         current = "keep";
       } else if (scope.repo && scope.branch) {
         foundAt = now();
@@ -276,11 +455,36 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       }
     }
 
+    for (const req of deps.takeHookRequests?.() ?? []) {
+      if (subs.get(req.repo, req.pr)) continue; // already watched, by Claude, the branch or an earlier hand-over
+      // A PR URL in a tool's output is text anyone can write (a log, a README, a comment). The hook already keeps
+      // only the session's own repository; checked again here, with the settings and the limits.
+      const refuse = (reason: string) => events.write("hook_refused", { repo: req.repo, pr: req.pr, reason });
+      if (config.autoSubscribe === "off") {
+        refuse("auto_subscribe_off");
+        continue;
+      }
+      if (!scope?.repo || scope.repo.toLowerCase() !== req.repo.toLowerCase()) {
+        refuse("other_repo");
+        continue;
+      }
+      const all = subs.list();
+      if (all.length >= limits.total || all.filter((x) => x.source === "hook").length >= limits.hook) {
+        refuse("cap");
+        continue;
+      }
+      const e = subs.add({ repo: req.repo, pr: req.pr, source: "hook" });
+      hookSeenAt.set(e.key, req.at);
+      events.write("subscribe", { repo: req.repo, pr: req.pr, source: "hook", events: "all" });
+    }
+    for (const key of hookSeenAt.keys()) if (!subs.list().some((e) => e.key === key && e.source === "hook")) hookSeenAt.delete(key);
     for (const key of looks.keys()) if (!subs.list().some((e) => e.key === key)) looks.delete(key);
     for (const entry of subs.list()) {
       if (signal.aborted) break;
       const look = looks.get(entry.key);
       if (look && now() < look.next) continue;
+      // Paused: a PR with nothing running waits for the limit to refill; one whose CI runs is still read.
+      if (look && look.phase === "finished" && pressure().pause) continue;
       const reuse = look?.phase === "finished" && now() - look.runsReadAt < RUNS_EVERY_MS ? entry.last : null;
       const r = await fetchSnapshot(gh, entry.repo, entry.pr, reuse);
       if (r.kind === "auth") {
@@ -310,6 +514,20 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       const snap = r.value;
       const live = subs.get(entry.repo, entry.pr);
       if (!live) continue; // unsubscribed while GitHub was being asked
+      if (live.source === "hook" && live.last === null) {
+        const seenAt = hookSeenAt.get(live.key) ?? now();
+        const opened = Date.parse(snap.createdAt ?? "");
+        if (snap.state !== "open" || !Number.isFinite(opened) || seenAt - opened > HOOK_NEW_MS) {
+          unsubscribe(live, "hook_not_new");
+          continue;
+        }
+        // Only a PR the signed-in login opened. Not known (GitHub did not say) is not a yes.
+        const me = await gh.viewerLogin();
+        if (me.kind !== "ok" || !me.value || (snap.author ?? "").toLowerCase() !== me.value.toLowerCase()) {
+          unsubscribe(live, "hook_not_mine");
+          continue;
+        }
+      }
       const first = live.last === null;
       const changes = diff(live.last, snap);
       const prev = live.last;
@@ -343,6 +561,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
         const full = await withFailedJobs(gh, change);
         await send(toMessage(full), full);
       }
+      if (snap.state === "open") await checkJobs(live, snap);
       if (first && live.source === "auto" && needsAttention(snap)) await send(currentState(snap), null);
       {
         const t = now();
@@ -350,13 +569,15 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
         const phase = phaseOf(snap, headSeenAt, t);
         const quiet = changes.length === 0 && look?.phase === "finished" && phase === "finished" ? look.quiet + 1 : 0;
         const runsReadAt = look && reuse !== null && snap.runs === reuse.runs ? look.runsReadAt : t;
-        looks.set(entry.key, { next: t + lookEvery(phase, config.pollSeconds * 1000, quiet), quiet, phase, headSha: snap.headSha, headSeenAt, runsReadAt });
+        looks.set(entry.key, { next: t + lookEvery(phase, config.pollSeconds * 1000, quiet) * pressure().stretch, quiet, phase, headSha: snap.headSha, headSeenAt, runsReadAt });
       }
       live.last = carry(live.last, snap);
       if (snap.state !== "open") unsubscribe(live, snap.state);
     }
 
     await checkBases();
+    await checkReviews();
+    await checkReviewRequests();
 
     if (!saidScope && gh.scopes !== null && !gh.scopes.includes("repo")) {
       saidScope = true;
@@ -371,11 +592,13 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
         subscriptions: subs.list().length,
         watching: subs.list().map((e) => `${e.repo}#${e.pr}`),
         rate_remaining: gh.rateRemaining,
+        rate_limit: gh.rateLimit,
+        graphql_remaining: gh.graphqlRemaining,
         requests: { ...gh.requests },
       });
     }
 
-    if (belowFloor()) waitMs *= 4; // the newest reading, this pass's answers included
+    waitMs *= Math.max(belowFloor() ? 4 : 1, pressure().stretch); // the newest reading, this pass's answers included
     await sleep(waitMs, signal);
   }
 }
@@ -401,14 +624,17 @@ function eventFields(message: ChannelMessage, change: Change | null): Record<str
     ...fields,
     sha: s.headSha,
     run_id: change.run?.id ?? null,
-    workflow: change.run?.name ?? null,
+    // Workflow names are chosen by whoever pushed; cleaned as in the message, so the log holds no terminal escapes.
+    workflow: change.run ? clean(change.run.name) : null,
     conclusion: change.run?.conclusion ?? change.conclusion ?? null,
     github_at: at ?? null,
     latency_ms: at ? Math.max(0, Date.now() - Date.parse(at)) : null,
     ...(change.labelsAdded
       ? { labels_added: change.labelsAdded.map((l) => clean(l, 40)), labels_removed: (change.labelsRemoved ?? []).map((l) => clean(l, 40)) }
       : {}),
-    ...(change.failing ? { failing: change.failing, base: s.baseRef ?? null } : {}),
+    ...(change.failing ? { failing: change.failing.map((name) => clean(name)), base: s.baseRef ?? null } : {}),
+    // A review's or a thread's link: its id is what the summary's GitHub check matches it by.
+    ...(change.review?.url ? { review_url: safeLink(change.review.url) || null } : {}),
     ...(change.run ? { run_attempt: change.run.runAttempt } : {}),
   };
 }

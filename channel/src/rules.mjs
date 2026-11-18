@@ -11,12 +11,22 @@ const COUNTED = new Set(["success", "neutral", "failure", "timed_out", "startup_
  * runs: GitHub's workflow runs on the base branch (push events), any order.
  * Answers which workflows are red now, and the GitHub time of the newest result that decided it.
  */
-export function baseVerdict(runs) {
+/**
+ * Each workflow's newest completed, counted run. The poller keeps this between reads of a base and merges
+ * it into the next read, because the read is a window of the newest runs: on a busy main a slow workflow's failed run
+ * scrolls out of it, and a workflow missing from the window must keep its last verdict, not vanish from it.
+ */
+export function latestPerWorkflow(runs) {
   const latest = new Map();
   const sorted = [...(runs ?? [])]
     .filter((r) => r && r.status === "completed" && COUNTED.has(r.conclusion))
     .sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")));
   for (const r of sorted) if (!latest.has(r.name)) latest.set(r.name, r);
+  return [...latest.values()];
+}
+
+export function baseVerdict(runs) {
+  const latest = new Map(latestPerWorkflow(runs).map((r) => [r.name, r]));
   const failing = [...latest.values()].filter((r) => FAILED.has(r.conclusion)).map((r) => String(r.name)).sort();
   const times = [...latest.values()].map((r) => String(r.updated_at ?? r.created_at ?? "")).filter(Boolean).sort();
   return { red: failing.length > 0, failing, at: times.at(-1) ?? null };
