@@ -45,16 +45,22 @@ test("running is every pass, pending a minute, finished two minutes stretching t
   assert.equal(RUNS_EVERY_MS, 600_000);
 });
 
-test("the rate limit: nothing changes above 20% left; below it every interval stretches in proportion; at 10% the non-essential reads pause", () => {
+// The limit is the GitHub login's, shared with everything else it drives: other sessions, gh, scripts. Eleven
+// sessions once made about 2,000 counted requests an hour, and their heartbeats read 1,001 left while every
+// channel still polled at full speed, because the back-off began only at 20%. It now begins at 30%.
+test("the rate limit: nothing changes above 30% left; below it every interval stretches in proportion; at 15% the non-essential reads pause", () => {
   assert.deepEqual(ratePressure(null, null), { stretch: 1, pause: false }, "not known yet");
   assert.deepEqual(ratePressure(4000, null), { stretch: 1, pause: false }, "no limit header: not guessed");
   assert.deepEqual(ratePressure(2500, 5000), { stretch: 1, pause: false });
-  assert.deepEqual(ratePressure(1000, 5000), { stretch: 1, pause: false }, "exactly 20%");
-  assert.equal(ratePressure(750, 5000).pause, false);
-  assert.ok(Math.abs(ratePressure(750, 5000).stretch - 4 / 3) < 1e-6, "15% left: a third slower");
-  assert.deepEqual(ratePressure(500, 5000), { stretch: 2, pause: true }, "10% left: twice as slow, and paused");
-  assert.deepEqual(ratePressure(250, 5000), { stretch: 4, pause: true });
+  assert.deepEqual(ratePressure(1500, 5000), { stretch: 1, pause: false }, "exactly 30%");
+  const seen = ratePressure(1001, 5000);
+  assert.equal(seen.pause, false);
+  assert.ok(seen.stretch > 1.49 && seen.stretch < 1.5, `1,001 left (the reading seen live) slows every read: ${seen.stretch}`);
+  assert.deepEqual(ratePressure(1000, 5000), { stretch: 1.5, pause: false }, "20% left: half as slow again");
+  assert.deepEqual(ratePressure(750, 5000), { stretch: 2, pause: true }, "15% left: twice as slow, and paused");
+  assert.deepEqual(ratePressure(500, 5000), { stretch: 3, pause: true });
+  assert.deepEqual(ratePressure(250, 5000), { stretch: 6, pause: true });
   assert.deepEqual(ratePressure(0, 5000), { stretch: 8, pause: true }, "capped");
   assert.deepEqual(ratePressure(60, 60), { stretch: 1, pause: false }, "an unauthenticated limit of 60 works the same");
-  assert.deepEqual(ratePressure(5, 60), { stretch: 2.4, pause: true });
+  assert.deepEqual(ratePressure(5, 60), { stretch: 3.6, pause: true });
 });

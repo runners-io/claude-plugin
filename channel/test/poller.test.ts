@@ -541,16 +541,16 @@ test("each rate_backoff record says why: low, recovered, or reset", async () => 
   try {
     await until("baseline", () => t.subs.list()[0]?.last != null);
     const backoffs = () => t.records.filter((r) => r.type === "rate_backoff");
-    t.gh.setRate(700, 5000);
+    t.gh.setRate(1200, 5000);
     await until("slowed", () => backoffs().length === 1);
     assert.equal(backoffs()[0].level, "slowed");
     assert.equal(backoffs()[0].reason, "low");
     t.gh.setRate(4000, 5000);
     await until("recovered", () => backoffs().length === 2);
     assert.deepEqual([backoffs()[1].level, backoffs()[1].reason, backoffs()[1].remaining], ["normal", "recovered", 4000]);
-    t.gh.setRate(700, 5000, Math.floor(Date.now() / 1000) + 1);
+    t.gh.setRate(1200, 5000, Math.floor(Date.now() / 1000) + 1);
     await until("slowed again", () => backoffs().length === 3);
-    t.gh.setRate(700, 5000, Math.floor(Date.now() / 1000) - 60);
+    t.gh.setRate(1200, 5000, Math.floor(Date.now() / 1000) - 60);
     await until("reset", () => backoffs().length === 4, 5000);
     assert.deepEqual([backoffs()[3].level, backoffs()[3].reason, backoffs()[3].remaining], ["normal", "reset", null]);
   } finally {

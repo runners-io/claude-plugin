@@ -36,11 +36,11 @@ Or from inside a session: `/plugin marketplace add runners-io/claude-plugin`, th
 
 ### Pinned install
 
-The commands above follow `main`. Every release has a new version and a tag of its own (`v0.2.1` is this one), so you
+The commands above follow `main`. Every release has a new version and a tag of its own (`v0.2.2` is this one), so you
 can install exactly the release you have read instead: add `#` and the tag to the marketplace source.
 
 ```bash
-claude plugin marketplace add runners-io/claude-plugin#v0.2.1
+claude plugin marketplace add runners-io/claude-plugin#v0.2.2
 claude plugin install runners-io@runners-io
 ```
 
@@ -50,7 +50,7 @@ with the newer tag. `claude plugin list` shows the version you have. To install 
 read yourself:
 
 ```bash
-git clone --branch v0.2.1 --depth 1 https://github.com/runners-io/claude-plugin.git
+git clone --branch v0.2.2 --depth 1 https://github.com/runners-io/claude-plugin.git
 claude plugin marketplace add ./claude-plugin
 claude plugin install runners-io@runners-io
 ```
@@ -209,9 +209,9 @@ When your hourly limit runs low (the newest reading any session on this machine 
 
 | left of the hour's limit | what changes |
 |---|---|
-| more than 20% | nothing |
-| below 20% | every interval above is longer in proportion: a third longer at 15%, twice as long at 10%, up to eight times |
-| 10% or less | also paused: finished pull requests, the base branch and the search for a new pull request. A pull request whose CI is running is still read, so its result still arrives |
+| more than 30% | nothing |
+| below 30% | every interval above is longer in proportion: half as long again at 20%, twice as long at 15%, three times at 10%, up to eight times |
+| 15% or less | also paused: finished pull requests, the base branch and the search for a new pull request. A pull request whose CI is running is still read, so its result still arrives |
 
 The pause ends when GitHub resets the limit (`x-ratelimit-reset`). Separately, below 200 requests left
 (`RUNNERS_IO_RATE_FLOOR`) it looks four times less often, whichever is slower.
@@ -298,7 +298,7 @@ These are read from the environment you start Claude Code from. None is needed.
 |---|---|---|
 | `RUNNERS_IO_NO_CLAUDE_GH_OFFER` | unset | `1`: Claude never offers to set up `claude-gh` at the start of a session |
 | `RUNNERS_IO_POLL_SECONDS` | `20` | seconds between looks at a pull request whose CI is running, 5 to 300; the slower looks are never shorter than this |
-| `RUNNERS_IO_RATE_FLOOR` | `200` | below this many GitHub requests left in the hour, look four times less often (on top of the backoff at 20% and 10% left). Raise it when the same `gh` login also drives other tools |
+| `RUNNERS_IO_RATE_FLOOR` | `200` | below this many GitHub requests left in the hour, look four times less often (on top of the backoff at 30% and 15% left). Raise it when the same `gh` login also drives other tools |
 | `RUNNERS_IO_EVENT_LOG_DIR` | off | an absolute directory for the event log (below) |
 
 ### The event log

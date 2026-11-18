@@ -393,7 +393,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       if (level !== rateLevel) {
         if (rateLevel !== "normal" || level !== "normal") {
           log(`GitHub rate limit: ${gh.rateRemaining} of ${gh.rateLimit} left, reads ${level}`);
-          // Why the level changed: below 20% left ("low"), a reading back above it ("recovered"), or the reading
+          // Why the level changed: below 30% left ("low"), a reading back above it ("recovered"), or the reading
           // went void at x-ratelimit-reset ("reset"), when remaining is null until the next answer.
           const reason = level !== "normal" ? "low" : gh.rateRemaining === null ? "reset" : "recovered";
           events.write("rate_backoff", { level, reason, remaining: gh.rateRemaining, limit: gh.rateLimit, stretch: p.stretch });
