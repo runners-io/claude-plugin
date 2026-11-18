@@ -35,6 +35,10 @@ const sinceArg = opt("--since", "24h");
 const gapMinutes = Number(opt("--gap-minutes", "12"));
 const asJson = flag("--json");
 const githubApi = opt("--github-api", "https://api.github.com").replace(/\/+$/, "");
+// The check shares its GitHub login with every session and tool on it: below this many requests left it stops, as
+// "could not evaluate", rather than spend the rest.
+const githubFloor = Number(opt("--github-floor", "1500"));
+let githubRequests = 0;
 
 // A record's text (a session, a project, an event kind, an error's reason, a workflow name) is printed to a
 // terminal. Whoever names a workflow or a branch chooses those characters, and an ESC or C1 sequence printed raw
@@ -80,23 +84,30 @@ if (!Number.isFinite(since)) couldNotEvaluate(`--since ${sinceArg} is neither li
 // ---- read
 let files = [];
 try {
-  files = readdirSync(dir).filter((f) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(f) && f.slice(0, 10) >= new Date(since).toISOString().slice(0, 10));
+  // Every day's file: the window's records come from those on or after its first day, and a subscription made before
+  // the window (its choice of events) from any of them.
+  files = readdirSync(dir).filter((f) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(f));
 } catch (error) {
   couldNotEvaluate(`${dir} cannot be read: ${error.message}`);
 }
 const records = [];
+// Subscribe and unsubscribe records from before the window, oldest first: what each watch the window inherits chose.
+const before = [];
 let unreadable = 0;
+const firstDay = new Date(since).toISOString().slice(0, 10);
 for (const f of files.sort()) {
   for (const line of readFileSync(join(dir, f), "utf8").split("\n")) {
     if (!line.trim()) continue;
     try {
       const r = JSON.parse(line);
       if (Date.parse(r.t) >= since) records.push(r);
+      else if (r.type === "subscribe" || r.type === "unsubscribe") before.push(r);
     } catch {
-      unreadable++;
+      if (f.slice(0, 10) >= firstDay) unreadable++;
     }
   }
 }
+before.sort((a, b) => a.t.localeCompare(b.t));
 records.sort((a, b) => a.t.localeCompare(b.t));
 if (!records.length) couldNotEvaluate(`no records in ${dir} since ${new Date(since).toISOString()}`);
 
@@ -240,6 +251,11 @@ async function gh(path, auth) {
     redirect: "error",
     signal: AbortSignal.timeout(20_000),
   });
+  githubRequests++;
+  const left = Number(res.headers.get("x-ratelimit-remaining"));
+  if (res.headers.has("x-ratelimit-remaining") && Number.isFinite(left) && left < githubFloor) {
+    couldNotEvaluate(`GitHub has ${left} requests left for this login, below the floor of ${githubFloor} (--github-floor): stopped after ${githubRequests} request(s), so the rest is left for everything else that shares it`);
+  }
   if (!res.ok) throw new Error(`GitHub answered HTTP ${res.status} for ${path.split("?")[0]}`);
   return res.json();
 }
@@ -255,41 +271,111 @@ async function checkGitHub() {
   // names with no window open was subscribed before the window, and counts from the window's start. An unsubscribe
   // with nothing open closes such a window.
   const windowStart = new Date(since).toISOString();
-  const close = (key, from, to) => (windows.get(key) ?? windows.set(key, []).get(key)).push([from, to]);
+  // A window is [from, to, events]: `events` is what the subscription asked for ("all", or a list of kinds). A kind it
+  // excluded is not expected (one check counted 17 of them as MISSes).
+  // The fourth element is the session that watched.
+  const close = (key, from, to, events = "all", session = null) => (windows.get(key) ?? windows.set(key, []).get(key)).push([from, to, events, session]);
   const closed = new Set();
+  // What each session's subscriptions chose, as of the window's start: a watch the window inherits (opened below by a
+  // heartbeat's watching list, which names the PR but not the choice) keeps it.
+  const chosen = new Map();
+  for (const r of before) {
+    if (r.type === "unsubscribe" && !r.repo) {
+      for (const sk of [...chosen.keys()]) if (sk.startsWith(`${r.session}|`)) chosen.delete(sk);
+    } else if (r.repo && r.pr) {
+      const sk = `${r.session}|${r.repo}#${r.pr}`;
+      if (r.type === "subscribe") chosen.set(sk, Array.isArray(r.events) ? r.events : "all");
+      else chosen.delete(sk);
+    }
+  }
   let saidWatching = false;
   for (const r of records) {
     if (r.type === "heartbeat") {
       if (Number(r.subscriptions) > 0) saidWatching = true;
       for (const key of Array.isArray(r.watching) ? r.watching : []) {
         const sk = `${r.session}|${key}`;
-        if (!open.has(sk) && !closed.has(sk)) open.set(sk, windowStart);
+        if (!open.has(sk) && !closed.has(sk)) open.set(sk, { from: windowStart, events: chosen.get(sk) ?? "all" });
+      }
+      continue;
+    }
+    if (r.type === "unsubscribe" && !r.repo) {
+      // Unsubscribe-all names no PR: it closes every window its session has open.
+      for (const [sk, w] of [...open]) {
+        if (!sk.startsWith(`${r.session}|`)) continue;
+        close(sk.slice(sk.indexOf("|") + 1), w.from, r.t, w.events, r.session);
+        open.delete(sk);
+        closed.add(sk);
       }
       continue;
     }
     if (!r.repo || !r.pr) continue;
     const key = `${r.repo}#${r.pr}`;
     const sk = `${r.session}|${key}`;
-    if (r.type === "subscribe" && !open.has(sk)) open.set(sk, r.t);
+    if (r.type === "subscribe") {
+      const events = Array.isArray(r.events) ? r.events : "all";
+      const w = open.get(sk);
+      if (w && JSON.stringify(w.events) !== JSON.stringify(events)) close(key, w.from, r.t, w.events, r.session); // a new choice from now on
+      if (!w || JSON.stringify(w.events) !== JSON.stringify(events)) open.set(sk, { from: r.t, events });
+    }
     if (r.type === "unsubscribe") {
-      close(key, open.get(sk) ?? (closed.has(sk) ? r.t : windowStart), r.t);
+      const w = open.get(sk);
+      close(key, w?.from ?? (closed.has(sk) ? r.t : windowStart), r.t, w?.events ?? "all", r.session);
       open.delete(sk);
       closed.add(sk);
     }
   }
   const lastBySession = new Map([...sessions.values()].map((s) => [s.session, s.stopped || ended.has(s.session) ? s.last : new Date().toISOString()]));
-  for (const [sk, from] of open) {
+  for (const [sk, w] of open) {
     const [session, key] = sk.split("|");
-    (windows.get(key) ?? windows.set(key, []).get(key)).push([from, lastBySession.get(session)]);
+    close(key, w.from, lastBySession.get(session), w.events, session);
   }
   if (saidWatching && windows.size === 0) {
     // An older build's heartbeat carries how many PRs it watched but not which: "0 misses" here would be a check of
     // nothing, so it is not an all-clear.
     couldNotEvaluate("heartbeats say a PR was watched, but no subscribe record or watching list in the window names it");
   }
-  const inside = (key, t) => (windows.get(key) ?? []).some(([a, b]) => t >= a && t <= b);
-  const sent = new Set(records.filter((r) => r.type === "event" && r.outcome === "sent").map((r) => `${r.repo}#${r.pr}|${r.kind}|${r.run_id ?? ""}`));
-  const sentKinds = new Set(records.filter((r) => r.type === "event" && r.outcome === "sent").map((r) => `${r.repo}#${r.pr}|${r.kind}`));
+  // Whether a change at time t of this kind was the channel's to report. A window that wanted it and stayed open at
+  // least one poll after t: "in". One that wanted it but closed (or reached now) within one poll of t: "overtaken",
+  // as when a session stops watching seconds after a merge, before its next look. Otherwise "out".
+  const POLL_MS = 60_000;
+  const where = (key, t, kind) => {
+    const wanting = (windows.get(key) ?? []).filter(([a, b, ev]) => t >= a && t <= b && (ev === "all" || ev.includes(kind)));
+    if (wanting.some(([, b]) => Date.parse(b) - Date.parse(t) >= POLL_MS)) return "in";
+    return wanting.length ? "overtaken" : "out";
+  };
+  const inside = (key, t, kind) => where(key, t, kind) !== "out";
+  // Sent or filtered: either way the channel saw the change. Filtered means the subscription did not want it told.
+  const seen = (r) => r.type === "event" && (r.outcome === "sent" || r.outcome === "filtered");
+  const sent = new Set(records.filter(seen).map((r) => `${r.repo}#${r.pr}|${r.kind}|${r.run_id ?? ""}`));
+  const sentKinds = new Set(records.filter(seen).map((r) => `${r.repo}#${r.pr}|${r.kind}`));
+  let overtaken = 0;
+
+  // A base branch's push runs, back to before the earliest window, a page of 100 at a time: a workflow's last verdict
+  // can be older than the newest 100 runs (a failure was once off the page 70 minutes later, and the check saw a
+  // green that never was). At most 10 pages, and read ONCE per repository and branch, shared by every PR on it: read
+  // per PR, one day's replay of 99 PRs spent the hourly limit of a login every other tool and session share.
+  const earliest = [...windows.values()].flat().map(([a]) => a).sort()[0];
+  const baseHistories = new Map();
+  const baseHistory = (repo, ref) => {
+    const k = `${repo}@${ref}`;
+    if (!baseHistories.has(k)) {
+      baseHistories.set(
+        k,
+        (async () => {
+          const byId = new Map();
+          for (let page = 1; page <= 10; page++) {
+            const q = new URLSearchParams({ branch: ref, event: "push", per_page: "100", page: String(page) });
+            const got = (await gh(`/repos/${repo}/actions/runs?${q}`, auth)).workflow_runs ?? [];
+            for (const r of got) byId.set(r.id, r);
+            const oldest = got.map((r) => r.created_at).filter(Boolean).sort()[0];
+            if (got.length < 100 || (oldest && oldest < earliest)) break;
+          }
+          return [...byId.values()];
+        })(),
+      );
+    }
+    return baseHistories.get(k);
+  };
 
   const misses = [];
   let superseded = 0;
@@ -299,15 +385,27 @@ async function checkGitHub() {
       const pull = await gh(`/repos/${repo}/pulls/${pr}`, auth);
       const closedAt = pull.merged_at ?? pull.closed_at;
       const closeKind = pull.merged_at ? "pr.merged" : "pr.closed";
-      if (closedAt && inside(key, closedAt) && !sentKinds.has(`${key}|${closeKind}`)) {
-        misses.push({ kind: closeKind, repo, pr: Number(pr), github_at: closedAt });
+      if (closedAt && inside(key, closedAt, closeKind) && !sentKinds.has(`${key}|${closeKind}`)) {
+        if (where(key, closedAt, closeKind) === "overtaken") overtaken++;
+        else misses.push({ kind: closeKind, repo, pr: Number(pr), github_at: closedAt });
       }
       const commits = await gh(`/repos/${repo}/pulls/${pr}/commits?per_page=100`, auth);
       const shas = [...new Set([...commits.map((c) => c.sha), pull.head?.sha].filter(Boolean))];
-      const runsBySha = new Map();
-      for (const sha of shas) {
-        const r = await gh(`/repos/${repo}/actions/runs?head_sha=${sha}&per_page=100`, auth);
-        runsBySha.set(sha, r.workflow_runs ?? []);
+      // The runs of the PR's own head branch, in its own head repository, a page of 100 at a time back to before its
+      // first window (at most 5), kept for its commits. One read per commit cost thousands of requests for a day of PRs
+      // that the merge queue updates, each update a commit.
+      const runsBySha = new Map(shas.map((sha) => [sha, []]));
+      const headRef = pull.head?.ref;
+      const headRepo = (pull.head?.repo?.full_name ?? repo).toLowerCase();
+      const firstWatch = (windows.get(key) ?? []).map(([a]) => a).sort()[0];
+      for (let page = 1; headRef && page <= 5; page++) {
+        const q = new URLSearchParams({ branch: headRef, per_page: "100", page: String(page) });
+        const got = (await gh(`/repos/${repo}/actions/runs?${q}`, auth)).workflow_runs ?? [];
+        for (const run of got) {
+          if (runsBySha.has(run.head_sha) && (run.head_repository?.full_name ?? repo).toLowerCase() === headRepo) runsBySha.get(run.head_sha).push(run);
+        }
+        const oldest = got.map((x) => x.created_at).filter(Boolean).sort()[0];
+        if (got.length < 100 || (oldest && oldest < firstWatch)) break;
       }
       // A commit's push time is its first run's creation; the head at time T is the latest commit pushed by T.
       const pushed = shas
@@ -318,30 +416,33 @@ async function checkGitHub() {
       for (const [sha, runs] of runsBySha) {
         for (const run of runs) {
           if (run.status !== "completed" || !["failure", "timed_out", "startup_failure"].includes(run.conclusion)) continue;
-          if (!run.updated_at || !inside(key, run.updated_at)) continue;
+          if (!run.updated_at || !inside(key, run.updated_at, "ci.workflow_failed")) continue;
           if (headAt(run.updated_at) !== sha) {
             superseded++;
             continue;
           }
           if (!sent.has(`${key}|ci.workflow_failed|${run.id}`)) {
+            // A newer commit pushed within one poll of the failure: the channel's next look found the head moved.
+            const replaced = pushed.some((p) => p.at > run.updated_at && Date.parse(p.at) - Date.parse(run.updated_at) < POLL_MS);
+            if (replaced || where(key, run.updated_at, "ci.workflow_failed") === "overtaken") {
+              overtaken++;
+              continue;
+            }
             misses.push({ kind: "ci.workflow_failed", repo, pr: Number(pr), run_id: run.id, workflow: run.name, github_at: run.updated_at });
           }
         }
       }
 
       // Each other kind, against the history GitHub (or a local log) keeps.
-      const accounted = (kind, at, also = () => true) =>
-        records.some(
-          (r) =>
-            r.type === "event" &&
-            (r.outcome === "sent" || r.outcome === "filtered") &&
-            `${r.repo}#${r.pr}` === key &&
-            r.kind === kind &&
-            Date.parse(r.t) >= Date.parse(at) - 5_000 &&
-            also(r),
-        );
-      const expect = (kind, at, extra = {}, also) => {
-        if (inside(key, at) && !accounted(kind, at, also)) misses.push({ kind, repo, pr: Number(pr), github_at: at, ...extra });
+      // `early`: how long before GitHub's (or the log line's) time a record may be. A train line is stamped when the
+      // waiter writes it, which can be seconds after the state the channel read (10 s, once).
+      const accounted = (kind, at, also = () => true, early = 5_000) =>
+        records.some((r) => seen(r) && `${r.repo}#${r.pr}` === key && r.kind === kind && Date.parse(r.t) >= Date.parse(at) - early && also(r));
+      const expect = (kind, at, extra = {}, also, early) => {
+        const w = where(key, at, kind);
+        if (w === "out" || accounted(kind, at, also, early)) return;
+        if (w === "overtaken") overtaken++;
+        else misses.push({ kind, repo, pr: Number(pr), github_at: at, ...extra });
       };
 
       // Labels and draft: GitHub's issue events (the first 100).
@@ -378,8 +479,7 @@ async function checkGitHub() {
       // The base branch: replay its push runs in the order they finished; each red <-> green is an event.
       const baseRef = pull.base?.ref;
       if (baseRef && !closedAt) {
-        const q = new URLSearchParams({ branch: baseRef, event: "push", per_page: "100" });
-        const baseRuns = (await gh(`/repos/${repo}/actions/runs?${q}`, auth)).workflow_runs ?? [];
+        const baseRuns = await baseHistory(repo, baseRef);
         const done = baseRuns.filter((r) => r.status === "completed" && r.updated_at).sort((a, b) => a.updated_at.localeCompare(b.updated_at));
         const starts = (windows.get(key) ?? []).map(([a]) => a).sort();
         let red = baseVerdict(done.filter((r) => r.updated_at <= starts[0])).red;
@@ -388,7 +488,13 @@ async function checkGitHub() {
           const v = baseVerdict(done.filter((x) => x.updated_at <= r.updated_at));
           if (v.red === red) continue;
           red = v.red;
-          expect(red ? "base.red" : "base.green", r.updated_at);
+          // A session reads a base branch once for all its PRs on it, and tells each turn once, on any one of them.
+          const kind = red ? "base.red" : "base.green";
+          const watchers = new Set(
+            (windows.get(key) ?? []).filter(([a, b, ev]) => r.updated_at >= a && r.updated_at <= b && (ev === "all" || ev.includes(kind))).map(([, , , who]) => who),
+          );
+          const toldOnAnother = (x) => x.repo === repo && watchers.has(x.session) && (x.base ?? baseRef) === baseRef;
+          if (!records.some((x) => seen(x) && x.kind === kind && toldOnAnother(x) && Date.parse(x.t) >= Date.parse(r.updated_at) - 5_000)) expect(kind, r.updated_at);
         }
       }
 
@@ -398,8 +504,10 @@ async function checkGitHub() {
   }
   return {
     checked_prs: windows.size,
+    requests: githubRequests,
     misses,
     superseded,
+    overtaken,
     not_checked:
       "merge conflicts (GitHub keeps no history of them), pr.head_moved (whether this machine had the commit), pr.body_edited (REST keeps no edit history), pr.review_thread_resolved and pr.ready_to_merge (no history of either), ci.job_failed and ci.job_stuck_queued (a job's history does not say what the run was doing at the time) and review.requested (not tied to a watched pull request)",
   };
@@ -434,7 +542,7 @@ function text(s) {
   for (const e of s.ended_without_stop) out.push(`  ${e.session} ${e.project}: last record ${e.last}`);
   for (const g of s.gaps) out.push(`  ${g.session} ${g.project}: ${g.from} .. ${g.to} (${g.minutes} min)`);
   if (s.github) {
-    out.push(`GitHub check: ${s.github.checked_prs} PR(s), ${s.github.misses.length} miss(es), ${s.github.superseded} superseded failure(s) rightly not sent; not checked: ${s.github.not_checked}`);
+    out.push(`GitHub check: ${s.github.checked_prs} PR(s), ${s.github.misses.length} miss(es), ${s.github.superseded} superseded failure(s) rightly not sent, ${s.github.overtaken ?? 0} overtaken within one poll, ${s.github.requests ?? "?"} GitHub request(s); not checked: ${s.github.not_checked}`);
     for (const m of s.github.misses) {
       out.push(`  MISS ${m.kind} ${m.repo}#${m.pr}${m.run_id ? ` run ${m.run_id} "${m.workflow}"` : ""}${m.state ? ` ${m.state}` : ""} at ${m.github_at}`);
     }

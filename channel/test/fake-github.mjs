@@ -115,7 +115,28 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
     m = /^\/repos\/([^/]+)\/([^/]+)\/actions\/runs$/.exec(url.pathname);
     if (m) {
       const branch = url.searchParams.get("branch");
-      const runs = branch ? (state.baseRuns.get(`${m[1]}/${m[2]}@${branch}`) ?? []) : (state.runs.get(`${m[1]}/${m[2]}@${url.searchParams.get("head_sha")}`) ?? []);
+      const sha = url.searchParams.get("head_sha");
+      const repo = `${m[1]}/${m[2]}`;
+      // A run carries its head branch and repository, as GitHub's do: by default those of the pull request whose head
+      // or commit list has that commit.
+      const ownerOf = (s) =>
+        [...state.pulls.entries()].find(
+          ([k, p]) => k.startsWith(`${repo}#`) && (p.head?.sha === s || (state.commits.get(k) ?? []).some((c) => c.sha === s)),
+        )?.[1];
+      const prRuns = [...state.runs.entries()]
+        .filter(([k]) => k.startsWith(`${repo}@`))
+        .flatMap(([k, rs]) => {
+          const s = k.slice(k.indexOf("@") + 1);
+          return rs.map((r) => ({ head_branch: ownerOf(s)?.head?.ref ?? "fix-login", head_repository: { full_name: repo }, ...r }));
+        });
+      const page = Number(url.searchParams.get("page") ?? 1);
+      const per = Number(url.searchParams.get("per_page") ?? 30);
+      const runs = sha
+        ? prRuns.filter((r) => r.head_sha === sha && (!branch || r.head_branch === branch))
+        : [...(state.baseRuns.get(`${repo}@${branch}`) ?? []), ...prRuns.filter((r) => r.head_branch === branch && url.searchParams.get("event") !== "push")]
+            // As GitHub pages them: newest first, per_page at a time.
+            .toSorted((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")))
+            .slice((page - 1) * per, page * per);
       return send(req, res, 200, { total_count: runs.length, workflow_runs: runs });
     }
     m = /^\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)\/events$/.exec(url.pathname);
@@ -151,12 +172,12 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
         mergeable: true,
         mergeable_state: "clean",
         html_url: `https://github.com/${repo}/pull/${number}`,
-        head: { sha: "a".repeat(40), ref: "fix-login" },
+        head: { sha: "a".repeat(40), ref: "fix-login", repo: { full_name: repo } },
         user: { login: state.reviewRequests.viewer }, // opened by the signed-in login unless a test says otherwise
         ...prev,
         ...fields,
       };
-      if (fields.head) pull.head = { ...(prev?.head ?? {}), ...fields.head };
+      if (fields.head) pull.head = { repo: { full_name: repo }, ...(prev?.head ?? {}), ...fields.head };
       state.pulls.set(`${repo}#${number}`, pull);
       return pull;
     },
@@ -211,7 +232,8 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
       state.annotations.set(jobId, list);
     },
     setJobs(runId, jobs) {
-      state.jobs.set(runId, jobs);
+      // Every job GitHub returns has an id (a job is a check run); a test that names none gets one per position.
+      state.jobs.set(runId, jobs.map((j, i) => ({ id: runId * 1000 + i + 1, ...j })));
     },
     close: () => new Promise((r) => server.close(r)),
   };
