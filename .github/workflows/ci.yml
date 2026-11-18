@@ -1,0 +1,66 @@
+name: ci
+
+# The plugin's checks, on the copy a user installs from. It runs on runners.io's own runners, and needs no secrets,
+# so a pull request from a fork runs it the same way.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: manifest, bundle and tests
+    runs-on: runnersio-2vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install the channel's build tools
+        working-directory: channel
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck, rebuild, and require the committed bundle to match
+        working-directory: channel
+        run: |
+          set -euo pipefail
+          npm run typecheck
+          # An untracked bundle makes the diff below silently empty: require it tracked first.
+          git ls-files --error-unmatch dist/runners-io-channel.mjs >/dev/null
+          npm run build
+          git diff --exit-code --stat -- dist/
+
+      - name: Tests (Node 24)
+        working-directory: channel
+        run: npm test
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 20
+          package-manager-cache: false
+
+      - name: The bundle end to end, and the manifest's promises (Node 20)
+        run: |
+          set -euo pipefail
+          node scripts/check-plugin.mjs
+          node --test channel/test/bundle.test.mjs
+
+      - name: claude plugin validate --strict
+        run: |
+          set -euo pipefail
+          home="$(mktemp -d)"
+          HOME="$home" npx -y @anthropic-ai/claude-code@2.1.317 plugin validate . --strict

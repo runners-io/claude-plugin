@@ -1,0 +1,15 @@
+{
+  "name": "runners-io",
+  "description": "The runners.io plugin for Claude Code.",
+  "owner": {
+    "name": "runners.io",
+    "url": "https://www.runners.io"
+  },
+  "plugins": [
+    {
+      "name": "runners-io",
+      "source": "./",
+      "description": "CI results and merge conflicts for your pull requests pushed into your Claude Code session, read from GitHub with your own login; plus the runners.io MCP server."
+    }
+  ]
+}

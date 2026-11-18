@@ -1,0 +1,5 @@
+node_modules/
+# the channel's event log, if pointed here
+*.jsonl
+*.log
+.env*

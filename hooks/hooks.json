@@ -1,0 +1,29 @@
+{
+  "description": "After Claude opens a pull request, prompt it to subscribe the runners-io CI channel to it; at launch, tell the user when live CI events are off in the session.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash|mcp__.*create_pull_request",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/pr-created.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

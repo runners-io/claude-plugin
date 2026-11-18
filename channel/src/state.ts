@@ -1,0 +1,206 @@
+/**
+ * A subscribed pull request as the channel last saw it, and what changed
+ * between two looks. Pure: no I/O, so every rule here is a unit test.
+ *
+ * THE FIRST LOOK IS A BASELINE. `diff(null, s)` is empty: subscribing tells
+ * Claude the current state in the tool's answer, and the channel then pushes
+ * only what changes. A session never gets a burst of yesterday's results.
+ *
+ * RUNS ARE COMPARED FOR THE SAME HEAD SHA ONLY. A push resets them, so the
+ * new commit's workflows are reported as they start and finish, and "all
+ * done" is never declared over a mix of two commits.
+ */
+import type { RunInfo } from "./github.ts";
+
+export const EVENT_KINDS = [
+  "ci.workflow_started",
+  "ci.workflow_succeeded",
+  "ci.workflow_failed",
+  "ci.workflow_cancelled",
+  "ci.approval_waiting",
+  "ci.run_all_done",
+  "pr.conflict",
+  "pr.conflict_resolved",
+  "pr.merged",
+  "pr.closed",
+  "pr.head_moved",
+  "pr.labels_changed",
+  "pr.ready_for_review",
+  "pr.converted_to_draft",
+  "pr.body_edited",
+  "ci.flaky",
+  "base.red",
+  "base.green",
+] as const;
+
+export type EventKind = (typeof EVENT_KINDS)[number];
+
+export function isEventKind(value: unknown): value is EventKind {
+  return typeof value === "string" && (EVENT_KINDS as readonly string[]).includes(value);
+}
+
+export interface Snapshot {
+  readonly repo: string;
+  readonly pr: number;
+  readonly state: "open" | "merged" | "closed";
+  readonly headSha: string;
+  readonly headRef: string;
+  /** GitHub's `mergeable_state`: `dirty` is a conflict, `unknown` is "still computing". */
+  readonly mergeableState: string;
+  readonly prUrl: string;
+  readonly runs: readonly RunInfo[];
+  /** When the PR was merged or closed, GitHub's time. */
+  readonly closedAt?: string;
+  /** When GitHub last changed the PR, for the latency of a label, draft or body change. */
+  readonly updatedAt?: string;
+  readonly baseRef?: string;
+  readonly draft?: boolean;
+  /** Label names. Absent when not read, which is never a change. */
+  readonly labels?: readonly string[];
+  /** A hash of the PR's body, never the body: the body is untrusted text and only its change is reported. */
+  readonly bodyHash?: string | null;
+  /** Run id -> the attempt that failed, for this head sha only (carried by `carry`), to tell a flaky re-run. */
+  readonly failedAttempts?: Readonly<Record<number, number>>;
+}
+
+export interface Change {
+  readonly kind: EventKind;
+  readonly snapshot: Snapshot;
+  /** The run the change is about, for the `ci.workflow_*` and approval kinds. */
+  readonly run?: RunInfo;
+  /** Filled in by the poller for a failed run, from the run's jobs. */
+  readonly failedJobs?: readonly string[];
+  /** For `ci.run_all_done`: failure, cancelled or success, the worst of the runs. */
+  readonly conclusion?: string;
+  readonly labelsAdded?: readonly string[];
+  readonly labelsRemoved?: readonly string[];
+  /** For `base.red`: the base branch's failing workflows. */
+  readonly failing?: readonly string[];
+  /** For `ci.workflow_started`: how many workflows started on this head commit in the same read. */
+  readonly workflows?: number;
+  /** GitHub's (or a local log's) time for the change, when the snapshot's own times do not give it. */
+  readonly at?: string;
+}
+
+const FAILED = new Set(["failure", "timed_out", "startup_failure"]);
+/**
+ * A fork's run held until a maintainer approves it: there is no log to read, so it is an approval wait,
+ * never a failure.
+ */
+const NEEDS_APPROVAL = "action_required";
+const PASSED = new Set(["success", "neutral"]);
+/** Conclusions that are neither a pass nor a failure and are not reported at all. */
+const IGNORED = new Set(["skipped", "stale"]);
+
+export type Outcome = "failed" | "succeeded" | "cancelled" | "needs_approval" | "ignored";
+
+export function outcome(conclusion: string | null): Outcome {
+  if (conclusion && FAILED.has(conclusion)) return "failed";
+  if (conclusion && PASSED.has(conclusion)) return "succeeded";
+  if (conclusion === "cancelled") return "cancelled";
+  if (conclusion === NEEDS_APPROVAL) return "needs_approval";
+  if (conclusion && IGNORED.has(conclusion)) return "ignored";
+  return "failed"; // an unknown conclusion on a completed run is not a pass
+}
+
+const done = (r: RunInfo) => r.status === "completed";
+const allDone = (runs: readonly RunInfo[]) => runs.length > 0 && runs.every(done);
+
+/** A run started over: a new attempt, or a completed run running again. */
+function restarted(prev: RunInfo, next: RunInfo): boolean {
+  return next.runAttempt !== prev.runAttempt || (done(prev) && !done(next));
+}
+
+export function diff(prev: Snapshot | null, next: Snapshot): Change[] {
+  if (!prev) return [];
+  if (next.state === "merged" && prev.state !== "merged") return [{ kind: "pr.merged", snapshot: next }];
+  if (next.state === "closed" && prev.state !== "closed") return [{ kind: "pr.closed", snapshot: next }];
+  if (next.state !== "open") return [];
+
+  const changes: Change[] = [];
+  const before = new Map(prev.headSha === next.headSha ? prev.runs.map((r) => [r.id, r] as const) : []);
+  let anyRunChanged = false;
+
+  for (const run of next.runs) {
+    const old = before.get(run.id);
+    const fresh = !old || restarted(old, run);
+    if (done(run)) {
+      if (!fresh && old && done(old)) continue;
+      anyRunChanged = true;
+      const o = outcome(run.conclusion);
+      if (o === "ignored") continue;
+      const kind =
+        o === "failed"
+          ? "ci.workflow_failed"
+          : o === "succeeded"
+            ? "ci.workflow_succeeded"
+            : o === "needs_approval"
+              ? "ci.approval_waiting"
+              : "ci.workflow_cancelled";
+      changes.push({ kind, snapshot: next, run });
+      const failedAttempt = prev.headSha === next.headSha ? prev.failedAttempts?.[run.id] : undefined;
+      if (o === "succeeded" && failedAttempt !== undefined && run.runAttempt > failedAttempt) {
+        changes.push({ kind: "ci.flaky", snapshot: next, run });
+      }
+      continue;
+    }
+    if (run.status === "waiting") {
+      if (fresh || old?.status !== "waiting") {
+        anyRunChanged = true;
+        changes.push({ kind: "ci.approval_waiting", snapshot: next, run });
+      }
+      continue;
+    }
+    if (fresh) {
+      anyRunChanged = true;
+      changes.push({ kind: "ci.workflow_started", snapshot: next, run });
+    }
+  }
+
+  if (anyRunChanged && allDone(next.runs)) {
+    const reported = next.runs.filter((r) => outcome(r.conclusion) !== "ignored");
+    const has = (o: Outcome) => reported.some((r) => outcome(r.conclusion) === o);
+    const worst = has("failed") ? "failure" : has("needs_approval") ? NEEDS_APPROVAL : has("cancelled") ? "cancelled" : "success";
+    changes.push({ kind: "ci.run_all_done", snapshot: next, conclusion: worst });
+  }
+
+  if (next.mergeableState !== "unknown" && next.mergeableState !== prev.mergeableState) {
+    if (next.mergeableState === "dirty") changes.push({ kind: "pr.conflict", snapshot: next });
+    else if (prev.mergeableState === "dirty") changes.push({ kind: "pr.conflict_resolved", snapshot: next });
+  }
+
+  if (prev.draft !== undefined && next.draft !== undefined && prev.draft !== next.draft) {
+    changes.push({ kind: next.draft ? "pr.converted_to_draft" : "pr.ready_for_review", snapshot: next });
+  }
+  if (prev.labels && next.labels) {
+    const was = new Set(prev.labels);
+    const now = new Set(next.labels);
+    const labelsAdded = [...now].filter((l) => !was.has(l)).sort();
+    const labelsRemoved = [...was].filter((l) => !now.has(l)).sort();
+    if (labelsAdded.length || labelsRemoved.length) changes.push({ kind: "pr.labels_changed", snapshot: next, labelsAdded, labelsRemoved });
+  }
+  if (prev.bodyHash != null && next.bodyHash != null && prev.bodyHash !== next.bodyHash) {
+    changes.push({ kind: "pr.body_edited", snapshot: next });
+  }
+  return changes;
+}
+
+/**
+ * The snapshot to keep for next time. GitHub answers `unknown` while it
+ * recomputes mergeability after every push; keeping the last known value
+ * through it stops a still-conflicted PR from being reported twice.
+ */
+export function carry(prev: Snapshot | null, next: Snapshot): Snapshot {
+  const failedAttempts: Record<number, number> = { ...(prev && prev.headSha === next.headSha ? prev.failedAttempts : {}) };
+  for (const r of next.runs) if (done(r) && outcome(r.conclusion) === "failed") failedAttempts[r.id] = r.runAttempt;
+  const kept = { ...next, failedAttempts };
+  if (prev && next.mergeableState === "unknown") return { ...kept, mergeableState: prev.mergeableState };
+  return kept;
+}
+
+export function needsAttention(s: Snapshot): boolean {
+  return (
+    s.mergeableState === "dirty" ||
+    s.runs.some((r) => r.status === "waiting" || (done(r) && ["failed", "needs_approval"].includes(outcome(r.conclusion))))
+  );
+}

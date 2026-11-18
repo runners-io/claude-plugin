@@ -1,0 +1,14 @@
+export type LaunchState = "on" | "off" | "headless" | "unknown";
+
+export function parseLaunch(args: string): { state: Exclude<LaunchState, "unknown"> };
+
+export function findLaunch(
+  pid?: number,
+  ps?: (pid: number) => { ppid: number; args: string } | null,
+): { state: LaunchState; claudePid?: number };
+
+export function pollsIn(state: LaunchState): boolean;
+
+export function shellWord(s: string): string;
+
+export function channelFlags(pluginRoot: string): string[];
