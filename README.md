@@ -36,11 +36,11 @@ Or from inside a session: `/plugin marketplace add runners-io/claude-plugin`, th
 
 ### Pinned install
 
-The commands above follow `main`. Every release has a new version and a tag of its own (`v0.2.2` is this one), so you
+The commands above follow `main`. Every release has a new version and a tag of its own (`v0.2.3` is this one), so you
 can install exactly the release you have read instead: add `#` and the tag to the marketplace source.
 
 ```bash
-claude plugin marketplace add runners-io/claude-plugin#v0.2.2
+claude plugin marketplace add runners-io/claude-plugin#v0.2.3
 claude plugin install runners-io@runners-io
 ```
 
@@ -50,7 +50,7 @@ with the newer tag. `claude plugin list` shows the version you have. To install 
 read yourself:
 
 ```bash
-git clone --branch v0.2.2 --depth 1 https://github.com/runners-io/claude-plugin.git
+git clone --branch v0.2.3 --depth 1 https://github.com/runners-io/claude-plugin.git
 claude plugin marketplace add ./claude-plugin
 claude plugin install runners-io@runners-io
 ```

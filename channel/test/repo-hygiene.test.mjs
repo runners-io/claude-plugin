@@ -43,6 +43,13 @@ test("Dependabot watches the workflow actions and the channel's npm packages", (
   assert.match(text, /package-ecosystem:\s*"?npm"?[\s\S]*?directory:\s*"?\/channel"?/);
 });
 
+test("Dependabot here raises alerts but opens no pull requests: this repository is published, and updates land at the source", () => {
+  const text = readFileSync(join(root, ".github", "dependabot.yml"), "utf8");
+  const entries = text.split(/\n\s*-\s*package-ecosystem:/).slice(1);
+  assert.ok(entries.length >= 2, "both entries were read");
+  for (const e of entries) assert.match(e, /\n\s+open-pull-requests-limit:\s*0\s*(\n|$)/, e.split("\n")[0]);
+});
+
 test("SECURITY.md offers GitHub's private vulnerability reporting as well as the email address", () => {
   const text = read("SECURITY.md");
   assert.match(text, /security@runners\.io/);

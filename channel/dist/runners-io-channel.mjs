@@ -2287,7 +2287,7 @@ function findLaunch(pid = process.ppid, ps = psRow) {
 }
 
 // src/main.ts
-var VERSION = "0.2.2";
+var VERSION = "0.2.3";
 function serve() {
   const config = loadConfig();
   const gh = new GitHubClient(config.githubApi, () => readGhAuth(process.env, void 0, config.githubApi), fetch, {
