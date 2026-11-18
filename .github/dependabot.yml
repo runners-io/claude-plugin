@@ -1,12 +1,16 @@
-# Weekly updates for the actions the workflows use (each pinned to a full commit SHA) and for the channel's build
-# tools (esbuild, typescript: development dependencies only; the plugin ships a committed bundle and installs nothing).
+# Alerts for the actions the workflows use (each pinned to a full commit SHA) and for the channel's build tools
+# (esbuild, typescript: development dependencies only; the plugin ships a committed bundle and installs nothing).
+# This repository is published from the runners.io source tree and takes no commits of its own, so Dependabot opens
+# no pull requests here (a limit of 0 keeps the alerts); the updates are raised and merged at the source.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 0
   - package-ecosystem: "npm"
     directory: "/channel"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 0
