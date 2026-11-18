@@ -55,16 +55,20 @@ export const REVIEW_EVERY_MS = 60_000;
  */
 export const REQUESTS_EVERY_MS = 180_000;
 
-/** Below this share of the hourly rate limit left, every interval stretches in proportion. */
-export const RATE_SLOW = 0.2;
+/**
+ * Below this share of the hourly rate limit left, every interval stretches in proportion. The limit belongs to the
+ * GitHub login, which other sessions, gh and scripts share: at 20% several sessions were still polling at full
+ * speed while the login ran out, so the channel now gives way from 30%.
+ */
+export const RATE_SLOW = 0.3;
 /** At or below this share, only the reads a running CI needs go on: a finished PR, the base and the search pause. */
-export const RATE_PAUSE = 0.1;
+export const RATE_PAUSE = 0.15;
 const STRETCH_MAX = 8;
 
 /**
  * How hard to back off, from the newest `x-ratelimit-remaining` and `x-ratelimit-limit` (any session's on this
- * machine). Above RATE_SLOW nothing changes; below it every interval is multiplied by RATE_SLOW / share left (a
- * third longer at 15%, twice at 10%, four times at 5%, at most eight); at RATE_PAUSE and below, `pause`. An
+ * machine). Above RATE_SLOW nothing changes; below it every interval is multiplied by RATE_SLOW / share left (half
+ * as long again at 20%, twice at 15%, three times at 10%, at most eight); at RATE_PAUSE and below, `pause`. An
  * unknown limit is never guessed.
  */
 export function ratePressure(remaining: number | null, limit: number | null): { stretch: number; pause: boolean } {

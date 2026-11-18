@@ -185,12 +185,12 @@ test("at 10% left, a finished PR, its base and the search for a new PR pause, an
   assert.ok(gh.requests.length > before, "reads resumed after the reset");
 });
 
-test("at 10% left, a PR whose CI is running is still read, at a stretched pace, and its failure still arrives", async () => {
+test("below the pause line, a PR whose CI is running is still read, at a stretched pace, and its failure still arrives", async () => {
   const gh = await quietPr();
   gh.setRuns("octo-org/example", A, [{ id: 41, name: "CI", status: "in_progress" }]);
   const s = await session(gh);
   await s.step(3);
-  gh.setRate(250); // 5%: four times slower
+  gh.setRate(375); // 7.5%: four times slower, and paused
   await s.step(2);
   const pulls = () => gh.requests.filter((r) => r.path === "/repos/octo-org/example/pulls/7").length;
   const bases = () => gh.requests.filter((r) => r.path.includes("branch=main")).length;

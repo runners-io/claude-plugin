@@ -1457,8 +1457,8 @@ function lookEveryMs(phase, pollMs, quietLooks) {
 }
 var REVIEW_EVERY_MS = 6e4;
 var REQUESTS_EVERY_MS = 18e4;
-var RATE_SLOW = 0.2;
-var RATE_PAUSE = 0.1;
+var RATE_SLOW = 0.3;
+var RATE_PAUSE = 0.15;
 var STRETCH_MAX = 8;
 function ratePressure(remaining, limit) {
   if (remaining === null || limit === null || !(limit > 0)) return { stretch: 1, pause: false };
@@ -2287,7 +2287,7 @@ function findLaunch(pid = process.ppid, ps = psRow) {
 }
 
 // src/main.ts
-var VERSION = "0.2.1";
+var VERSION = "0.2.2";
 function serve() {
   const config = loadConfig();
   const gh = new GitHubClient(config.githubApi, () => readGhAuth(process.env, void 0, config.githubApi), fetch, {
