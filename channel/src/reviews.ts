@@ -12,7 +12,7 @@
  * `member` (GitHub says owner, member or collaborator) or `outside`, so a session can weigh a bot's "LGTM" and a
  * stranger's request differently.
  */
-import type { Change, Snapshot } from "./state.ts";
+import { type Change, type Snapshot, outcome } from "./state.ts";
 
 export type AuthorType = "bot" | "member" | "outside";
 
@@ -124,11 +124,18 @@ export function graphqlRate(body: unknown): { remaining: number; limit: number; 
  * baseline. A review is new when its id is: a reviewer's newer review has a new id. A thread is added when its id
  * is new, resolved when it was unresolved. Ready to merge is sent once per head commit.
  */
-export function reviewChanges(prev: ReviewState | null, next: ReviewState, snapshot: Snapshot): { changes: Change[]; keep: ReviewState } {
+export function reviewChanges(prev: ReviewState | null, next: ReviewState, snapshot: Snapshot, settled = true): { changes: Change[]; keep: ReviewState } {
   const ready = READY.has(next.mergeState);
-  const readySha = ready ? next.headSha : prev?.headSha === next.headSha ? prev.readySha : undefined;
+  // GitHub's CLEAN can come before CI has finished: a workflow not registered yet, or a check the rules do not
+  // require. So ready to merge waits for the head to settle (`settled`, from the poller: its window to register
+  // workflows has passed) and for every run on it to have finished, none failed. Until then it is not marked sent.
+  const runsDone = snapshot.runs.every((r) => r.status === "completed" && outcome(r.conclusion) !== "failed");
+  const fire = ready && settled && runsDone;
+  // The first reading is a baseline: a PR already ready is not news. Its head is marked said only when ready to merge
+  // would have fired on it now; CLEAN with a run still queued, marked, lost the ready to merge that run's finish makes.
+  if (!prev) return { changes: [], keep: fire ? { ...next, readySha: next.headSha } : { ...next } };
+  const readySha = fire ? next.headSha : prev.headSha === next.headSha ? prev.readySha : undefined;
   const keep: ReviewState = { ...next, ...(readySha ? { readySha } : {}) };
-  if (!prev) return { changes: [], keep: ready ? keep : { ...next } };
   const changes: Change[] = [];
   const unresolved = next.threads.filter((t) => !t.resolved).length;
   const seenReviews = new Set(prev.reviews.map((r) => r.id));
@@ -150,7 +157,7 @@ export function reviewChanges(prev: ReviewState | null, next: ReviewState, snaps
       ...(kind === "pr.review_thread_added" && t.at ? { at: t.at } : {}),
     });
   }
-  if (ready && prev.readySha !== next.headSha) {
+  if (fire && prev.readySha !== next.headSha) {
     changes.push({ kind: "pr.ready_to_merge", snapshot, review: { mergeState: next.mergeState, decision: next.reviewDecision ?? undefined, unresolved } });
   }
   return { changes, keep };

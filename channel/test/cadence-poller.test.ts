@@ -39,10 +39,11 @@ async function session(gh: FakeGitHub) {
   const auth: GhAuth = { kind: "ok", token: TOKEN, source: "gh" };
   const client = new GitHubClient(gh.base, async () => auth, fetch, { now: () => t });
   const config: Config = { githubApi: gh.base, projectDir: "/nowhere", autoSubscribe: "pr", pollSeconds: PASS_MS / 1000, eventLogDir: null, rateFloor: 200 };
+  const subs = new Subscriptions();
   const done = runPoller({
     config,
     gh: client,
-    subs: new Subscriptions(),
+    subs,
     readScope: async () => ({ repo: "octo-org/example", branch: "feat" }),
     notify: async (m) => void inbox.push(m),
     signal: stop.signal,
@@ -56,6 +57,7 @@ async function session(gh: FakeGitHub) {
   let pass = 0;
   return {
     inbox,
+    subs,
     get passes() {
       return pass;
     },
@@ -116,7 +118,8 @@ test("a push to a finished PR is seen within five minutes, and its failure withi
   });
   for (let i = 0; i < 20 && seenAt < 0; i++) {
     await s.step(1);
-    if (s.inbox.some((m) => m.meta.kind === "ci.workflow_started")) seenAt = s.passes;
+    // Seen: the watch holds the new head. (The automatic watch no longer pushes ci.workflow_started by default.)
+    if (s.subs.list()[0]?.last?.headSha === B) seenAt = s.passes;
   }
   assert.ok(seenAt > 0 && (seenAt - pushedAt) * PASS_MS <= 300_000, `the push was seen ${(seenAt - pushedAt) * 20} s later`);
   let failedAt = -1;

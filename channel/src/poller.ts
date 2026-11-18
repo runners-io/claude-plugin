@@ -17,19 +17,19 @@
  *   one of its PRs is busy.
  */
 import type { Config } from "./config.ts";
-import { type Phase, REQUESTS_EVERY_MS, REVIEW_EVERY_MS, RUNS_EVERY_MS, lookEveryMs, passSleepMs, phaseOf, ratePressure } from "./cadence.ts";
+import { PENDING_WINDOW_MS, type Phase, REQUESTS_EVERY_MS, REVIEW_EVERY_MS, RUNS_EVERY_MS, lookEveryMs, passSleepMs, phaseOf, ratePressure } from "./cadence.ts";
 import { type JobsSeen, jobChanges } from "./jobs.ts";
 import { type RequestsSeen, requestChanges, requestMessage } from "./requests.ts";
 import { type ReviewState, reviewChanges } from "./reviews.ts";
-import { type ChannelMessage, clean, describe, safeLink, scopeMessage, setupMessage, toMessage } from "./format.ts";
+import { type ChannelMessage, REPLY, clean, describe, safeLink, scopeMessage, setupMessage, toMessage } from "./format.ts";
 import type { GitScope } from "./git.ts";
 import { type EventLog, NO_EVENT_LOG } from "./eventlog.ts";
 import type { BaseRunInfo, ApiResult, GhProblem, GitHubClient } from "./github.ts";
 import { log } from "./log.ts";
 import { baseVerdict, latestPerWorkflow } from "./rules.mjs";
-import { type Change, type EventKind, type Snapshot, carry, diff, needsAttention } from "./state.ts";
+import { type Change, type EventKind, type Snapshot, allDoneChange, carry, diff, needsAttention } from "./state.ts";
 import type { HookRequest } from "./hookrequests.ts";
-import { type Entry, MAX_HOOK_SUBSCRIPTIONS, MAX_SUBSCRIPTIONS, type Subscriptions, wants } from "./subscriptions.ts";
+import { AUTO_EVENTS, type Entry, MAX_HOOK_SUBSCRIPTIONS, MAX_SUBSCRIPTIONS, type Subscriptions, wants } from "./subscriptions.ts";
 
 /**
  * The PR and its head's runs. `reuseRunsOf`: a snapshot whose runs stand in for a fresh read when the PR has not
@@ -58,6 +58,7 @@ export async function fetchSnapshot(gh: GitHubClient, repo: string, pr: number, 
       headSha: p.headSha,
       headRef: p.headRef,
       mergeableState: p.mergeableState,
+      ...(p.mergeStatus ? { mergeStatus: p.mergeStatus } : {}),
       prUrl: p.htmlUrl,
       runs,
       ...(p.closedAt ? { closedAt: p.closedAt } : {}),
@@ -107,6 +108,16 @@ export interface PollerDeps {
   /** PRs the PostToolUse hook handed over since the last pass (hookrequests.ts takeRequests); none by default. */
   readonly takeHookRequests?: () => readonly HookRequest[];
   readonly limits?: Partial<typeof DEFAULT_LIMITS>;
+  /**
+   * How long a head is watched before ci.run_all_done or pr.ready_to_merge may be said for it (cadence.ts
+   * PENDING_WINDOW_MS by default): a fast workflow can finish before a slow one has registered. Tests set 0.
+   */
+  readonly allDoneHoldMs?: number;
+  /**
+   * Test seam: handed, once, a reader of how many entries each long-lived list holds, so a test can hold every one
+   * under a bound. Nothing else reads it.
+   */
+  readonly sizes?: (read: () => Record<string, number>) => void;
 }
 
 function realSleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -133,7 +144,7 @@ function notVisible(e: Entry): ChannelMessage {
 
 function currentState(s: Snapshot): ChannelMessage {
   return {
-    content: `CI needs attention on the pull request for this branch:\n${describe(s)}`,
+    content: `CI needs attention on the pull request for this branch. Tell the user what needs attention. ${REPLY}\n${describe(s)}`,
     meta: { kind: "ci.current_state", repo: s.repo, pr: String(s.pr) },
   };
 }
@@ -189,10 +200,15 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
   const unsubscribe = (e: Entry, reason: string) => {
     subs.remove(e.repo, e.pr);
     events.write("unsubscribe", { repo: e.repo, pr: e.pr, source: e.source, reason });
+    forgetEnded();
   };
   const send = async (message: ChannelMessage, change: Change | null, wanted = true, reason?: string, extra: Record<string, unknown> = {}) => {
     let fields = { ...eventFields(message, change), ...extra };
     if (!wanted) return events.write("event", { ...fields, outcome: "filtered", ...(reason ? { reason } : {}) });
+    // This session's mutes (the mute tool, or an unsubscribed automatic watch): held back, and logged as such.
+    if (change && subs.mutes.matching({ repo: change.snapshot.repo, pr: change.snapshot.pr, kind: change.kind, workflow: change.run ? clean(change.run.name) : "" })) {
+      return events.write("event", { ...fields, outcome: "filtered", reason: "muted" });
+    }
     const meta = message.meta as Record<string, unknown>;
     if (typeof meta.repo === "string" && typeof meta.pr === "string") {
       const key = `${meta.repo.toLowerCase()}#${meta.pr}`;
@@ -232,6 +248,22 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
   let lastScope = "";
   let saidScope = false;
   const misses = new Map<string, number>();
+  const allDoneHoldMs = deps.allDoneHoldMs ?? PENDING_WINDOW_MS;
+  /** Per PR: the head whose ci.run_all_done is held until the head has had its window (allDoneHoldMs). */
+  const held = new Map<string, string>();
+  /**
+   * When a head's window to register workflows in began: the oldest run's creation on it (GitHub's time, near the
+   * push), or this session's first sight of the head if that is earlier or no run says. Both are at or after the push,
+   * so the earlier is the nearer. A session that subscribes mid-CI adds no wait of its own.
+   */
+  const holdFrom = (seenAt: number, snap: Snapshot): number => {
+    let from = seenAt;
+    for (const r of snap.runs) {
+      const created = Date.parse(r.createdAt ?? "");
+      if (Number.isFinite(created) && created < from) from = created;
+    }
+    return from;
+  };
   /** Per PR the hook handed over and not yet looked at: when the hook saw it (HOOK_NEW_MS). */
   const hookSeenAt = new Map<string, number>();
 
@@ -253,7 +285,6 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
    * (reviews.ts). GraphQL's budget is its own, so its own reading decides the back-off and the pause.
    */
   const checkReviews = async () => {
-    for (const key of reviews.keys()) if (!subs.list().some((e) => e.key === key)) reviews.delete(key);
     const p = ratePressure(gh.graphqlRemaining, gh.graphqlLimit);
     if (p.pause) return;
     for (const entry of subs.list()) {
@@ -273,7 +304,9 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       }
       const live = subs.get(entry.repo, entry.pr);
       if (!live?.last) continue;
-      const { changes, keep } = reviewChanges(seen?.state ?? null, r.value, live.last);
+      const look = looks.get(entry.key);
+      const settled = look !== undefined && look.headSha === live.last.headSha && now() - holdFrom(look.headSeenAt, live.last) >= allDoneHoldMs && !held.has(entry.key);
+      const { changes, keep } = reviewChanges(seen?.state ?? null, r.value, live.last, settled);
       reviews.set(entry.key, { state: keep, next: now() + reviewEveryMs * p.stretch });
       for (const change of changes) await send(await message(change), change, wants(live, change.kind));
     }
@@ -287,7 +320,6 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
    * such run per look, a 304 when nothing changed. The PR's first look is a baseline (jobs.ts).
    */
   const checkJobs = async (entry: Entry, snap: Snapshot) => {
-    for (const key of jobsSeen.keys()) if (!subs.list().some((e) => e.key === key)) jobsSeen.delete(key);
     if (!JOB_KINDS.some((k) => wants(entry, k))) return;
     let seen = jobsSeen.get(entry.key) ?? null;
     for (const run of snap.runs) {
@@ -374,13 +406,45 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       const kind = v.red ? "base.red" : "base.green";
       const seen = entries.filter((e) => e.last !== null);
       const wanting = seen.filter((e) => wants(e, kind));
-      const about = wanting[0] ?? seen[0];
+      // A mute of one PR is not a mute of the base: said about, and naming, the PRs that want it and are not muted;
+      // held back (by send) only when every one of them is.
+      const heard = wanting.filter((e) => !subs.mutes.matching({ repo: e.repo, pr: e.pr, kind, workflow: "" }));
+      const named = heard.length ? heard : wanting.length ? wanting : seen;
+      const about = named[0];
       if (!about?.last) continue;
-      const prs = [...new Set((wanting.length ? wanting : seen).map((e) => e.pr))].sort((a, b) => a - b);
+      const prs = [...new Set(named.map((e) => e.pr))].sort((a, b) => a - b);
       const change: Change = { kind, snapshot: about.last, failing: v.failing, prs, ...(v.at ? { at: v.at } : {}) };
       await send(await message(change), change, wanting.length > 0);
     }
   };
+
+  /**
+   * THE ONE PLACE A PR'S STATE IS DROPPED: every per-PR list loses each PR no longer watched, however its subscription
+   * ended (merged, closed, gone, a branch switch, the tool's unsubscribe, the hook's screen). Run when the poller ends
+   * a subscription, and at the start and end of every pass, which catches one the tool ended between passes. Without
+   * it, a session that watched hundreds of PRs over days kept something of each.
+   */
+  function forgetEnded(): void {
+    const watched = new Set(subs.list().map((e) => e.key));
+    const perPr: Map<string, unknown>[] = [startedFor, sentAt, misses, looks, reviews, jobsSeen, hookSeenAt, held];
+    for (const map of perPr) for (const key of map.keys()) if (!watched.has(key)) map.delete(key);
+    // A hook's hand-over time matters only while the hook's own subscription stands (Claude's subscribe outranks it).
+    for (const key of hookSeenAt.keys()) if (!subs.list().some((e) => e.key === key && e.source === "hook")) hookSeenAt.delete(key);
+  }
+
+  deps.sizes?.(() => ({
+    startedFor: startedFor.size,
+    sentAt: sentAt.size,
+    misses: misses.size,
+    looks: looks.size,
+    reviews: reviews.size,
+    jobsSeen: jobsSeen.size,
+    hookSeenAt: hookSeenAt.size,
+    held: held.size,
+    bases: bases.size,
+    requestIds: requests.seen?.ids.size ?? 0,
+    etagEntries: gh.etagEntries,
+  }));
 
   while (!signal.aborted) {
     let waitMs = config.pollSeconds * 1000;
@@ -411,14 +475,18 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
     }
 
     const scope = config.autoSubscribe === "pr" || deps.inOwnHistory ? await deps.readScope() : null;
-    if (config.autoSubscribe === "pr" && scope) {
-      const label = `${scope.repo ?? "(no GitHub remote)"}@${scope.branch ?? "(no branch)"}`;
+    // No branch is no change: git answers none mid-rebase and nothing at all when it times out, and taking either for
+    // a branch switch ended the branch's mutes, unwatched its pull request and dropped a held all done.
+    if (config.autoSubscribe === "pr" && scope?.branch) {
+      const label = `${scope.repo ?? "(no GitHub remote)"}@${scope.branch}`;
       if (label !== lastScope) {
         log(`session folder is on ${label}`);
         lastScope = label;
       }
       let current: string | null = null;
       if (label !== findLabel) {
+        // A branch change ends the mute an unsubscribed automatic watch left: the new branch's PR is news again.
+        if (findLabel) subs.mutes.endBranchMutes();
         findLabel = label;
         findSince = now();
         foundAt = Number.NEGATIVE_INFINITY;
@@ -438,10 +506,12 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
           await sleep(waitMs, signal);
           continue;
         }
-        if (found.kind === "ok" && found.value !== null) {
+        if (found.kind === "ok" && found.value !== null && subs.mutes.mutesPr(scope.repo, found.value)) {
+          current = null; // muted in this session (the mute tool, or unsubscribed): never added back
+        } else if (found.kind === "ok" && found.value !== null) {
           const isNew = !subs.get(scope.repo, found.value);
           current = subs.add({ repo: scope.repo, pr: found.value, source: "auto" }).key;
-          if (isNew) events.write("subscribe", { repo: scope.repo, pr: found.value, source: "auto", events: "all" });
+          if (isNew) events.write("subscribe", { repo: scope.repo, pr: found.value, source: "auto", events: [...AUTO_EVENTS] });
         } else if (found.kind !== "ok") {
           current = "keep"; // GitHub did not answer: leave the automatic subscription as it is
         }
@@ -477,10 +547,9 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       }
       const e = subs.add({ repo: req.repo, pr: req.pr, source: "hook" });
       hookSeenAt.set(e.key, req.at);
-      events.write("subscribe", { repo: req.repo, pr: req.pr, source: "hook", events: "all" });
+      events.write("subscribe", { repo: req.repo, pr: req.pr, source: "hook", events: [...AUTO_EVENTS] });
     }
-    for (const key of hookSeenAt.keys()) if (!subs.list().some((e) => e.key === key && e.source === "hook")) hookSeenAt.delete(key);
-    for (const key of looks.keys()) if (!subs.list().some((e) => e.key === key)) looks.delete(key);
+    forgetEnded();
     for (const entry of subs.list()) {
       if (signal.aborted) break;
       const look = looks.get(entry.key);
@@ -544,6 +613,29 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       ) {
         changes.unshift({ kind: "pr.head_moved", snapshot: snap, ...(snap.updatedAt ? { at: snap.updatedAt } : {}) });
       }
+      // ALL DONE IS NEVER EARLY: every run listed so far being done is not all done while the head is new, since a
+      // slow workflow can register after a fast one has finished. Held until the head has been watched for
+      // allDoneHoldMs, re-made from the snapshot then, and dropped if a run is unfinished meanwhile (its finish
+      // makes a new one) or the head moves.
+      const headSeenAt = look && look.headSha === snap.headSha ? look.headSeenAt : now();
+      {
+        const at = changes.findIndex((c) => c.kind === "ci.run_all_done");
+        const early = now() - holdFrom(headSeenAt, snap) < allDoneHoldMs;
+        if (at >= 0 && early) {
+          changes.splice(at, 1);
+          held.set(entry.key, snap.headSha);
+        } else if (at >= 0) {
+          held.delete(entry.key);
+        } else if (held.has(entry.key)) {
+          const unfinished = snap.state !== "open" || held.get(entry.key) !== snap.headSha || snap.runs.some((r) => r.status !== "completed");
+          if (unfinished) held.delete(entry.key);
+          else if (!early) {
+            held.delete(entry.key);
+            const all = allDoneChange(snap);
+            if (all) changes.push(all);
+          }
+        }
+      }
       const starts = changes.filter((c) => c.kind === "ci.workflow_started");
       const startKey = `${entry.repo.toLowerCase()}#${entry.pr}`;
       const startedAlready = startedFor.get(startKey) === snap.headSha;
@@ -567,8 +659,8 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       if (first && live.source === "auto" && needsAttention(snap)) await send(currentState(snap), null);
       {
         const t = now();
-        const headSeenAt = look && look.headSha === snap.headSha ? look.headSeenAt : t;
-        const phase = phaseOf(snap, headSeenAt, t);
+        // A held all done keeps the PR pending: looked at every minute, its runs read fresh, until it is said.
+        const phase = held.has(entry.key) ? "pending" : phaseOf(snap, headSeenAt, t);
         const quiet = changes.length === 0 && look?.phase === "finished" && phase === "finished" ? look.quiet + 1 : 0;
         const runsReadAt = look && reuse !== null && snap.runs === reuse.runs ? look.runsReadAt : t;
         looks.set(entry.key, { next: t + lookEvery(phase, config.pollSeconds * 1000, quiet) * pressure().stretch, quiet, phase, headSha: snap.headSha, headSeenAt, runsReadAt });
@@ -588,6 +680,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       await send(scopeMessage(), null);
     }
 
+    forgetEnded();
     if (Date.now() - lastBeat >= heartbeatMs) beat();
 
     // The newest reading, this pass's answers included.

@@ -27,11 +27,11 @@ async function setup(auth: GhAuth = { kind: "ok", token: "gho_fakeToken123", sou
   return { gh, subs, tools };
 }
 
-test("the four tools are listed, read-only, and nothing else", async () => {
+test("the six tools are listed, read-only, and nothing else", async () => {
   const { tools } = await setup();
   const listed = tools.list();
   assert.deepEqual(listed.map((t) => t.name).sort(), [...TOOL_NAMES].sort());
-  assert.deepEqual([...TOOL_NAMES].sort(), ["ci_status", "list_subscriptions", "subscribe", "unsubscribe"]);
+  assert.deepEqual([...TOOL_NAMES].sort(), ["ci_status", "list_subscriptions", "mute", "subscribe", "unmute", "unsubscribe"]);
   for (const t of listed) {
     assert.equal(t.annotations.readOnlyHint, true, t.name);
     assert.equal(t.inputSchema.type, "object", t.name);
@@ -111,7 +111,10 @@ test("unsubscribe removes one PR, or all; list_subscriptions shows what is left"
   await tools.call("subscribe", { repo: "acme/widgets", pr: 8, events: ["ci.workflow_failed"] });
   assert.match((await tools.call("list_subscriptions", {})).text, /acme\/widgets PR #7: all events[\s\S]*acme\/widgets PR #8: ci\.workflow_failed/);
   assert.match((await tools.call("unsubscribe", { repo: "acme/widgets", pr: 7 })).text, /Stopped watching 1/);
-  assert.doesNotMatch((await tools.call("list_subscriptions", {})).text, /PR #7/);
+  // PR 7 is the current branch's ("feat"), so unsubscribing it also leaves a mute, listed as one: no longer watched.
+  const left = (await tools.call("list_subscriptions", {})).text;
+  assert.doesNotMatch(left, /PR #7:/);
+  assert.match(left, /Muted in this session only[\s\S]*PR #7 \(unsubscribed as the current branch's pull request/);
   assert.match((await tools.call("unsubscribe", { all: true })).text, /Stopped watching 1/);
   assert.match((await tools.call("list_subscriptions", {})).text, /No subscriptions/);
 });

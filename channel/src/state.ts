@@ -54,6 +54,11 @@ export interface Snapshot {
   readonly headRef: string;
   /** GitHub's `mergeable_state`: `dirty` is a conflict, `unknown` is "still computing". */
   readonly mergeableState: string;
+  /**
+   * GitHub's `mergeable_state` as it answered (clean, has_hooks, blocked, behind, dirty, unstable, draft or unknown),
+   * for whether the PR may be ready to merge. `mergeableState` above folds it to a conflict or not.
+   */
+  readonly mergeStatus?: string;
   readonly prUrl: string;
   readonly runs: readonly RunInfo[];
   /** When the PR was merged or closed, GitHub's time. */
@@ -87,6 +92,8 @@ export interface Change {
   readonly conclusion?: string;
   /** For `ci.run_all_done`: the names of the workflows that failed, in the order GitHub lists them. */
   readonly failedWorkflows?: readonly string[];
+  /** For `ci.run_all_done`: the names of the workflows that were cancelled. */
+  readonly cancelledWorkflows?: readonly string[];
   readonly labelsAdded?: readonly string[];
   readonly labelsRemoved?: readonly string[];
   /** For `base.red` and `base.green`: every watched PR on that base, the event being about the base, not one PR. */
@@ -194,12 +201,9 @@ export function diff(prev: Snapshot | null, next: Snapshot): Change[] {
     }
   }
 
-  if (anyRunChanged && allDone(next.runs)) {
-    const reported = next.runs.filter((r) => outcome(r.conclusion) !== "ignored");
-    const has = (o: Outcome) => reported.some((r) => outcome(r.conclusion) === o);
-    const worst = has("failed") ? "failure" : has("needs_approval") ? NEEDS_APPROVAL : has("cancelled") ? "cancelled" : "success";
-    const failedWorkflows = reported.filter((r) => outcome(r.conclusion) === "failed").map((r) => r.name);
-    changes.push({ kind: "ci.run_all_done", snapshot: next, conclusion: worst, failedWorkflows });
+  if (anyRunChanged) {
+    const all = allDoneChange(next);
+    if (all) changes.push(all);
   }
 
   if (next.mergeableState !== "unknown" && next.mergeableState !== prev.mergeableState) {
@@ -234,6 +238,22 @@ export function carry(prev: Snapshot | null, next: Snapshot): Snapshot {
   const kept = { ...next, failedAttempts };
   if (prev && next.mergeableState === "unknown") return { ...kept, mergeableState: prev.mergeableState };
   return kept;
+}
+
+/**
+ * The ci.run_all_done for a snapshot whose runs have all finished, or null while any has not. `workflows` is how many
+ * were reported on, so the event can say "all 3 succeeded" or "1 of 3 did not". A workflow that starts later on the
+ * same head is a new run: its finish is a change, and all done is said again. The poller holds it until the head has
+ * had its window to register workflows (poller.ts), since every run listed so far being done is not all done.
+ */
+export function allDoneChange(next: Snapshot): Change | null {
+  if (!allDone(next.runs)) return null;
+  const reported = next.runs.filter((r) => outcome(r.conclusion) !== "ignored");
+  const has = (o: Outcome) => reported.some((r) => outcome(r.conclusion) === o);
+  const worst = has("failed") ? "failure" : has("needs_approval") ? NEEDS_APPROVAL : has("cancelled") ? "cancelled" : "success";
+  const failedWorkflows = reported.filter((r) => outcome(r.conclusion) === "failed").map((r) => r.name);
+  const cancelledWorkflows = reported.filter((r) => outcome(r.conclusion) === "cancelled").map((r) => r.name);
+  return { kind: "ci.run_all_done", snapshot: next, conclusion: worst, failedWorkflows, cancelledWorkflows, workflows: reported.length };
 }
 
 export function needsAttention(s: Snapshot): boolean {

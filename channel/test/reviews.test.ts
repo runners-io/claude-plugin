@@ -122,6 +122,26 @@ test("ready to merge is sent once per head commit, when GitHub says CLEAN or HAS
   assert.deepEqual(reviewChanges(again.keep, pushed, snap).changes.map((c) => c.kind), ["pr.ready_to_merge"], "a new commit that is ready: again");
 });
 
+// GitHub's CLEAN can come before CI on the head has finished (a workflow not yet registered, a check not required).
+// Ready to merge is said only when every run on the head has finished and none failed, and the head has settled.
+test("ready to merge never fires while a run is unfinished or failed, or before the head has settled", () => {
+  const blocked = read();
+  const clean = read({ mergeStateStatus: "CLEAN" });
+  const run = (id: number, status: string, conclusion: string | null) => ({ id, name: `W${id}`, status, conclusion, htmlUrl: "", runAttempt: 1 });
+  const running = { ...snap, runs: [run(1, "completed", "success"), run(2, "in_progress", null)] };
+  const failed = { ...snap, runs: [run(1, "completed", "success"), run(2, "completed", "failure")] };
+  const green = { ...snap, runs: [run(1, "completed", "success"), run(2, "completed", "skipped")] };
+  const one = reviewChanges(blocked, clean, running);
+  assert.deepEqual(one.changes, [], "a run is unfinished");
+  const two = reviewChanges(one.keep, clean, failed);
+  assert.deepEqual(two.changes, [], "a run failed");
+  const early = reviewChanges(two.keep, clean, green, false);
+  assert.deepEqual(early.changes, [], "the head has not settled");
+  const ready = reviewChanges(early.keep, clean, green);
+  assert.deepEqual(ready.changes.map((c) => c.kind), ["pr.ready_to_merge"], "now it is, and it was not lost");
+  assert.deepEqual(reviewChanges(ready.keep, clean, green).changes, [], "once");
+});
+
 test("the messages carry logins, kinds, file:line and links, never a review's or a comment's text", () => {
   const before = read();
   const after = read({
@@ -150,4 +170,19 @@ test("the messages carry logins, kinds, file:line and links, never a review's or
   assert.match(t.meta.url, /^https:\/\/github\.com\/acme\/widgets\/pull\/7#discussion_r11$/);
   assert.match(t.content, /a bot/);
   assert.equal(messages[2].meta.merge_state, "CLEAN");
+});
+
+// The first reading marks a head as already said only when ready to merge would have fired on it then: GitHub can say
+// CLEAN while a run is still queued, and marking that head lost its ready to merge for good.
+test("CLEAN on the first reading while a run is queued, then the run succeeds: one ready to merge", () => {
+  const clean = read({ mergeStateStatus: "CLEAN" });
+  const run = (status: string, conclusion: string | null) => ({ id: 1, name: "CI", status, conclusion, htmlUrl: "", runAttempt: 1 });
+  const base = reviewChanges(null, clean, { ...snap, runs: [run("queued", null)] });
+  assert.deepEqual(base.changes, [], "the first reading is a baseline");
+  const done = reviewChanges(base.keep, clean, { ...snap, runs: [run("completed", "success")] });
+  assert.deepEqual(done.changes.map((c) => c.kind), ["pr.ready_to_merge"]);
+  assert.deepEqual(reviewChanges(done.keep, clean, { ...snap, runs: [run("completed", "success")] }).changes, [], "once");
+  // The control: a PR already ready and finished when first read is not news.
+  const already = reviewChanges(null, clean, { ...snap, runs: [run("completed", "success")] });
+  assert.deepEqual(reviewChanges(already.keep, clean, { ...snap, runs: [run("completed", "success")] }).changes, []);
 });

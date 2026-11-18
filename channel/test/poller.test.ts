@@ -81,6 +81,8 @@ async function setup(
     ...(opts.hookRequests ? { takeHookRequests: () => (opts.hookRequests as { repo: string; pr: number; at: number }[]).splice(0) } : {}),
     // These tests change a settled PR and expect the next pass to see it; the cadence has its own (cadence*.test.ts).
     lookEveryMs: () => 0,
+    // ...and expect all done at once; holding it for a new head's window has its own tests (actions.test.ts).
+    allDoneHoldMs: 0,
     baseIdleMs: 0,
     reviewEveryMs: 0,
     requestsEveryMs: 0,
@@ -246,7 +248,7 @@ test("auth lost then regained: said once, and changes flow again after", async (
     t.gh.state.token = TOKEN;
     t.auth.current = { kind: "ok", token: TOKEN, source: "gh" };
     t.gh.setRuns("acme/widgets", SHA, [{ id: 41, name: "CI", status: "completed", conclusion: "success" }]);
-    await until("the pass", () => t.kinds().includes("ci.workflow_succeeded"));
+    await until("the pass", () => t.kinds().includes("ci.run_all_done"));
   } finally {
     await t.stop();
   }
@@ -683,6 +685,9 @@ test("a review, a review thread and ready-to-merge reach the session once each, 
       }),
     );
     await until("changes requested and the thread", () => t.kinds().includes("pr.changes_requested") && t.kinds().includes("pr.review_thread_added"));
+    // Ready to merge waits for CI on the head to finish (reviews.ts): the setup's run is still queued.
+    t.gh.setRuns("acme/widgets", SHA, [{ id: 41, name: "CI", status: "completed", conclusion: "success" }]);
+    await until("CI finished", () => t.subs.list()[0]?.last?.runs[0]?.status === "completed");
     t.gh.setReviewPull("acme/widgets", 7, reviewNode({ mergeStateStatus: "CLEAN", latestOpinionatedReviews: { nodes: [] }, reviewThreads: { nodes: [] } }));
     await until("ready to merge", () => t.kinds().includes("pr.ready_to_merge"));
     await settle();
@@ -713,8 +718,10 @@ test("a subscription that asked for no review event costs no GraphQL read", asyn
 
 
 test("a push that starts many workflows is ONE ci.workflow_started per head commit; the rest are logged as collapsed", async () => {
-  const t = await setup();
+  // Subscribed by the tool: the branch's automatic watch leaves ci.workflow_started out by default.
+  const t = await setup({ autoSubscribe: "off" });
   try {
+    await t.tools.call("subscribe", { repo: "acme/widgets", pr: 7 });
     await until("baseline", () => t.subs.list()[0]?.last != null);
     t.gh.setPull("acme/widgets", 7, { head: { ref: "feat", sha: SHA_B } });
     t.gh.setRuns("acme/widgets", SHA_B, [

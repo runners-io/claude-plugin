@@ -108,6 +108,8 @@ export interface PullInfo {
    * `mergeable` boolean first: a draft PR's `mergeable_state` is `draft` whether or not it conflicts.
    */
   readonly mergeableState: string;
+  /** GitHub's `mergeable_state` as it answered (clean, blocked, behind, dirty, unstable, draft, has_hooks, unknown). */
+  readonly mergeStatus?: string;
   readonly htmlUrl: string;
   /** When it was merged or closed, GitHub's time; for the event log's latency. */
   readonly closedAt?: string;
@@ -144,6 +146,8 @@ export interface RunInfo {
   /** GitHub's times, for the event log's latency: when this attempt started, and when the run last changed. */
   readonly startedAt?: string;
   readonly updatedAt?: string;
+  /** When GitHub created the run (a re-run keeps it): near the push that made it, for the all-done hold. */
+  readonly createdAt?: string;
 }
 
 export type ApiResult<T> =
@@ -194,6 +198,9 @@ const TOKEN_TTL_MS = 5 * 60_000;
 
 type Fetch = typeof fetch;
 
+/** The most paths whose ETag and answer one client keeps: the least recently used goes first. */
+export const ETAG_CACHE_MAX = 500;
+
 /** How long a session waits for another session's request to the same path before asking GitHub itself. */
 const LEASE_WAIT_MS = 3000;
 
@@ -238,6 +245,11 @@ export class GitHubClient {
     this.fetchImpl = fetchImpl;
     this.shared = options.shared ?? null;
     this.now = options.now ?? Date.now;
+  }
+
+  /** How many paths' ETags and answers this client keeps (tests hold it under a bound). */
+  get etagEntries(): number {
+    return this.cache.size;
   }
 
   /**
@@ -309,6 +321,7 @@ export class GitHubClient {
         headRef: String(p.head?.ref ?? ""),
         headRepo: typeof p.head?.repo?.full_name === "string" ? p.head.repo.full_name : null,
         mergeableState: mergeability(p),
+        mergeStatus: typeof p.mergeable_state === "string" ? p.mergeable_state : "unknown",
         htmlUrl: String(p.html_url ?? ""),
         ...(typeof (p.merged_at ?? p.closed_at) === "string" ? { closedAt: String(p.merged_at ?? p.closed_at) } : {}),
         ...(typeof p.created_at === "string" ? { createdAt: p.created_at } : {}),
@@ -353,6 +366,7 @@ export class GitHubClient {
         runAttempt: Number(r.run_attempt ?? 1),
         ...(typeof (r.run_started_at ?? r.created_at) === "string" ? { startedAt: String(r.run_started_at ?? r.created_at) } : {}),
         ...(typeof r.updated_at === "string" ? { updatedAt: r.updated_at } : {}),
+        ...(typeof r.created_at === "string" ? { createdAt: r.created_at } : {}),
       }));
     });
     if (all.kind !== "ok") return all;
@@ -527,7 +541,7 @@ export class GitHubClient {
   ): Promise<ApiResult<T>> {
     let auth = first;
     // The newest ETag on this machine, with the value it stands for: another session's when it is newer.
-    const own = this.cache.get(path) as { etag: string; value: T } | undefined;
+    const own = this.cached<T>(path);
     const known = stored ? { etag: stored.etag, value: stored.value } : own;
     let res = await this.request(path, auth.token, known?.etag);
     if ("kind" in res) return res;
@@ -587,10 +601,33 @@ export class GitHubClient {
     const value = map(body);
     const etag = res.headers.get("etag");
     if (etag) {
-      this.cache.set(path, { etag, value });
+      this.remember(path, { etag, value });
       store?.write({ path, etag, value, at: now });
     }
     return { kind: "ok", value };
+  }
+
+  /** The path's ETag and answer, marked as used just now. */
+  private cached<T>(path: string): { etag: string; value: T } | undefined {
+    const hit = this.cache.get(path);
+    if (!hit) return undefined;
+    this.cache.delete(path);
+    this.cache.set(path, hit);
+    return hit as { etag: string; value: T };
+  }
+
+  /**
+   * Keeps a path's ETag and answer, and drops the least recently used past ETAG_CACHE_MAX: every head commit's runs,
+   * every run's jobs and every pull request read is a path, and a session that ran for days kept them all.
+   */
+  private remember(path: string, entry: { etag: string; value: unknown }): void {
+    this.cache.delete(path);
+    this.cache.set(path, entry);
+    while (this.cache.size > ETAG_CACHE_MAX) {
+      const oldest = this.cache.keys().next().value;
+      if (oldest === undefined) break;
+      this.cache.delete(oldest);
+    }
   }
 
   private async request(path: string, token: string, etag: string | undefined): Promise<Response | { kind: "retry"; reason: string }> {

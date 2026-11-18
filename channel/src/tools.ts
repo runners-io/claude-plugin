@@ -3,20 +3,20 @@
  * hears about: some pull requests, or all of the current branch's.
  *
  * THESE ARE NOT A REPLY PATH. They read GitHub and change only this process's
- * own list of what to watch. Nothing here approves a tool call, sends a
+ * own lists of what to watch and what to mute. Nothing here approves a tool call, sends a
  * message anywhere, or writes to GitHub, so the channel still declares no
  * `claude/channel/permission` and every tool is `readOnlyHint`.
  */
 import { NO_EVENT_LOG } from "./eventlog.ts";
 import type { EventLog } from "./eventlog.ts";
-import { clean, describe, setupText } from "./format.ts";
+import { NAMES_LABEL, clean, describe, setupText } from "./format.ts";
 import type { GitScope } from "./git.ts";
 import type { GitHubClient } from "./github.ts";
 import { fetchSnapshot } from "./poller.ts";
 import { EVENT_KINDS, type EventKind, isEventKind } from "./state.ts";
-import { MAX_SUBSCRIPTIONS, type Subscriptions } from "./subscriptions.ts";
+import { type Entry, MAX_MUTES, MAX_SUBSCRIPTIONS, type Mute, type Subscriptions } from "./subscriptions.ts";
 
-export const TOOL_NAMES = ["subscribe", "unsubscribe", "list_subscriptions", "ci_status"] as const;
+export const TOOL_NAMES = ["subscribe", "unsubscribe", "list_subscriptions", "ci_status", "mute", "unmute"] as const;
 
 export interface ToolDef {
   readonly name: string;
@@ -47,6 +47,13 @@ const target = {
   pr: { type: "integer", minimum: 1, description: "Pull request number. Default: the open pull request for the current branch." },
 } as const;
 
+const muteFields = {
+  repo: { type: "string", description: "owner/name on GitHub, with pr. Default with pr: this session's repository." },
+  pr: { type: "integer", minimum: 1, description: "Pull request number." },
+  kinds: { type: "array", items: { type: "string", enum: [...EVENT_KINDS] }, description: "Event kinds to mute." },
+  workflow: { type: "string", description: "A workflow's name, exactly as the events give it." },
+} as const;
+
 function def(name: (typeof TOOL_NAMES)[number], title: string, description: string, properties: Record<string, unknown>): ToolDef {
   return {
     name,
@@ -70,8 +77,20 @@ const DEFS: ToolDef[] = [
     ...target,
     all: { type: "boolean", description: "Stop watching everything." },
   }),
-  def("list_subscriptions", "List watched pull requests", "The pull requests this session is watching, and which events each pushes.", {}),
+  def("list_subscriptions", "List watched pull requests", "The pull requests this session is watching, which events each pushes, and this session's mutes.", {}),
   def("ci_status", "Read a pull request's CI now", "The pull request's current CI and merge-conflict state, read from GitHub now. Does not subscribe.", target),
+  def(
+    "mute",
+    "Stop hearing some events",
+    "In this session only, stop pushing events that match: a pull request (repo and pr), some kinds on every pull request (kinds), " +
+      "kinds on one pull request (repo, pr and kinds), or one workflow by its name (workflow). Other sessions are not affected. " +
+      `A pull request muted on its own is never watched automatically. At most ${MAX_MUTES}; they end with the session.`,
+    muteFields,
+  ),
+  def("unmute", "Hear muted events again", "Remove one mute (the same fields it was made with), or every mute (all: true).", {
+    ...muteFields,
+    all: { type: "boolean", description: "Remove every mute." },
+  }),
 ];
 
 interface Deps {
@@ -125,7 +144,61 @@ function parseEvents(raw: unknown): { ok: true; events: EventKind[] | "all" } | 
   return { ok: true, events: [...new Set(raw as EventKind[])] };
 }
 
-const label = (events: ReadonlySet<EventKind> | EventKind[] | "all") => (events === "all" ? "all events" : [...events].join(", "));
+/** A mute from the tool's arguments, or why not. */
+async function parseMute(deps: Deps, args: Record<string, unknown>): Promise<{ ok: true; mute: Mute } | { ok: false; text: string }> {
+  const has = (k: string) => args[k] !== undefined;
+  if (!has("pr") && !has("kinds") && !has("workflow")) return { ok: false, text: "Name what to mute: repo and pr, kinds, both, or workflow." };
+  let repo: string | undefined;
+  let pr: number | undefined;
+  if (has("repo") && !has("pr")) return { ok: false, text: "repo needs pr: a mute names one pull request, not a whole repository." };
+  if (has("pr")) {
+    if (typeof args.pr !== "number" || !Number.isInteger(args.pr) || args.pr < 1) return { ok: false, text: "pr must be a positive whole number." };
+    pr = args.pr;
+    if (has("repo")) {
+      if (typeof args.repo !== "string" || !REPO.test(args.repo)) return { ok: false, text: "repo must be owner/name, for example acme/widgets." };
+      repo = args.repo;
+    } else {
+      const scope = await deps.readScope();
+      if (!scope.repo) return { ok: false, text: "This session's folder has no GitHub origin remote: pass repo (owner/name) with pr." };
+      repo = scope.repo;
+    }
+  }
+  let kinds: Set<EventKind> | undefined;
+  if (has("kinds")) {
+    const parsed = parseEvents(args.kinds);
+    if (!parsed.ok || parsed.events === "all") return { ok: false, text: "kinds must be a non-empty list of event kinds." + (parsed.ok ? "" : ` ${parsed.text}`) };
+    kinds = new Set(parsed.events);
+  }
+  let workflow: string | undefined;
+  if (has("workflow")) {
+    workflow = typeof args.workflow === "string" ? clean(args.workflow) : "";
+    if (!workflow) return { ok: false, text: "workflow must be a workflow's name, as the events give it." };
+  }
+  return { ok: true, mute: { ...(repo && pr ? { repo, pr } : {}), ...(kinds ? { kinds } : {}), ...(workflow ? { workflow } : {}) } };
+}
+
+/** One mute in words. A workflow's name is the repository's: it comes last, quoted, after the names label. */
+function muteText(m: Mute): string {
+  const parts = [
+    m.kinds ? [...m.kinds].join(", ") : "every event",
+    m.repo && m.pr ? `on ${m.repo} PR #${m.pr}` : "on every pull request",
+    m.workflow ? "of the workflow named at the end" : "",
+    m.untilBranchChange ? "(unsubscribed as the current branch's pull request: until the branch changes)" : "",
+  ];
+  return `${parts.filter(Boolean).join(" ")}.${m.workflow ? ` ${NAMES_LABEL} workflow ${JSON.stringify(m.workflow)}.` : ""}`;
+}
+
+function muteLog(m: Mute): Record<string, unknown> {
+  return { repo: m.repo ?? null, pr: m.pr ?? null, kinds: m.kinds ? [...m.kinds] : null, workflow: m.workflow ?? null };
+}
+
+const label = (events: ReadonlySet<EventKind> | EventKind[] | "all") => {
+  if (events === "all") return "all events";
+  const list = [...events];
+  // Most kinds (the automatic watch's default): say which are left out, not the twenty that are not.
+  const left = EVENT_KINDS.filter((k) => !list.includes(k));
+  return list.length > left.length ? `all events but ${left.join(", ")}` : list.join(", ");
+};
 
 export function makeTools(deps: Deps): ToolHost {
   const err = (text: string): ToolResult => ({ text, isError: true });
@@ -162,38 +235,89 @@ export function makeTools(deps: Deps): ToolHost {
           if ("text" in snap) return snap;
           if (snap.state !== "open") return { text: `${describe(snap)}\nThe pull request is ${snap.state}, so it is not subscribed.` };
           deps.subs.add({ repo: t.repo, pr: t.pr, events: events.events, source: "tool", last: snap });
+          // Asked for by name: a mute of the whole pull request no longer holds. Kind and workflow mutes stay.
+          const lifted = deps.subs.mutes.remove({ repo: t.repo, pr: t.pr });
           (deps.eventLog ?? NO_EVENT_LOG).write("subscribe", {
             repo: t.repo,
             pr: t.pr,
             source: "tool",
             events: events.events === "all" ? "all" : [...events.events],
           });
-          return { text: `Subscribed to ${t.repo} PR #${t.pr} (${label(events.events)}).\n${describe(snap)}\n${deps.liveEvents === false ? EVENTS_OFF_NOTE : CHANNEL_NOTE}` };
+          return { text: `Subscribed to ${t.repo} PR #${t.pr} (${label(events.events)})${lifted ? "; its mute is lifted" : ""}.\n${describe(snap)}\n${deps.liveEvents === false ? EVENTS_OFF_NOTE : CHANNEL_NOTE}` };
         }
         case "unsubscribe": {
           const record = (repo: string | null, pr: number | null, count: number) =>
             (deps.eventLog ?? NO_EVENT_LOG).write("unsubscribe", { repo, pr, source: "tool", reason: "tool", count });
+          // The branch's automatic watch would find its pull request again within minutes: unsubscribing it leaves a
+          // mute of that pull request, which ends when the session's branch changes. Whoever holds it: the automatic
+          // watch, the hook's hand-over of a PR just opened, or Claude's own subscribe.
+          const muteBranchPr = async (repo?: string, pr?: number) => {
+            const scope = await deps.readScope();
+            const branchPr = (e: Entry) =>
+              e.source === "auto" ||
+              (!!scope.branch && !!scope.repo && e.repo.toLowerCase() === scope.repo.toLowerCase() && e.last?.headRef === scope.branch);
+            const mine = deps.subs
+              .list()
+              .filter((e) => branchPr(e) && (!repo || e.repo.toLowerCase() === repo.toLowerCase()) && (pr === undefined || e.pr === pr));
+            let note = "";
+            for (const e of mine) {
+              const added = deps.subs.mutes.add({ repo: e.repo, pr: e.pr, untilBranchChange: true });
+              if (added === "added") (deps.eventLog ?? NO_EVENT_LOG).write("mute", { ...muteLog({ repo: e.repo, pr: e.pr }), source: "unsubscribe" });
+              note +=
+                added === "full"
+                  ? ` This session already has ${MAX_MUTES} mutes, so the branch's automatic watch may add ${e.repo} PR #${e.pr} back.`
+                  : ` ${e.repo} PR #${e.pr} is the current branch's: it stays unwatched until the branch changes, or until unmute or subscribe.`;
+            }
+            return note;
+          };
           if (args.all === true) {
+            const note = await muteBranchPr();
             const count = deps.subs.remove();
             record(null, null, count);
-            return { text: `Stopped watching ${count} pull request(s).` };
+            return { text: `Stopped watching ${count} pull request(s).${note}` };
           }
           if (args.repo !== undefined && (typeof args.repo !== "string" || !REPO.test(args.repo))) return err("repo must be owner/name.");
           if (args.pr !== undefined && (typeof args.pr !== "number" || !Number.isInteger(args.pr) || args.pr < 1)) return err("pr must be a positive whole number.");
           const repo = (args.repo as string | undefined) ?? (await deps.readScope()).repo;
           if (!repo) return err("Pass repo, or all: true.");
+          const note = await muteBranchPr(repo, args.pr as number | undefined);
           const count = deps.subs.remove(repo, args.pr as number | undefined);
           record(repo, (args.pr as number | undefined) ?? null, count);
-          return { text: `Stopped watching ${count} pull request(s).` };
+          return { text: `Stopped watching ${count} pull request(s).${note}` };
         }
         case "list_subscriptions": {
           const all = deps.subs.list();
-          if (!all.length) return { text: "No subscriptions in this session." };
-          return {
-            text: all
-              .map((e) => `- ${e.repo} PR #${e.pr}: ${label(e.events)}${e.source === "auto" ? " (automatic: the current branch's PR)" : ""}`)
-              .join("\n"),
-          };
+          const mutes = deps.subs.mutes.list();
+          const watched = all.length
+            ? all.map((e) => `- ${e.repo} PR #${e.pr}: ${label(e.events)}${e.source === "auto" ? " (automatic: the current branch's PR)" : ""}`).join("\n")
+            : "No subscriptions in this session.";
+          if (!mutes.length) return { text: watched };
+          return { text: `${watched}\nMuted in this session only (${mutes.length} of ${MAX_MUTES}):\n${mutes.map((m) => `- ${muteText(m)}`).join("\n")}` };
+        }
+        case "mute": {
+          const m = await parseMute(deps, args);
+          if (!m.ok) return err(m.text);
+          const added = deps.subs.mutes.add(m.mute);
+          if (added === "full") {
+            return err(`This session already has ${MAX_MUTES} mutes, the most it keeps. Call unmute for one it no longer needs (list_subscriptions shows them), then mute again.`);
+          }
+          if (added === "exists") return { text: `Already muted: ${muteText(m.mute)}` };
+          (deps.eventLog ?? NO_EVENT_LOG).write("mute", { ...muteLog(m.mute), source: "tool" });
+          return { text: `Muted in this session only: ${muteText(m.mute)} Other sessions still hear it; unmute with the same fields undoes it.` };
+        }
+        case "unmute": {
+          if (args.all === true) {
+            const count = deps.subs.mutes.clear();
+            (deps.eventLog ?? NO_EVENT_LOG).write("unmute", { all: true, count });
+            return { text: `Removed ${count} mute(s).` };
+          }
+          const m = await parseMute(deps, args);
+          if (!m.ok) return err(m.text);
+          // An unsubscribed automatic watch's mute is the same pull request: unmute names it the same way.
+          const removed = deps.subs.mutes.remove(m.mute);
+          if (!removed) return err(`No such mute: ${muteText(m.mute)} list_subscriptions shows this session's mutes.`);
+          (deps.eventLog ?? NO_EVENT_LOG).write("unmute", muteLog(m.mute));
+          return { text: `Unmuted: ${muteText(m.mute)}` };
         }
         case "ci_status": {
           const t = await resolveTarget(deps, args);

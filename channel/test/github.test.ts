@@ -99,10 +99,21 @@ test("getPull maps GitHub's pull request to PullInfo", async () => {
     headRef: "feat",
     headRepo: "acme/widgets",
     mergeableState: "dirty",
+    mergeStatus: "dirty", // GitHub's mergeable_state as it answered: whether the PR may be ready to merge
     htmlUrl: "https://github.com/acme/widgets/pull/7",
     author: "octocat", // the fake PR's user.login: who opened it, read to screen a handed-over PR
     bodyHash: "e3b0c44298fc1c14", // no body: the SHA-256 of ""
   });
+});
+
+test("a mergeable PR that a rule still blocks is no conflict, and says blocked", async () => {
+  const gh = await fake();
+  gh.setPull("acme/widgets", 7, { mergeable: true, mergeable_state: "blocked" });
+  const r = await new GitHubClient(gh.base, ok()).getPull("acme/widgets", 7);
+  assert.equal(r.kind, "ok");
+  if (r.kind !== "ok") return;
+  assert.equal(r.value.mergeableState, "clean");
+  assert.equal(r.value.mergeStatus, "blocked");
 });
 
 test("a 304 returns the cached body", async () => {

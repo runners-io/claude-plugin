@@ -76,7 +76,7 @@ test("the bundle is a one-way channel with the subscribe tools, and pushes a fai
 
     s.send({ id: 2, method: "tools/list" });
     await s.until("tools/list", () => s.messages.some((m) => m.id === 2));
-    assert.deepEqual(s.messages.find((m) => m.id === 2).result.tools.map((t) => t.name).sort(), ["ci_status", "list_subscriptions", "subscribe", "unsubscribe"]);
+    assert.deepEqual(s.messages.find((m) => m.id === 2).result.tools.map((t) => t.name).sort(), ["ci_status", "list_subscriptions", "mute", "subscribe", "unmute", "unsubscribe"]);
 
     s.send({ id: 3, method: "tools/call", params: { name: "subscribe", arguments: {} } });
     await s.until("subscribe", () => s.messages.some((m) => m.id === 3));

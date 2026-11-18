@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { NAMES_LABEL } from "../src/format.ts";
-import { parseReviewRequests, requestChanges, requestMessage } from "../src/requests.ts";
+import { REQUEST_IDS_MAX, parseReviewRequests, requestChanges, requestMessage } from "../src/requests.ts";
 
 const T0 = Date.parse("2026-01-01T00:00:00Z");
 const iso = (min: number) => new Date(T0 + min * 60_000).toISOString();
@@ -68,6 +68,28 @@ test("the first reading is a baseline; a new request is sent once; one made befo
   const again = parseReviewRequests(answer([pr("acme/api", 9, [event("E6", 12, user("me")), event("E7", 15, user("me"))])]));
   assert.ok(again);
   assert.deepEqual(requestChanges(b.keep, again, T0 + 16 * 60_000).fresh.map((q) => q.id), ["E7"], "asked again: a new request");
+});
+
+// A session can run for days: the ids it keeps to know a request already seen must not grow with every request ever
+// made. A request that left the search long ago is forgotten, and is still never sent twice when it comes back.
+test("the ids kept stay under a bound over a long run, and a forgotten request that comes back is not sent again", () => {
+  let keep = requestChanges(null, parseReviewRequests(answer([]))!, T0).keep;
+  let sent = 0;
+  for (let i = 1; i <= 3 * REQUEST_IDS_MAX; i++) {
+    // One new request a minute; the search shows the newest 30.
+    const nodes = [];
+    for (let j = i; j > Math.max(0, i - 30); j--) nodes.push(pr("acme/widgets", 1000 + j, [event(`R${j}`, j, user("me"))]));
+    const r = requestChanges(keep, parseReviewRequests(answer(nodes))!, T0 + i * 60_000 + 1);
+    sent += r.fresh.length;
+    keep = r.keep;
+    assert.ok(keep.ids.size <= REQUEST_IDS_MAX, `${keep.ids.size} ids kept after ${i} readings`);
+  }
+  assert.equal(sent, 3 * REQUEST_IDS_MAX, "each request was sent once");
+  // The control: the first request is long forgotten.
+  assert.equal([...keep.ids.keys()].includes("R1"), false);
+  // R1's pull request rises into the first page again (some other update): its request is old news.
+  const back = parseReviewRequests(answer([pr("acme/widgets", 1001, [event("R1", 1, user("me"))])]))!;
+  assert.deepEqual(requestChanges(keep, back, T0 + (3 * REQUEST_IDS_MAX + 1) * 60_000).fresh, []);
 });
 
 test("the message names the repository, the number, who asked and a link, and how to read it; never a title", () => {

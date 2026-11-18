@@ -130,7 +130,7 @@ if (existsSync(bundlePath)) {
   // The permission relay would let a CI event approve a tool call. The string must not appear at all.
   check(!bundle.includes("claude/channel/permission"), "the bundle mentions claude/channel/permission");
   check(!/\bimport\s+[^;]*from\s+["'](?!node:)[^"']+["']/.test(bundle), "the bundle imports a package: it must be self-contained");
-  for (const tool of ["subscribe", "unsubscribe", "list_subscriptions", "ci_status"]) check(bundle.includes(`"${tool}"`), `the bundle does not offer the ${tool} tool`);
+  for (const tool of ["subscribe", "unsubscribe", "list_subscriptions", "ci_status", "mute", "unmute"]) check(bundle.includes(`"${tool}"`), `the bundle does not offer the ${tool} tool`);
   check(!bundle.includes('"reply"'), "the bundle mentions a reply tool: the channel is one way");
   // The channel reads GitHub with the user's own login, and calls no runners.io API.
   check(bundle.includes("api.github.com") && !bundle.includes("authorization_code") && !/runners\.io\/api\//.test(bundle), "the bundle does not read GitHub directly, or calls a runners.io API");
