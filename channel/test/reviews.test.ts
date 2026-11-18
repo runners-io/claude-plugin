@@ -139,7 +139,9 @@ test("the messages carry logins, kinds, file:line and links, never a review's or
   const changes = messages[0];
   assert.equal(changes.meta.reviewer, "evescript");
   assert.equal(changes.meta.author_type, "outside");
-  assert.match(changes.content, /gh pr view 7 --repo acme\/widgets --comments/);
+  // An outsider's request for changes is reported, never read on Claude's own initiative (a member's may be: format.test.ts).
+  assert.match(changes.content, /Tell the user/);
+  assert.doesNotMatch(changes.content, /gh pr view/);
   const t = messages[1];
   assert.equal(t.meta.author_type, "bot");
   assert.equal(t.meta.path, "src/a.ts");

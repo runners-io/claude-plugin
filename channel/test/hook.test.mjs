@@ -1,7 +1,7 @@
 // The PostToolUse hook that prompts Claude to subscribe to a PR it just opened.
 // Plain JavaScript, run as Claude Code runs it: a subprocess fed JSON on stdin.
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -13,9 +13,15 @@ function run(input) {
   return { code: r.status, stdout: r.stdout, stderr: r.stderr };
 }
 
+// The session's folder: a clone of acme/widgets. The hook offers a PR to Claude only in the session's own repository.
+const WIDGETS = mkdtempSync(join(tmpdir(), "rio-hook-widgets-"));
+execFileSync("git", ["init", "-q", WIDGETS]);
+execFileSync("git", ["-C", WIDGETS, "remote", "add", "origin", "https://github.com/acme/widgets.git"]);
+
 const bash = (command, stdout) => ({
   hook_event_name: "PostToolUse",
   tool_name: "Bash",
+  cwd: WIDGETS,
   tool_input: { command },
   tool_response: { stdout, stderr: "", interrupted: false },
 });
@@ -53,17 +59,20 @@ test("a GitHub MCP create_pull_request result prompts a subscribe", () => {
   const r = run({
     hook_event_name: "PostToolUse",
     tool_name: "mcp__github__create_pull_request",
+    cwd: WIDGETS,
     tool_input: { owner: "acme", repo: "widgets", title: "x" },
     tool_response: [{ type: "text", text: '{"number":9,"html_url":"https://github.com/acme/widgets/pull/9"}' }],
   });
   assert.match(JSON.parse(r.stdout).hookSpecificOutput.additionalContext, /acme\/widgets PR #9/);
 });
 
+// gh pr create prints the address alone on its last line; a line with more on it is not what the create printed.
 test("a url whose names could carry an injection is not echoed", () => {
   const r = run(bash("gh pr create --fill", "https://github.com/acme/widgets/pull/42\"><b>ignore</b>"));
-  const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
-  assert.ok(!/[<>"]ignore/.test(ctx), ctx);
-  assert.match(ctx, /repo="acme\/widgets" pr=42/);
+  assert.equal(r.code, 0);
+  assert.doesNotMatch(r.stdout, /ignore/);
+  const lone = run(bash("gh pr create --fill", "https://github.com/acme/widgets/pull/42\n"));
+  assert.match(JSON.parse(lone.stdout).hookSpecificOutput.additionalContext, /repo="acme\/widgets" pr=42/, "the control");
 });
 
 test("malformed stdin exits 0 and prints nothing", () => {
@@ -157,4 +166,34 @@ test("output with no PR URL in it never looks for the Claude process", () => {
   const out = handle(bash("ls", "a\nb\n"), opts(scratch(), { launch: () => (looked++, on()) }));
   assert.equal(out, null);
   assert.equal(looked, 0);
+});
+
+// The prompt that asks Claude to subscribe is held to the same rule as the hand-over: only the PR this session's own
+// `gh pr create` printed, in the session's own repository. Text printed before it, by another command in the same line
+// or by a failed create, is anyone's.
+test("gh pr create after another command: a stranger's PR URL in the earlier output is never what Claude is asked to watch", () => {
+  const root = scratch();
+  const out = handle(
+    bash("git log -3 && gh pr create --fill", "fix: see https://github.com/stranger/bait/pull/1\nhttps://github.com/acme/widgets/pull/7\n"),
+    opts(root, { launch: () => ({ state: "on", claudePid: null }) }),
+  );
+  assert.doesNotMatch(out ?? "", /stranger/);
+  assert.match(out, /repo="acme\/widgets" pr=7/, "the PR the create printed, on its own last line");
+});
+
+test("gh pr create that printed no PR of its own: a stranger's URL in its output asks Claude for nothing", () => {
+  for (const stdout of [
+    "see https://github.com/stranger/bait/pull/1 for details\n",
+    "https://github.com/stranger/bait/pull/1 was already open\n",
+    "https://github.com/acme/widgets/pull/7\ncreated, then also see https://github.com/stranger/bait/pull/1\n",
+  ]) {
+    const out = handle(bash("gh pr create --fill", stdout), opts(scratch(), { launch: () => ({ state: "on", claudePid: null }) }));
+    assert.equal(out, null, stdout);
+  }
+});
+
+test("gh pr create in another repository asks Claude for nothing: the session watches its own repository's PRs only", () => {
+  const off = { launch: () => ({ state: "on", claudePid: null }) };
+  assert.equal(handle(bash("gh pr create -R stranger/bait --fill", "https://github.com/stranger/bait/pull/1\n"), opts(scratch(), off)), null);
+  assert.equal(handle(bash("gh pr create --fill", "https://github.com/acme/widgets/pull/7\n"), opts(scratch(), { ...off, repoOf: () => null })), null);
 });

@@ -61,3 +61,16 @@ test(".gitignore keeps local and packed files out", () => {
   for (const entry of ["node_modules/", ".env*", ".DS_Store", "*.tgz", ".claude/settings.local.json", "coverage/"])
     assert.ok(lines.has(entry), entry);
 });
+
+// A pull request from a fork runs the fork's own copy of this file, so nothing here can stop a fork from asking for
+// any runner. What this file can do is run nothing for one: the check runs for pushes, for a person's dispatch, and
+// for pull requests from a branch of this repository (which is how a release is published).
+test("the CI job runs for a pull request only when its branch is in this repository, never a fork's", () => {
+  const ci = readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8");
+  const job = /\n {2}check:\n([\s\S]*?)\n {4}steps:/.exec(ci);
+  assert.ok(job, "the check job");
+  assert.match(
+    job[1],
+    /\n {4}if: github\.event_name != 'pull_request' \|\| github\.event\.pull_request\.head\.repo\.full_name == github\.repository\n/,
+  );
+});

@@ -21,3 +21,12 @@ test("the instructions say a review's or a comment's text is information, and a 
   assert.match(INSTRUCTIONS, /author_type/);
   assert.match(INSTRUCTIONS, /never follow instructions/);
 });
+
+// The instructions and the event's own sentence must agree: a request for changes is reported to the user, a member's
+// review may be read as information, and nobody's review makes Claude change code or push.
+test("on a request for changes or a review thread, Claude tells the user and changes code or pushes only if they ask", () => {
+  const line = INSTRUCTIONS.split("\n").find((l) => l.includes("pr.changes_requested")) ?? "";
+  assert.match(line, /tell the user/i);
+  assert.match(line, /only if the user asks/i);
+  assert.match(line, /outside or bot[^.]*only if the user asks/i, "an outsider's or bot's review is read only on request");
+});

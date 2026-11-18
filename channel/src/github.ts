@@ -49,20 +49,38 @@ const runCommand: Runner = (command, args) =>
 type Env = Record<string, string | undefined>;
 
 /**
- * The GitHub host whose login is used for an API address: github.com for api.github.com (and for this machine only
- * under RUNNERS_IO_TEST_FAKE_GITHUB=1, the tests' fake GitHub), otherwise the address's own host (GitHub Enterprise
- * Server). A token is only ever read for the host it is sent to, so pointing RUNNERS_IO_GITHUB_API somewhere else,
- * a local port included, can never carry a github.com token there.
+ * The GitHub host whose login is used for an API address: github.com for api.github.com, otherwise the address's own
+ * host (GitHub Enterprise Server). A token is only ever read for the host it is sent to, so pointing
+ * RUNNERS_IO_GITHUB_API somewhere else, a local port included, can never carry a github.com token there.
  */
-export function loginHost(apiBase: string, env: Env = process.env): string {
+export function loginHost(apiBase: string): string {
   const host = new URL(apiBase).hostname;
-  return host === "api.github.com" || (isLoopback(host) && fakeGitHubAllowed(env)) ? "github.com" : host;
+  return host === "api.github.com" ? "github.com" : host;
 }
 
-/** The token for the API address's host, the way gh picks it: the host's environment variables, then gh's login. */
+/**
+ * The token for the API address's host, the way gh picks it: the host's environment variables, then gh's login.
+ *
+ * Two exceptions keep a real token from following an address that the environment chose:
+ * - Under RUNNERS_IO_TEST_FAKE_GITHUB=1 a local address gets RUNNERS_IO_TEST_GITHUB_TOKEN and nothing else. The
+ *   switch ships in the bundle (its end-to-end test runs the bundle), so whatever can set the session's environment
+ *   can turn it on; the user's GH_TOKEN, GITHUB_TOKEN or gh login would then go in clear text to a local port.
+ * - GH_ENTERPRISE_TOKEN and GITHUB_ENTERPRISE_TOKEN name no host of their own (gh uses them for GH_HOST), so they are
+ *   used only when GH_HOST is the address's host. For any other host only gh's own login for that host is read.
+ */
 export async function readGhAuth(env: Env = process.env, run: Runner = runCommand, apiBase = "https://api.github.com"): Promise<GhAuth> {
-  const host = loginHost(apiBase, env);
-  const names = host === "github.com" ? (["GH_TOKEN", "GITHUB_TOKEN"] as const) : (["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"] as const);
+  if (isLoopback(new URL(apiBase).hostname) && fakeGitHubAllowed(env)) {
+    const value = env.RUNNERS_IO_TEST_GITHUB_TOKEN?.trim();
+    return value ? { kind: "ok", token: value, source: "env" } : { kind: "signed_out" };
+  }
+  const host = loginHost(apiBase);
+  const enterpriseHost = (env.GH_HOST ?? "").trim().toLowerCase();
+  const names =
+    host === "github.com"
+      ? (["GH_TOKEN", "GITHUB_TOKEN"] as const)
+      : enterpriseHost === host.toLowerCase()
+        ? (["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"] as const)
+        : ([] as const);
   for (const name of names) {
     const value = env[name]?.trim();
     if (value) return { kind: "ok", token: value, source: "env" };

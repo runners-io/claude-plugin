@@ -222,6 +222,9 @@ process.exit(findings ? 1 : 0);
 // ---------------------------------------------------------------------------
 
 function token() {
+  // This machine is a GitHub only for the tests (the check above), and gets only the tests' own token: the switch is
+  // an environment variable, so the user's real login must never follow it to a local port.
+  if (githubApi !== "https://api.github.com") return process.env.RUNNERS_IO_TEST_GITHUB_TOKEN?.trim() ?? "";
   if (process.env.GH_TOKEN?.trim()) return process.env.GH_TOKEN.trim();
   if (process.env.GITHUB_TOKEN?.trim()) return process.env.GITHUB_TOKEN.trim();
   try {

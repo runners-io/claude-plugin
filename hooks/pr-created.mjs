@@ -30,6 +30,8 @@ const PR_URL_ALL = /https:\/\/github\.com\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/
 /** At most this many PRs are handed over from one tool call's output (a long log can name dozens). */
 const MAX_REQUESTS = 5;
 const PR_URL = /https:\/\/github\.com\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100}?)\/pull\/(\d{1,9})(?![\d])/;
+/** A line that is a PR's address and nothing else, as `gh pr create` prints it. */
+const PR_URL_LINE = /^https:\/\/github\.com\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100}?)\/pull\/(\d{1,9})\/?$/;
 const GH_PR_CREATE = /(?:^|[\s;&|(])gh\s+pr\s+create\b/;
 const CREATE_TOOL = /^mcp__.+__create_pull_request$/;
 
@@ -54,25 +56,16 @@ function text(value) {
   }
 }
 
-export function contextFor(input) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
-  const tool = typeof input.tool_name === "string" ? input.tool_name : "";
-  let haystack = "";
-  if (tool === "Bash") {
-    const command = typeof input.tool_input?.command === "string" ? input.tool_input.command : "";
-    if (!GH_PR_CREATE.test(command)) return null;
-    const res = input.tool_response;
-    haystack = typeof res?.stdout === "string" ? res.stdout : text(res);
-  } else if (CREATE_TOOL.test(tool)) {
-    haystack = text(input.tool_response);
-  } else {
-    return null;
-  }
-  const m = PR_URL.exec(haystack);
-  if (!m) return null;
-  const repo = `${m[1]}/${m[2].replace(/\.git$/, "")}`;
-  const pr = Number(m[3]);
-  if (!Number.isSafeInteger(pr) || pr < 1) return null;
+/**
+ * The PR this session just opened, as text asking Claude to subscribe, or null. `own` is the session folder's
+ * repository. Only the create's own result counts: for Bash, the last line of output when that line is nothing but the
+ * PR's address (what `gh pr create` prints), and only a PR in `own`. Anything else in the output -- a log, a README, a
+ * failed create's text -- is whoever wrote it, so a stranger's PR address there is never offered to Claude.
+ */
+export function contextFor(input, own) {
+  const created = createdPr(input, own);
+  if (!created) return null;
+  const { repo, pr } = created;
   return (
     `You opened ${repo} PR #${pr}. Call the runners-io channel's subscribe tool now ` +
     `(mcp__plugin_runners-io_runners-io__subscribe) with repo="${repo}" pr=${pr}: without it this session is not told ` +
@@ -80,6 +73,32 @@ export function contextFor(input) {
     'Results arrive as <channel source="runners-io"> events if this session was started with the runners-io channel; ' +
     "if none arrive, call ci_status to check."
   );
+}
+
+/** The PR a create in this tool call made, in the session's own repository `own`, or null (see contextFor). */
+export function createdPr(input, own) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  if (typeof own !== "string" || !own) return null;
+  const tool = typeof input.tool_name === "string" ? input.tool_name : "";
+  let m = null;
+  if (tool === "Bash") {
+    const command = typeof input.tool_input?.command === "string" ? input.tool_input.command : "";
+    if (!GH_PR_CREATE.test(command)) return null;
+    const res = input.tool_response;
+    const stdout = typeof res?.stdout === "string" ? res.stdout : "";
+    const last = stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).at(-1) ?? "";
+    m = PR_URL_LINE.exec(last);
+  } else if (CREATE_TOOL.test(tool)) {
+    m = PR_URL.exec(text(input.tool_response));
+  } else {
+    return null;
+  }
+  if (!m) return null;
+  const repo = `${m[1]}/${m[2].replace(/\.git$/, "")}`;
+  const pr = Number(m[3]);
+  if (!Number.isSafeInteger(pr) || pr < 1) return null;
+  if (repo.toLowerCase() !== own.toLowerCase()) return null;
+  return { repo, pr };
 }
 
 /** The PRs named in a tool call's output: any Bash output (a script may have opened one), or a create tool's result. */
@@ -179,11 +198,11 @@ function repoOfFolder(cwd) {
  * `repoOf` gives the session folder's repository; `env` carries the plugin's settings.
  */
 export function handle(input, { launch, root, now, env = process.env, repoOf = repoOfFolder }) {
-  const prompt = contextFor(input);
   const prs = prsIn(input);
-  if (!prs.length) return prompt;
-  if (String(env.RUNNERS_IO_AUTO_SUBSCRIBE ?? "").trim().toLowerCase() === "off") return prompt;
+  if (!prs.length) return null;
   const own = repoOf(input?.cwd);
+  const prompt = contextFor(input, own);
+  if (String(env.RUNNERS_IO_AUTO_SUBSCRIBE ?? "").trim().toLowerCase() === "off") return prompt;
   const mine = own ? prs.filter((p) => p.repo.toLowerCase() === own.toLowerCase()) : [];
   if (!mine.length) return prompt;
   const l = launch();
@@ -191,9 +210,9 @@ export function handle(input, { launch, root, now, env = process.env, repoOf = r
   const handed = handOver(mine, { claudePid: l.claudePid, root, now }) > 0;
   if (!prompt) return null;
   if (!handed) return prompt;
-  // contextFor names the first PR URL in the output; it is handed over only if it is one of the session's own.
-  const { repo, pr } = prs[0];
-  if (!mine.some((p) => p.repo === repo && p.pr === pr)) return prompt;
+  // The PR this session's create made (contextFor's); the "now watching" text is given only if it was handed over.
+  const { repo, pr } = createdPr(input, own);
+  if (!mine.some((p) => p.repo.toLowerCase() === repo.toLowerCase() && p.pr === pr)) return prompt;
   return (
     `runners-io is now watching ${repo} PR #${pr} for this session: no subscribe call is needed. ` +
     "Its CI results (workflows failing or waiting for approval, all checks finished) and merge conflicts arrive here as " +

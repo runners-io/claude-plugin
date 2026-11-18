@@ -40,11 +40,40 @@ test("a local API address never gets the github.com login, unless the tests' swi
   const never = async () => {
     throw new Error("gh must not run when the environment has a token");
   };
-  assert.deepEqual(await readGhAuth({ GH_TOKEN: "gho_fake", RUNNERS_IO_TEST_FAKE_GITHUB: "1" }, never, "http://127.0.0.1:9"), {
+  assert.deepEqual(await readGhAuth({ RUNNERS_IO_TEST_GITHUB_TOKEN: "gho_fake", RUNNERS_IO_TEST_FAKE_GITHUB: "1" }, never, "http://127.0.0.1:9"), {
     kind: "ok",
     token: "gho_fake",
     source: "env",
   });
+});
+
+// The switch ships in the bundle (its own end-to-end test runs the bundle against a fake GitHub), so whoever can set a
+// session's environment can turn it on. Under it, a token is read only from the tests' own variable: never the user's
+// GH_TOKEN, GITHUB_TOKEN or gh login, which would then travel in clear text to whatever listens on this machine.
+test("under the tests' switch a local API address gets only the tests' own token, never the user's real login", async () => {
+  const never = async () => {
+    throw new Error("gh must not be asked for a login to send to this machine");
+  };
+  const on = { RUNNERS_IO_TEST_FAKE_GITHUB: "1", GH_TOKEN: "gho_real", GITHUB_TOKEN: "gho_real2" };
+  assert.deepEqual(await readGhAuth(on, never, "http://127.0.0.1:9"), { kind: "signed_out" });
+  assert.deepEqual(await readGhAuth({ ...on, RUNNERS_IO_TEST_GITHUB_TOKEN: "t" }, never, "http://127.0.0.1:9"), { kind: "ok", token: "t", source: "env" });
+  // The tests' token is for the fake GitHub only: it is never sent to a real host.
+  const gh = async () => ({ code: 0, stdout: "gho_fromGh\n" });
+  assert.deepEqual(await readGhAuth({ RUNNERS_IO_TEST_GITHUB_TOKEN: "t" }, gh), { kind: "ok", token: "gho_fromGh", source: "gh" });
+});
+
+// GH_ENTERPRISE_TOKEN names no host of its own; gh uses it for GH_HOST. Read it for any other address and an
+// environment that points RUNNERS_IO_GITHUB_API elsewhere receives the user's Enterprise token.
+test("an Enterprise token from the environment goes only to the host GH_HOST names", async () => {
+  const gh = async (_c: string, args: readonly string[]) => ({ code: 0, stdout: `token-for-${args.at(-1)}\n` });
+  const env = { GH_ENTERPRISE_TOKEN: "ghe_own", GITHUB_ENTERPRISE_TOKEN: "ghe_own2" };
+  assert.deepEqual(await readGhAuth(env, gh, "https://attacker.example/api/v3"), { kind: "ok", token: "token-for-attacker.example", source: "gh" });
+  assert.deepEqual(await readGhAuth({ ...env, GH_HOST: "ghe.corp.example" }, gh, "https://attacker.example/api/v3"), {
+    kind: "ok",
+    token: "token-for-attacker.example",
+    source: "gh",
+  });
+  assert.deepEqual(await readGhAuth({ ...env, GH_HOST: "ghe.corp.example" }, gh, "https://ghe.corp.example/api/v3"), { kind: "ok", token: "ghe_own", source: "env" });
 });
 
 test("readGhAuth maps a missing gh to not_installed and a failing or empty one to signed_out", async () => {
@@ -219,13 +248,13 @@ test("a github.com token is only ever read for api.github.com (or loopback, for 
   const env = { GH_TOKEN: "gho_githubcom", GITHUB_TOKEN: "gho_githubcom2" };
   assert.deepEqual(await readGhAuth(env, gh, "https://api.github.com"), { kind: "ok", token: "gho_githubcom", source: "env" });
   // A loopback address is a test's fake GitHub only under the tests' switch; without it, it is just another host.
-  const tests = { ...env, RUNNERS_IO_TEST_FAKE_GITHUB: "1" };
-  assert.deepEqual(await readGhAuth(tests, gh, "http://127.0.0.1:4567"), { kind: "ok", token: "gho_githubcom", source: "env" });
+  const tests = { ...env, RUNNERS_IO_TEST_FAKE_GITHUB: "1", RUNNERS_IO_TEST_GITHUB_TOKEN: "gho_testsown" };
+  assert.deepEqual(await readGhAuth(tests, gh, "http://127.0.0.1:4567"), { kind: "ok", token: "gho_testsown", source: "env" });
   assert.deepEqual(await readGhAuth(env, gh, "http://127.0.0.1:4567"), { kind: "ok", token: "token-for-127.0.0.1", source: "gh" }, "no switch: the github.com token stays home");
   const ghe = await readGhAuth(env, gh, "https://ghe.example.com/api/v3");
   assert.deepEqual(ghe, { kind: "ok", token: "token-for-ghe.example.com", source: "gh" }, "GH_TOKEN is github.com's, never sent elsewhere");
   assert.deepEqual(asked.at(-1), ["auth", "token", "--hostname", "ghe.example.com"]);
-  const enterprise = await readGhAuth({ ...env, GH_ENTERPRISE_TOKEN: "ghe_own" }, gh, "https://ghe.example.com/api/v3");
+  const enterprise = await readGhAuth({ ...env, GH_ENTERPRISE_TOKEN: "ghe_own", GH_HOST: "ghe.example.com" }, gh, "https://ghe.example.com/api/v3");
   assert.deepEqual(enterprise, { kind: "ok", token: "ghe_own", source: "env" });
 });
 

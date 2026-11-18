@@ -49,3 +49,22 @@ test("choosing 'local development' at the warning is explained, not just instruc
   const sentence = readme.slice(at, readme.indexOf("\n\n", at));
   assert.match(sentence, /because|since|that is how|this means/i);
 });
+
+// The default install follows main, so every later push reaches the user, together with the development flag. The
+// install the README leads with is the one that installs exactly a release the user has read.
+test("Install leads with the pinned install: the first command names a release tag", () => {
+  const install = section("Install");
+  const first = /claude plugin marketplace add (\S+)/.exec(install);
+  assert.ok(first, "an install command");
+  assert.match(first[1], /^runners-io\/claude-plugin#v\d+\.\d+\.\d+$/, `the first install is ${first[1]}`);
+  assert.match(install, /follows? `main`/, "the unpinned install is still offered, and says what it follows");
+});
+
+// GH_ENTERPRISE_TOKEN names no host, and the tests' switch is an environment variable anyone setting the environment
+// can set. The README says what each does with a token.
+test("Security says an Enterprise token goes only to GH_HOST, and what the tests' switch does with a token", () => {
+  const security = section("Security");
+  assert.match(security, /GH_ENTERPRISE_TOKEN[^.]*only when `GH_HOST`/);
+  assert.match(security, /RUNNERS_IO_TEST_FAKE_GITHUB/);
+  assert.match(security, /RUNNERS_IO_TEST_GITHUB_TOKEN/);
+});
