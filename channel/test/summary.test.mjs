@@ -31,7 +31,7 @@ function writeLog(records) {
 
 function run(args, env = {}) {
   return new Promise((resolve) => {
-    execFile(process.execPath, [SCRIPT, ...args], { env: { ...process.env, GH_TOKEN: TOKEN, ...env } }, (error, stdout, stderr) => {
+    execFile(process.execPath, [SCRIPT, ...args], { env: { ...process.env, GH_TOKEN: TOKEN, RUNNERS_IO_TEST_FAKE_GITHUB: "1", ...env } }, (error, stdout, stderr) => {
       resolve({ code: error ? error.code : 0, stdout, stderr });
     });
   });
@@ -110,6 +110,94 @@ test("with --github, a failure or a close GitHub shows inside a watched window a
   assert.ok(!JSON.stringify(s).includes(TOKEN));
 });
 
+// A check once reported "MISS pr.closed" for a PR. The one session that watched it
+// was a harness killed by SIGTERM: no stop record, last record 21 s before the close. A session that wrote nothing
+// for longer than a heartbeat interval has ended; it watched until its last record, not until now, and is listed so
+// that a crash is seen. One still writing heartbeats is still watching.
+test("--github-api sends the github.com login nowhere but api.github.com, or this machine under the tests' switch", async () => {
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  const dir = mkdtempSync(join(tmpdir(), "rio-summary-api-"));
+  for (const api of [gh.base, "https://example.com", "http://api.github.com"]) {
+    const r = await run(["--dir", dir, "--since", "24h", "--json", "--github", "--github-api", api], { RUNNERS_IO_TEST_FAKE_GITHUB: "" });
+    assert.equal(r.code, 2, `${api}: ${r.stderr}`);
+    assert.match(r.stderr, /--github-api/);
+  }
+  const off = await run(["--dir", dir, "--since", "24h", "--json", "--github", "--github-api", "https://example.com"]);
+  assert.equal(off.code, 2, "the switch admits this machine only, never another host");
+  assert.equal(gh.requests.length, 0, "the fake GitHub on this machine was never asked");
+});
+
+test("with --github, a session that ended without a stop record watched until its last record, and is listed", async () => {
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  const A = "a".repeat(40);
+  gh.setPull("acme/widgets", 4, { head: { sha: A, ref: "x" }, state: "closed", closed_at: ago(39.6) });
+  gh.setCommits("acme/widgets", 4, [A]);
+  gh.setRuns("acme/widgets", A, []);
+  gh.setPull("acme/widgets", 5, { head: { sha: A, ref: "y" }, state: "closed", closed_at: ago(3) });
+  gh.setCommits("acme/widgets", 5, [A]);
+  const killed = { session: "killed", project: "/w/a" };
+  const killedLast = ago(40);
+  const alive = { session: "alive", project: "/w/b" };
+  const dir = writeLog([
+    { ...killed, t: ago(45), type: "start" },
+    { ...killed, t: ago(44.9), type: "subscribe", repo: "acme/widgets", pr: 4, source: "tool" },
+    { ...killed, t: killedLast, type: "event", kind: "ci.run_all_done", repo: "acme/widgets", pr: 4, outcome: "sent", latency_ms: 1000 },
+    { ...alive, t: ago(20), type: "start" },
+    { ...alive, t: ago(19.9), type: "subscribe", repo: "acme/widgets", pr: 5, source: "tool" },
+    { ...alive, t: ago(1), type: "heartbeat", subscriptions: 1, rate_remaining: 4000, requests: { ok: 1, not_modified: 1, other: 0 } },
+  ]);
+  const r = await run(["--dir", dir, "--since", "24h", "--json", "--github", "--github-api", gh.base]);
+  const s = JSON.parse(r.stdout);
+  assert.deepEqual(
+    s.github.misses.map((m) => `${m.kind}:${m.pr}`),
+    ["pr.closed:5"],
+    "the killed session's PR is not a miss; the live session's still is",
+  );
+  assert.deepEqual(s.ended_without_stop.map((e) => e.session), ["killed"]);
+  assert.equal(s.ended_without_stop[0].last, killedLast);
+  const text = await run(["--dir", dir, "--since", "24h", "--github", "--github-api", gh.base]);
+  assert.match(text.stdout, /ended without a stop record: 1\n {2}killed/);
+});
+
+// `--since 1h --github` once reported "0 PR(s), 0 miss(es)" while a session watched a pull request throughout: its
+// subscribe record was before the window, and only a subscribe inside the window opened one. A heartbeat's `watching` list says the PR was watched; a subscription older than the window
+// counts from the window's start.
+test("with --github, a PR subscribed before the window is still checked: a heartbeat's watching list opens it", async () => {
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  const A = "a".repeat(40);
+  gh.setPull("acme/widgets", 7, { head: { sha: A, ref: "feat" }, state: "open" });
+  gh.setCommits("acme/widgets", 7, [A]);
+  gh.setRuns("acme/widgets", A, [{ id: 51, name: "CI", status: "completed", conclusion: "failure", created_at: ago(70), updated_at: ago(60) }]);
+  const watching = { watching: ["acme/widgets#7"] };
+  const dir = writeLog([
+    { ...base, t: ago(300), type: "start" },
+    { ...base, t: ago(299), type: "subscribe", repo: "acme/widgets", pr: 7, source: "auto" },
+    beat(110, watching),
+    beat(80, watching),
+    beat(50, watching),
+    beat(20, watching),
+    beat(1, watching),
+  ]);
+  const r = await run(["--dir", dir, "--since", "2h", "--json", "--github", "--github-api", gh.base]);
+  const s = JSON.parse(r.stdout);
+  assert.equal(s.github.checked_prs, 1, "the PR the heartbeats name was watched throughout the window");
+  assert.deepEqual(s.github.misses.map((m) => `${m.kind}:${m.run_id}`), ["ci.workflow_failed:51"]);
+  assert.equal(r.code, 1, r.stderr);
+});
+
+test("with --github, heartbeats that say a PR is watched while the check covers none is 'could not evaluate' (exit 2)", async () => {
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  // An older build's heartbeat carries the count but not the names: the check cannot know what was watched.
+  const dir = writeLog([beat(90), beat(60), beat(30), beat(1)]);
+  const r = await run(["--dir", dir, "--since", "2h", "--json", "--github", "--github-api", gh.base]);
+  assert.equal(r.code, 2, `${r.stdout}\n${r.stderr}`);
+  assert.match(r.stderr, /watched|subscri/i);
+});
+
 test("with --github, the new kinds are checked too: labels and draft from issue events, flaky re-runs and the base branch", async () => {
   const gh = await startFakeGitHub({ token: TOKEN });
   fakes.push(gh);
@@ -151,6 +239,42 @@ test("with --github, the new kinds are checked too: labels and draft from issue 
   );
   assert.match(s.github.not_checked, /pr.head_moved/);
   assert.match(s.github.not_checked, /pr.body_edited/);
+});
+
+test("with --github, reviews and new review threads are checked against GitHub's REST history", async () => {
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  const A = "a".repeat(40);
+  gh.setPull("acme/widgets", 7, { head: { sha: A, ref: "feat" }, base: { ref: "main" } });
+  gh.setCommits("acme/widgets", 7, [A]);
+  gh.setReviews("acme/widgets", 7, [
+    { id: 1, state: "APPROVED", submitted_at: ago(50) }, // no session got it: a miss
+    { id: 2, state: "CHANGES_REQUESTED", submitted_at: ago(40) }, // sent
+    { id: 3, state: "COMMENTED", submitted_at: ago(30) }, // not an event
+    { id: 4, state: "APPROVED", submitted_at: ago(200) }, // before the window
+  ]);
+  gh.setReviewComments("acme/widgets", 7, [
+    { id: 10, created_at: ago(55) }, // a new thread no session got: a miss
+    { id: 11, created_at: ago(54), in_reply_to_id: 10 }, // a reply, not a thread
+    { id: 12, created_at: ago(35) }, // a new thread, sent
+  ]);
+  const dir = writeLog([
+    { ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 7, source: "auto" },
+    beat(105),
+    // each matched by the id in its link: the sent thread (12) does not account for the unsent one (10)
+    { ...base, t: ago(39), type: "event", kind: "pr.changes_requested", repo: "acme/widgets", pr: 7, outcome: "sent", latency_ms: 30_000, review_url: "https://github.com/acme/widgets/pull/7#pullrequestreview-2" },
+    { ...base, t: ago(34), type: "event", kind: "pr.review_thread_added", repo: "acme/widgets", pr: 7, outcome: "sent", latency_ms: 30_000, review_url: "https://github.com/acme/widgets/pull/7#discussion_r12" },
+    beat(75),
+    beat(45),
+    beat(15),
+    beat(1),
+  ]);
+  const r = await run(["--dir", dir, "--since", "24h", "--json", "--github", "--github-api", gh.base]);
+  assert.equal(r.code, 1, r.stderr);
+  const s = JSON.parse(r.stdout);
+  assert.deepEqual(s.github.misses.map((m) => m.kind).sort(), ["pr.approved", "pr.review_thread_added"]);
+  assert.match(s.github.not_checked, /pr.review_thread_resolved/);
+  assert.match(s.github.not_checked, /pr.ready_to_merge/);
 });
 
 test("a session started without the channel flag is counted as channel_inactive, and is not a finding", async () => {
@@ -196,4 +320,33 @@ test("requests per hour, per session: what each session asked GitHub between its
   assert.equal(per.quiet.per_hour, 9);
   const text = (await run(["--dir", dir, "--since", "24h"])).stdout;
   assert.match(text, /s1: 28\.1 requests\/hour \(56 in 1\.99 h; 11 counted against the rate limit\)/);
+});
+
+test("what the summary prints from a record carries no control characters: a record's text could drive the terminal", async () => {
+  // A record's session, project, kind and reasons are text a log line can hold; printed raw, an ESC or a C1
+  // byte could clear the screen, rewrite earlier lines or set the window title.
+  const session = "s\u001b]0;owned\u0007\u001b[2Jx";
+  const project = "/w/\u009b31mrepo\r‮";
+  const evil = { session, project };
+  const dir = writeLog([
+    { ...evil, t: ago(30), type: "start", version: "0.2.0" },
+    { ...evil, t: ago(29), type: "event", kind: "ci.x\u001b[1A\u0085", repo: "acme/widgets", pr: 7, outcome: "sent", latency_ms: 1_000 },
+    { ...evil, t: ago(28), type: "api_error", repo: "acme/widgets", pr: 7, result: "retry", reason: "boom\u001b[31m\u009d" },
+    { ...evil, t: ago(27), type: "problem", kind: "p\u0007" },
+    { ...evil, t: ago(26), type: "heartbeat", rate_remaining: 4000, requests: { ok: 1, not_modified: 0, other: 0 } },
+    { ...evil, t: ago(25), type: "stop", reason: "closed" },
+  ]);
+  const text = await run(["--dir", dir, "--since", "24h"]);
+  assert.equal(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/.test(text.stdout), false, JSON.stringify(text.stdout));
+  // The control: the records were read and printed, so the check above looked at their text.
+  assert.match(text.stdout, /\/w\//);
+  assert.match(text.stdout, /ci\.x/);
+  assert.match(text.stdout, /boom/);
+
+  const json = await run(["--dir", dir, "--since", "24h", "--json"]);
+  assert.equal(/[\u0000-\u001f\u007f-\u009f‪-‮⁦-⁩]/.test(json.stdout.replaceAll("\n", "")), false, JSON.stringify(json.stdout));
+  // Escaped, not lost: the JSON still reads back as exactly what the record held.
+  const s = JSON.parse(json.stdout);
+  assert.equal(s.sessions[0].session, session);
+  assert.equal(s.sessions[0].project, project);
 });

@@ -24,27 +24,45 @@ export interface Config {
    * less often. 200 by default; raise it when the same gh login also drives other tools.
    */
   readonly rateFloor: number;
+  /**
+   * RUNNERS_IO_REVIEW_REQUESTS=on: hear review.requested when somebody asks this GitHub login (or one of its
+   * teams) to review a pull request (requests.ts). Off by default: every session with it on hears every request.
+   */
+  readonly reviewRequests?: boolean;
 }
 
 type Env = Record<string, string | undefined>;
 
-const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]"]);
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+
+/** This machine's own addresses: whatever process listens there could read a token sent to it. */
+export function isLoopback(hostname: string): boolean {
+  return LOOPBACK.has(hostname);
+}
+
+/** The plugin's own tests point it at a fake GitHub on this machine; nothing else may. */
+export function fakeGitHubAllowed(env: Env): boolean {
+  return env.RUNNERS_IO_TEST_FAKE_GITHUB === "1";
+}
 
 /**
- * A token is only ever sent over https, or over plain http to this machine
- * (the tests' fake GitHub). Anything else is refused at start, not at the
- * first request, so a typo cannot leak a token in clear text.
+ * A token is only ever sent over https, and never to this machine, where any local process could be listening,
+ * unless RUNNERS_IO_TEST_FAKE_GITHUB=1 (the tests' fake GitHub, which may use plain http). Anything else is refused at
+ * start, not at the first request, so a typo cannot leak a token in clear text.
  */
-export function checkTokenUrl(raw: string, what: string): string {
+export function checkTokenUrl(raw: string, what: string, env: Env = process.env): string {
   let url: URL;
   try {
     url = new URL(raw);
   } catch {
     throw new Error(`${what} is not a URL: ${raw}`);
   }
+  if (isLoopback(url.hostname)) {
+    if (fakeGitHubAllowed(env) && (url.protocol === "https:" || url.protocol === "http:")) return raw.replace(/\/+$/, "");
+    throw new Error(`${what} may name this machine only in the plugin's own tests (RUNNERS_IO_TEST_FAKE_GITHUB=1): ${raw}`);
+  }
   if (url.protocol === "https:") return raw.replace(/\/+$/, "");
-  if (url.protocol === "http:" && LOOPBACK.has(url.hostname)) return raw.replace(/\/+$/, "");
-  throw new Error(`${what} must be https (or http on 127.0.0.1): ${raw}`);
+  throw new Error(`${what} must be https: ${raw}`);
 }
 
 function parseAuto(raw: string | undefined): AutoSubscribe {
@@ -56,12 +74,14 @@ function parseAuto(raw: string | undefined): AutoSubscribe {
 export function loadConfig(env: Env = process.env): Config {
   const poll = Number(env.RUNNERS_IO_POLL_SECONDS ?? "20");
   return {
-    githubApi: checkTokenUrl(env.RUNNERS_IO_GITHUB_API || "https://api.github.com", "RUNNERS_IO_GITHUB_API"),
+    githubApi: checkTokenUrl(env.RUNNERS_IO_GITHUB_API || "https://api.github.com", "RUNNERS_IO_GITHUB_API", env),
     projectDir: env.CLAUDE_PROJECT_DIR || process.cwd(),
     autoSubscribe: parseAuto(env.RUNNERS_IO_AUTO_SUBSCRIBE),
     pollSeconds: Number.isFinite(poll) ? Math.max(5, Math.min(300, Math.floor(poll))) : 20,
     eventLogDir: isAbsolute(env.RUNNERS_IO_EVENT_LOG_DIR ?? "") ? (env.RUNNERS_IO_EVENT_LOG_DIR as string) : null,
     rateFloor: parseFloor(env.RUNNERS_IO_RATE_FLOOR),
+    // An unset plugin option arrives as the literal `${user_config.review_requests}`: anything but "on" is off.
+    reviewRequests: (env.RUNNERS_IO_REVIEW_REQUESTS ?? "").trim().toLowerCase() === "on",
   };
 }
 

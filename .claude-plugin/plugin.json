@@ -1,8 +1,8 @@
 {
   "name": "runners-io",
   "displayName": "runners.io",
-  "version": "0.2.0",
-  "description": "CI results and merge conflicts for your pull requests, read from GitHub with your own GitHub login and pushed into your Claude Code session as they happen (a Channels research preview). Claude chooses which pull requests to watch. Plus the runners.io MCP server for runners.io customers.",
+  "version": "0.2.1",
+  "description": "CI results and merge conflicts for your pull requests, read from GitHub with your own GitHub login and pushed into your Claude Code session as they happen (a Channels research preview). It watches the pull request for your branch, and one just opened by you in the same repository; Claude subscribes to any other. Plus the runners.io MCP server for runners.io customers.",
   "author": {
     "name": "runners.io",
     "url": "https://www.runners.io"
@@ -19,7 +19,7 @@
     "mcp"
   ],
   "icon": "./assets/icon.png",
-  "documentationUrl": "https://www.runners.io/docs/integrations/claude-code",
+  "documentationUrl": "https://www.runners.io/claude-code",
   "supportUrl": "https://www.runners.io/docs/help/support",
   "privacyPolicyUrl": "https://www.runners.io/privacy",
   "termsOfServiceUrl": "https://www.runners.io/terms",
@@ -34,7 +34,8 @@
         "${CLAUDE_PLUGIN_ROOT}/channel/dist/runners-io-channel.mjs"
       ],
       "env": {
-        "RUNNERS_IO_AUTO_SUBSCRIBE": "${user_config.auto_subscribe}"
+        "RUNNERS_IO_AUTO_SUBSCRIBE": "${user_config.auto_subscribe}",
+        "RUNNERS_IO_REVIEW_REQUESTS": "${user_config.review_requests}"
       }
     }
   },
@@ -46,12 +47,22 @@
         "auto_subscribe": {
           "type": "string",
           "title": "Watch the current branch's pull request automatically",
-          "description": "pr: the channel watches the pull request for the branch your session's folder is on, without being asked (default). off: only the pull requests Claude subscribes to.",
+          "description": "pr: the channel watches the pull request for the branch your session's folder is on, without being asked (default). off: only the pull requests Claude subscribes to; the hook then watches nothing on its own either.",
           "options": [
             "pr",
             "off"
           ],
           "default": "pr"
+        },
+        "review_requests": {
+          "type": "string",
+          "title": "Tell me when somebody asks me for a review",
+          "description": "on: every few minutes the channel asks GitHub which open pull requests ask your GitHub login (or one of its teams) for a review, and tells the session about each new request. off: it does not ask (default). Every session with this on hears every request.",
+          "options": [
+            "off",
+            "on"
+          ],
+          "default": "off"
         }
       }
     }

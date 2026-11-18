@@ -29,6 +29,24 @@ test("readGhAuth prefers GH_TOKEN, then GITHUB_TOKEN, then gh auth token", async
   assert.deepEqual(await readGhAuth({}, gh), { kind: "ok", token: "gho_fromGh", source: "gh" });
 });
 
+test("a local API address never gets the github.com login, unless the tests' switch is on", async () => {
+  const asked: string[][] = [];
+  const gh = async (_cmd: string, args: readonly string[]) => {
+    asked.push([...args]);
+    return { code: 1, stdout: "" };
+  };
+  assert.deepEqual(await readGhAuth({ GH_TOKEN: "gho_real" }, gh, "http://127.0.0.1:9"), { kind: "signed_out" });
+  assert.deepEqual(asked, [["auth", "token", "--hostname", "127.0.0.1"]], "asked for the local host's own login, not github.com's");
+  const never = async () => {
+    throw new Error("gh must not run when the environment has a token");
+  };
+  assert.deepEqual(await readGhAuth({ GH_TOKEN: "gho_fake", RUNNERS_IO_TEST_FAKE_GITHUB: "1" }, never, "http://127.0.0.1:9"), {
+    kind: "ok",
+    token: "gho_fake",
+    source: "env",
+  });
+});
+
 test("readGhAuth maps a missing gh to not_installed and a failing or empty one to signed_out", async () => {
   const missing = async () => ({ code: null, stdout: "", errorCode: "ENOENT" });
   assert.deepEqual(await readGhAuth({}, missing), { kind: "not_installed" });
@@ -51,6 +69,7 @@ test("getPull maps GitHub's pull request to PullInfo", async () => {
     headRef: "feat",
     mergeableState: "dirty",
     htmlUrl: "https://github.com/acme/widgets/pull/7",
+    author: "octocat", // the fake PR's user.login: who opened it, read to screen a handed-over PR
     bodyHash: "e3b0c44298fc1c14", // no body: the SHA-256 of ""
   });
 });
@@ -199,10 +218,69 @@ test("a github.com token is only ever read for api.github.com (or loopback, for 
   };
   const env = { GH_TOKEN: "gho_githubcom", GITHUB_TOKEN: "gho_githubcom2" };
   assert.deepEqual(await readGhAuth(env, gh, "https://api.github.com"), { kind: "ok", token: "gho_githubcom", source: "env" });
-  assert.deepEqual(await readGhAuth(env, gh, "http://127.0.0.1:4567"), { kind: "ok", token: "gho_githubcom", source: "env" });
+  // A loopback address is a test's fake GitHub only under the tests' switch; without it, it is just another host.
+  const tests = { ...env, RUNNERS_IO_TEST_FAKE_GITHUB: "1" };
+  assert.deepEqual(await readGhAuth(tests, gh, "http://127.0.0.1:4567"), { kind: "ok", token: "gho_githubcom", source: "env" });
+  assert.deepEqual(await readGhAuth(env, gh, "http://127.0.0.1:4567"), { kind: "ok", token: "token-for-127.0.0.1", source: "gh" }, "no switch: the github.com token stays home");
   const ghe = await readGhAuth(env, gh, "https://ghe.example.com/api/v3");
   assert.deepEqual(ghe, { kind: "ok", token: "token-for-ghe.example.com", source: "gh" }, "GH_TOKEN is github.com's, never sent elsewhere");
   assert.deepEqual(asked.at(-1), ["auth", "token", "--hostname", "ghe.example.com"]);
   const enterprise = await readGhAuth({ ...env, GH_ENTERPRISE_TOKEN: "ghe_own" }, gh, "https://ghe.example.com/api/v3");
   assert.deepEqual(enterprise, { kind: "ok", token: "ghe_own", source: "env" });
+});
+
+test("reviewState asks GraphQL once, and GraphQL's budget is kept apart from REST's", async () => {
+  const gh = await fake();
+  gh.setReviewPull("acme/widgets", 7, {
+    headRefOid: "a".repeat(40),
+    mergeStateStatus: "CLEAN",
+    reviewDecision: "APPROVED",
+    latestOpinionatedReviews: { nodes: [{ id: "R1", state: "APPROVED", authorAssociation: "MEMBER", author: { login: "alice", __typename: "User" } }] },
+    reviewThreads: { nodes: [] },
+  });
+  gh.setGraphqlRate(4321);
+  const client = new GitHubClient(gh.base, ok());
+  await client.getPull("acme/widgets", 1).catch(() => undefined);
+  const restBefore = client.rateRemaining;
+  const r = await client.reviewState("acme/widgets", 7);
+  assert.equal(r.kind, "ok");
+  if (r.kind !== "ok") return;
+  assert.equal(r.value.mergeState, "CLEAN");
+  assert.deepEqual(r.value.reviews.map((x) => x.login), ["alice"]);
+  const asked = gh.requests.filter((x) => x.path === "/graphql");
+  assert.equal(asked.length, 1);
+  assert.deepEqual((asked[0] as unknown as { variables: unknown }).variables, { owner: "acme", name: "widgets", number: 7 });
+  assert.equal(client.graphqlRemaining, 4321);
+  assert.equal(client.graphqlLimit, 5000);
+  assert.equal(client.rateRemaining, restBefore, "REST's reading is not GraphQL's");
+  assert.equal(client.requests.graphql, 1);
+});
+
+test("reviewState of a pull request GraphQL cannot see is not_found", async () => {
+  const gh = await fake();
+  const client = new GitHubClient(gh.base, ok());
+  assert.deepEqual(await client.reviewState("acme/widgets", 99), { kind: "not_found" });
+});
+
+test("reviewRequests asks GraphQL's search for this login's open review requests, and counts against GraphQL's budget", async () => {
+  const gh = await fake();
+  gh.setReviewRequests([
+    {
+      number: 9,
+      url: "https://github.com/acme/api/pull/9",
+      repository: { nameWithOwner: "acme/api" },
+      timelineItems: { nodes: [{ id: "E1", createdAt: "2026-01-01T00:00:00Z", actor: { login: "alice", __typename: "User" }, requestedReviewer: { __typename: "User", login: "octocat" } }] },
+    },
+  ]);
+  gh.setGraphqlRate(4000);
+  const client = new GitHubClient(gh.base, ok());
+  const r = await client.reviewRequests();
+  assert.equal(r.kind, "ok");
+  if (r.kind !== "ok") return;
+  assert.equal(r.value.viewer, "octocat");
+  assert.deepEqual(r.value.requests.map((q) => [q.repo, q.pr, q.id]), [["acme/api", 9, "E1"]]);
+  const asked = gh.requests.filter((x) => x.path === "/graphql") as unknown as { query: string; variables: { q: string } }[];
+  assert.equal(asked.length, 1);
+  assert.match(asked[0].variables.q, /review-requested:@me/);
+  assert.equal(client.graphqlRemaining, 4000);
 });

@@ -19,6 +19,8 @@ export const EVENT_KINDS = [
   "ci.workflow_cancelled",
   "ci.approval_waiting",
   "ci.run_all_done",
+  "ci.job_failed",
+  "ci.job_stuck_queued",
   "pr.conflict",
   "pr.conflict_resolved",
   "pr.merged",
@@ -31,6 +33,11 @@ export const EVENT_KINDS = [
   "ci.flaky",
   "base.red",
   "base.green",
+  "pr.approved",
+  "pr.changes_requested",
+  "pr.review_thread_added",
+  "pr.review_thread_resolved",
+  "pr.ready_to_merge",
 ] as const;
 
 export type EventKind = (typeof EVENT_KINDS)[number];
@@ -51,6 +58,10 @@ export interface Snapshot {
   readonly runs: readonly RunInfo[];
   /** When the PR was merged or closed, GitHub's time. */
   readonly closedAt?: string;
+  /** When the PR was opened (GitHub's time); read only to screen a PR the hook handed over. */
+  readonly createdAt?: string;
+  /** Who opened it; read only to screen a PR the hook handed over. */
+  readonly author?: string;
   /** When GitHub last changed the PR, for the latency of a label, draft or body change. */
   readonly updatedAt?: string;
   readonly baseRef?: string;
@@ -80,6 +91,26 @@ export interface Change {
   readonly prs?: readonly number[];
   /** For `base.red`: the base branch's failing workflows. */
   readonly failing?: readonly string[];
+  /** For ci.job_failed and ci.job_stuck_queued (jobs.ts): the job; never an annotation's message. */
+  readonly job?: {
+    readonly id: number;
+    readonly name: string;
+    readonly labels: readonly string[];
+    readonly url?: string;
+    readonly queuedSeconds?: number;
+    readonly annotations?: readonly { readonly path: string; readonly line: number | null; readonly level: string }[];
+  };
+  /** For the review kinds (reviews.ts): who, file:line, links and counts; never a review's or a comment's text. */
+  readonly review?: {
+    readonly login?: string;
+    readonly authorType?: "bot" | "member" | "outside";
+    readonly path?: string;
+    readonly line?: number | null;
+    readonly url?: string;
+    readonly unresolved?: number;
+    readonly mergeState?: string;
+    readonly decision?: string;
+  };
   /** For `ci.workflow_started`: how many workflows started on this head commit in the same read. */
   readonly workflows?: number;
   /** GitHub's (or a local log's) time for the change, when the snapshot's own times do not give it. */

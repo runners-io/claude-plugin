@@ -2,9 +2,9 @@
 // SessionStart hook, at every launch:
 //   - when this session was launched without the runners-io channel flag, tell the user how to relaunch it with
 //     live CI events on;
-//   - when the user has no `claude-gh` command, have Claude offer to set it up. Asked again at every launch while
-//     it is missing, whatever the user answered before: nothing records a no. RUNNERS_IO_NO_CLAUDE_GH_OFFER=1
-//     turns the offer off for good.
+//   - when the user has no `claude-gh` command, have Claude offer to set it up. A no is recorded (claude-gh.mjs
+//     decline) and the offer is not made again for 7 days, then once more. RUNNERS_IO_NO_CLAUDE_GH_OFFER=1 turns
+//     the offer off for good.
 //
 // Claude Code drops a channel's events silently in a session that did not opt in (channels-reference), so without
 // this a user who typed plain `claude` sees nothing and concludes the plugin is broken. The signal is the claude
@@ -17,7 +17,7 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { claudeGhForOffer } from "../skills/setup-github/claude-gh.mjs";
-import { channelFlags, findLaunch } from "./launch.mjs";
+import { channelFlags, findLaunch, shellWord } from "./launch.mjs";
 
 const LAUNCHES = new Set(["startup", "resume", "fork"]);
 const SESSION_ID = /^[A-Za-z0-9-]{8,64}$/;
@@ -53,7 +53,11 @@ export function noticeFor(input, launch, pluginRoot, { claudeGh = null } = {}) {
         `user exactly: "${OFFER_QUESTION}" If they say yes, follow the /runners-io:setup-github skill's step 5 (show ` +
         "the lines, ask, add them, check with type)" +
         (line ? `, then tell them to relaunch this session with \`claude-gh ${resume}\` for live CI events` : "") +
-        ". If they say no, do not ask again in this session and do not mention it again."
+        ". If they say no, " +
+        (pluginRoot
+          ? `run \`node ${shellWord(`${pluginRoot}/skills/setup-github/claude-gh.mjs`)} decline\`, which records it so the offer is not made again for 7 days, `
+          : "") +
+        "do not ask again in this session and do not mention it again."
       : null;
   if (!line && !offer) return null;
   const context = [line && `${line} The user has been shown this line. Do not repeat it unless they ask why CI events are not arriving.`, offer]

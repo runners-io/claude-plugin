@@ -1,0 +1,12 @@
+# Weekly updates for the actions the workflows use (each pinned to a full commit SHA) and for the channel's build
+# tools (esbuild, typescript: development dependencies only; the plugin ships a committed bundle and installs nothing).
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "npm"
+    directory: "/channel"
+    schedule:
+      interval: "weekly"

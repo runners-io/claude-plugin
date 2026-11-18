@@ -6,4 +6,5 @@ export interface BaseRun {
   readonly updated_at?: string;
 }
 
+export function latestPerWorkflow<T extends BaseRun>(runs: readonly T[]): T[];
 export function baseVerdict(runs: readonly BaseRun[]): { red: boolean; failing: string[]; at: string | null };

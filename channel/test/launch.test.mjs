@@ -1,9 +1,11 @@
 // Whether this Claude Code session opted the runners-io channel in, so the user can be told to relaunch
 // with the flag when they launched without it. Read from the launching process's own flags.
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { test } from "node:test";
 
-import { findLaunch, parseLaunch } from "../../hooks/launch.mjs";
+import { channelFlags, findLaunch, parseLaunch, shellWord } from "../../hooks/launch.mjs";
 
 test("the channel is on only when a channel flag names the runners-io plugin or server", () => {
   assert.equal(parseLaunch("claude --dangerously-load-development-channels plugin:runners-io@inline --resume abc").state, "on");
@@ -21,6 +23,21 @@ test("a headless run is headless whatever its flags: Claude Code ignores the cha
   assert.equal(parseLaunch("claude -p hello").state, "headless");
   assert.equal(parseLaunch("claude --print --dangerously-load-development-channels plugin:runners-io@inline").state, "headless");
   assert.equal(parseLaunch("claude --output-format=stream-json --print x").state, "headless");
+});
+
+test("flags are read only up to the prompt: words in it are not flags", () => {
+  // ps loses the quotes, so `claude "explain the -p flag"` reads as these words.
+  assert.equal(parseLaunch("claude explain the -p flag").state, "off");
+  assert.equal(parseLaunch("claude --model opus explain the --print option").state, "off", "a flag's value, then the prompt");
+  assert.equal(parseLaunch("claude fix it --channels plugin:runners-io@runners-io").state, "off", "a prompt naming the flag is no opt-in");
+  assert.equal(parseLaunch("claude -- -p").state, "off", "nothing after -- is a flag");
+  assert.equal(parseLaunch("claude --resume abc -p").state, "headless", "a value, then more flags");
+  assert.equal(parseLaunch("claude --channels plugin:telegram@x plugin:runners-io@acme --resume abc").state, "on");
+  assert.equal(
+    parseLaunch("node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js --channels plugin:runners-io@acme").state,
+    "on",
+    "started through node: the script path is not the prompt",
+  );
 });
 
 test("findLaunch walks up from a hook or the channel to the claude process, and is unknown when it cannot find one", () => {
@@ -68,3 +85,27 @@ test("the channel polls only where its events can arrive: on, or unknown (where 
   assert.equal(pollsIn("off"), false);
   assert.equal(pollsIn("headless"), false, "claude -p ignores the channel flag, so a push goes nowhere");
 });
+
+test("shellWord quotes for the shell that reads it: fish escapes a backslash and a quote inside single quotes", () => {
+  assert.equal(shellWord("/plain/path"), "/plain/path");
+  assert.equal(shellWord("/plain/path", "fish"), "/plain/path");
+  assert.equal(shellWord("a b'c"), "'a b'\\''c'");
+  assert.equal(shellWord("a b'c\\d", "fish"), "'a b\\'c\\\\d'");
+  const block = channelFlags("/x/it's here\\", "fish");
+  assert.ok(block.includes("'/x/it\\'s here\\\\'"), block.join(" "));
+});
+
+const TRICKY = ["a b", "it's", "back\\slash", "ends\\", "$HOME", "*", "(x)", "a\\'b", "semi;colon"];
+for (const [shell, exe] of [["posix", "/bin/sh"], ["fish", lookup("fish")]]) {
+  test(`a real ${shell} shell reads each quoted word back unchanged`, { skip: exe && existsSync(exe) ? false : `no ${shell} shell here` }, () => {
+    for (const word of TRICKY) {
+      const r = spawnSync(exe, ["-c", `printf %s ${shellWord(word, shell)}`], { encoding: "utf8" });
+      assert.equal(r.stdout, word, `${shell}: ${word} -> ${shellWord(word, shell)} (${r.stderr})`);
+    }
+  });
+}
+
+function lookup(name) {
+  const r = spawnSync("/bin/sh", ["-c", `command -v ${name}`], { encoding: "utf8" });
+  return r.status === 0 ? r.stdout.trim() : null;
+}

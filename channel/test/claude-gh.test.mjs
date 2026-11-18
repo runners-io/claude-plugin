@@ -3,13 +3,13 @@
 // without duplicating and taken out exactly. It never overrides `claude`.
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { BEGIN, END, addBlock, blockFor, removeBlock, rcFor } from "../../skills/setup-github/claude-gh.mjs";
+import { BEGIN, END, addBlock, blockFor, listedShells, removeBlock, rcFor, writeRc } from "../../skills/setup-github/claude-gh.mjs";
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "skills", "setup-github", "claude-gh.mjs");
 const CACHED = "/Users/me/.claude/plugins/cache/runners-io/runners-io/0.2.0";
@@ -64,6 +64,32 @@ test("the rc file follows the shell: ~/.zshrc (or $ZDOTDIR), ~/.bashrc, fish's c
   assert.equal(rcFor("fish", { HOME: "/h" }), "/h/.config/fish/config.fish");
   assert.equal(rcFor("fish", { HOME: "/h", XDG_CONFIG_HOME: "/c" }), "/c/fish/config.fish");
   assert.throws(() => rcFor("tcsh", { HOME: "/h" }), /zsh, bash or fish/);
+});
+
+test("an empty or relative HOME is refused, so the rc file is never written into the current folder", () => {
+  for (const env of [{}, { HOME: "" }, { HOME: "relative" }]) {
+    for (const shell of ["zsh", "bash", "fish"]) assert.throws(() => rcFor(shell, env), /HOME/, `${shell} ${JSON.stringify(env)}`);
+  }
+  assert.equal(rcFor("zsh", { ZDOTDIR: "/z" }), "/z/.zshrc", "an absolute ZDOTDIR needs no HOME");
+  assert.equal(rcFor("fish", { XDG_CONFIG_HOME: "/c" }), "/c/fish/config.fish", "nor does an absolute XDG_CONFIG_HOME");
+});
+
+test("the rc file is replaced in one step, through a symlink to the real file, keeping its mode and leaving no temporary file", () => {
+  const dir = mkdtempSync(join(tmpdir(), "claude-gh-rc-"));
+  const real = join(dir, "dotfiles", "zshrc");
+  mkdirSync(dirname(real));
+  writeFileSync(real, "old\n", { mode: 0o600 });
+  const link = join(dir, ".zshrc");
+  symlinkSync(real, link);
+  writeRc(link, "new\n");
+  assert.equal(lstatSync(link).isSymbolicLink(), true, "a dotfile kept in a repository stays a symlink");
+  assert.equal(readFileSync(real, "utf8"), "new\n");
+  assert.equal(statSync(real).mode & 0o777, 0o600, "its mode is kept");
+  assert.deepEqual(readdirSync(dirname(real)), ["zshrc"], "no temporary file left");
+  const fresh = join(dir, "fresh", ".bashrc");
+  mkdirSync(dirname(fresh));
+  writeRc(fresh, "x\n");
+  assert.equal(readFileSync(fresh, "utf8"), "x\n");
 });
 
 function which(name) {
@@ -146,53 +172,128 @@ test("claude-gh is looked for in the user's own login shell: an alias, a functio
   }
   const home = mkdtempSync(join(tmpdir(), "claude-gh-"));
   const env = { HOME: home, ZDOTDIR: home, SHELL: ZSH, PATH: "/usr/bin:/bin" };
-  assert.equal(await claudeGhPresent(env), false, "nowhere");
+  assert.equal(await claudeGhPresent(env, { shells: new Set([env.SHELL]) }), false, "nowhere");
   writeFileSync(join(home, ".zshrc"), addBlock("# mine\n", blockFor("zsh", CACHED, null)));
-  assert.equal(await claudeGhPresent(env), true, "our block in .zshrc");
+  assert.equal(await claudeGhPresent(env, { shells: new Set([env.SHELL]) }), true, "our block in .zshrc");
   writeFileSync(join(home, ".zshrc"), "# mine\n");
   writeFileSync(join(home, ".zprofile"), "alias claude-gh='claude --channels x'\n");
-  assert.equal(await claudeGhPresent(env), true, "an alias in .zprofile");
+  assert.equal(await claudeGhPresent(env, { shells: new Set([env.SHELL]) }), true, "an alias in .zprofile");
   writeFileSync(join(home, ".zprofile"), "");
   writeFileSync(join(home, "more.zsh"), "claude-gh() { claude \"$@\"; }\n");
   writeFileSync(join(home, ".zshrc"), `source ${join(home, "more.zsh")}\n`);
-  assert.equal(await claudeGhPresent(env), true, "a function in a file .zshrc sources");
+  assert.equal(await claudeGhPresent(env, { shells: new Set([env.SHELL]) }), true, "a function in a file .zshrc sources");
   const bin = mkdtempSync(join(tmpdir(), "claude-gh-bin-"));
   writeFileSync(join(home, ".zshrc"), "# mine\n");
   writeFileSync(join(bin, "claude-gh"), "#!/bin/sh\n", { mode: 0o755 });
-  assert.equal(await claudeGhPresent({ ...env, PATH: `${bin}:/usr/bin:/bin` }), true, "an executable on PATH");
+  assert.equal(await claudeGhPresent({ ...env, PATH: `${bin}:/usr/bin:/bin` }, { shells: new Set([env.SHELL]) }), true, "an executable on PATH");
 });
 
 test("bash: found in .bashrc as well as in the login files", async () => {
   const { claudeGhPresent } = await import("../../skills/setup-github/claude-gh.mjs");
   const home = mkdtempSync(join(tmpdir(), "claude-gh-"));
   const env = { HOME: home, SHELL: "/bin/bash", PATH: "/usr/bin:/bin" };
-  assert.equal(await claudeGhPresent(env), false);
+  assert.equal(await claudeGhPresent(env, { shells: new Set([env.SHELL]) }), false);
   writeFileSync(join(home, ".bashrc"), "alias claude-gh='claude --channels x'\n");
-  assert.equal(await claudeGhPresent(env), true, ".bashrc, which a login bash does not read by itself");
+  assert.equal(await claudeGhPresent(env, { shells: new Set([env.SHELL]) }), true, ".bashrc, which a login bash does not read by itself");
 });
 
 test("no answer, so no offer: Windows, a shell other than zsh, bash or fish, a shell that fails or hangs", async () => {
   const { claudeGhPresent } = await import("../../skills/setup-github/claude-gh.mjs");
   const env = { HOME: "/nowhere", SHELL: "/bin/zsh", PATH: "/nonexistent" };
+  const shells = new Set(["/bin/zsh", "/bin/tcsh", "/usr/local/bin/fish"]);
   const calls = [];
   const run = (status) => (file, args) => {
     calls.push([file, ...args]);
     return status;
   };
-  assert.equal(await claudeGhPresent(env, { platform: "win32", run: run(1) }), null, "Windows");
-  assert.equal(await claudeGhPresent({ ...env, SHELL: "/bin/tcsh" }, { run: run(1) }), null, "tcsh");
-  assert.equal(await claudeGhPresent({ ...env, SHELL: undefined }, { run: run(1) }), null, "no SHELL");
+  assert.equal(await claudeGhPresent(env, { shells, platform: "win32", run: run(1) }), null, "Windows");
+  assert.equal(await claudeGhPresent({ ...env, SHELL: "/bin/tcsh" }, { shells, run: run(1) }), null, "tcsh");
+  assert.equal(await claudeGhPresent({ ...env, SHELL: undefined }, { shells, run: run(1) }), null, "no SHELL");
   assert.deepEqual(calls, [], "no shell was started for any of them");
-  assert.equal(await claudeGhPresent(env, { run: run(null) }), null, "timed out or could not start");
-  assert.equal(await claudeGhPresent(env, { run: run(127) }), null, "the shell's own failure");
-  assert.equal(await claudeGhPresent(env, { run: run(0) }), true);
-  assert.equal(await claudeGhPresent(env, { run: run(1) }), false);
+  assert.equal(await claudeGhPresent(env, { shells, run: run(null) }), null, "timed out or could not start");
+  assert.equal(await claudeGhPresent(env, { shells, run: run(127) }), null, "the shell's own failure");
+  assert.equal(await claudeGhPresent(env, { shells, run: run(0) }), true);
+  assert.equal(await claudeGhPresent(env, { shells, run: run(1) }), false);
   calls.length = 0;
-  await claudeGhPresent({ ...env, SHELL: "/usr/local/bin/fish" }, { run: run(1) });
+  await claudeGhPresent({ ...env, SHELL: "/usr/local/bin/fish" }, { shells, run: run(1) });
   assert.deepEqual(calls, [["/usr/local/bin/fish", "-lic", "type -q claude-gh"]], "fish: its own builtin, fixed arguments");
   calls.length = 0;
-  await claudeGhPresent(env, { run: run(1) });
+  await claudeGhPresent(env, { shells, run: run(1) });
   assert.deepEqual(calls, [["/bin/zsh", "-lic", "command -v claude-gh >/dev/null 2>&1"]]);
+});
+
+test("SHELL is used only when /etc/shells lists it: one pointing anywhere else is no answer, and nothing is started", async () => {
+  const { claudeGhPresent } = await import("../../skills/setup-github/claude-gh.mjs");
+  const calls = [];
+  const run = (file) => {
+    calls.push(file);
+    return 0;
+  };
+  const env = { HOME: "/nowhere", PATH: "/nonexistent" };
+  const shells = new Set(["/bin/zsh", "/bin/bash"]);
+  assert.equal(await claudeGhPresent({ ...env, SHELL: "/tmp/x/zsh" }, { run, shells }), null);
+  assert.equal(await claudeGhPresent({ ...env, SHELL: "/home/u/bin/bash" }, { run, shells }), null);
+  assert.equal(await claudeGhPresent({ ...env, SHELL: "/bin/zsh" }, { run, shells: new Set() }), null, "an unreadable /etc/shells lists nothing");
+  assert.deepEqual(calls, [], "no shell was started for any of them");
+  assert.equal(await claudeGhPresent({ ...env, SHELL: "/bin/zsh" }, { run, shells }), true);
+  assert.deepEqual(listedShells("# comment\n/bin/sh\n\n /usr/bin/zsh \nnot/absolute\n"), new Set(["/bin/sh", "/usr/bin/zsh"]));
+});
+
+test("a no is remembered for 7 days: no offer and no shell started until then, then it is offered once again", async () => {
+  const { claudeGhForOffer, recordDecline } = await import("../../skills/setup-github/claude-gh.mjs");
+  const home = mkdtempSync(join(tmpdir(), "claude-gh-decline-"));
+  const env = { HOME: home, SHELL: "/bin/zsh" };
+  const cacheRoot = join(home, ".cache", "runners-io");
+  let asked = 0;
+  const present = () => {
+    asked++;
+    return false;
+  };
+  const t0 = 1_700_000_000_000;
+  const day = 24 * 60 * 60_000;
+  assert.equal(await claudeGhForOffer(env, present, { now: t0, cacheRoot }), false, "offered before any no");
+  assert.equal(recordDecline(env, t0), true);
+  const state = join(home, ".local", "state", "runners-io");
+  assert.equal(statSync(state).mode & 0o777, 0o700);
+  assert.equal(statSync(join(state, "claude-gh-declined.json")).mode & 0o777, 0o600);
+  asked = 0;
+  assert.equal(await claudeGhForOffer(env, present, { now: t0 + day, cacheRoot }), null, "a day later: no offer");
+  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 7 * day - 1, cacheRoot }), null, "just under a week: none");
+  assert.equal(asked, 0, "and the user's shell was not started");
+  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 7 * day, cacheRoot }), false, "a week later: offered again");
+  assert.equal(await claudeGhForOffer({ ...env, XDG_STATE_HOME: join(home, "elsewhere") }, present, { now: t0 + day, cacheRoot }), false, "XDG_STATE_HOME is where it lives");
+});
+
+test("a no is never read or written through a symlink, another user's folder, or without an absolute HOME", async () => {
+  const { claudeGhForOffer, recordDecline } = await import("../../skills/setup-github/claude-gh.mjs");
+  const present = () => false;
+  const t0 = 1_700_000_000_000;
+  const home = mkdtempSync(join(tmpdir(), "claude-gh-decline-link-"));
+  const target = join(home, "target");
+  mkdirSync(target);
+  mkdirSync(join(home, ".local", "state"), { recursive: true });
+  symlinkSync(target, join(home, ".local", "state", "runners-io"));
+  const env = { HOME: home, SHELL: "/bin/zsh" };
+  assert.equal(recordDecline(env, t0), false, "a symlinked state folder is refused");
+  assert.deepEqual(readdirSync(target), [], "nothing was written through it");
+  const home2 = mkdtempSync(join(tmpdir(), "claude-gh-decline-file-"));
+  const state2 = join(home2, ".local", "state", "runners-io");
+  mkdirSync(state2, { recursive: true, mode: 0o700 });
+  const planted = join(home2, "planted.json");
+  writeFileSync(planted, JSON.stringify({ at: t0 }));
+  symlinkSync(planted, join(state2, "claude-gh-declined.json"));
+  const cacheRoot = join(home2, ".cache", "runners-io");
+  assert.equal(await claudeGhForOffer({ HOME: home2, SHELL: "/bin/zsh" }, present, { now: t0 + 1000, cacheRoot }), false, "a symlinked record is not believed");
+  assert.equal(recordDecline({ SHELL: "/bin/zsh" }, t0), false, "no HOME: nowhere to write");
+  assert.equal(recordDecline({ HOME: "relative" }, t0), false);
+});
+
+test("`claude-gh.mjs decline` records the no and says when it will be asked again", () => {
+  const home = mkdtempSync(join(tmpdir(), "claude-gh-decline-cli-"));
+  const r = spawnSync(process.execPath, [SCRIPT, "decline"], { env: { PATH: process.env.PATH, HOME: home }, encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /7 days/);
+  assert.ok(existsSync(join(home, ".local", "state", "runners-io", "claude-gh-declined.json")));
 });
 
 test("a claude-gh found is remembered for a day, so the shell is not started at every launch; one missing is asked every time", async () => {

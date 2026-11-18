@@ -1,6 +1,7 @@
 # Security
 
-Please report a vulnerability in this plugin to **security@runners.io**, not in a public issue. Include what you
+Please report a vulnerability in this plugin privately, not in a public issue: to **security@runners.io**, or through
+GitHub's [private vulnerability reporting](https://github.com/runners-io/claude-plugin/security/advisories/new). Include what you
 found, how to reproduce it, and the version (`.claude-plugin/plugin.json`).
 
 We will acknowledge your report within three working days and tell you what we will do about it. Please give us a

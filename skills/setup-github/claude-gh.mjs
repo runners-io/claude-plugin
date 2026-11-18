@@ -4,15 +4,16 @@
 //   node claude-gh.mjs show     the shell, the rc file and the exact lines; changes nothing
 //   node claude-gh.mjs add      writes the lines between the markers (again: replaces them in place)
 //   node claude-gh.mjs remove   takes them out, leaving the file as it was
+//   node claude-gh.mjs decline  records the user's no, so the offer is not made again for 7 days
 //   --shell zsh|bash|fish       instead of $SHELL;  --rc <file>  instead of the shell's usual rc file
 //
 // It never redefines `claude`, and refuses to write over a claude-gh the user defined themselves. The command
 // names claude by its absolute path when it can find it, so it does not depend on what is on PATH later.
 // Dependency-free plain JavaScript, Node 20.
 import { execFileSync, spawn } from "node:child_process";
-import { accessSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { channelFlags, shellWord } from "../../hooks/launch.mjs";
@@ -26,8 +27,8 @@ export const SIGNATURE = "# written by the runners.io plugin's setup-github skil
 
 /** The lines for one shell. `claude` is its absolute path, or null to use `command claude`. */
 export function blockFor(shell, pluginRoot, claude) {
-  const exe = claude ? shellWord(claude) : "command claude";
-  const words = [exe, ...channelFlags(pluginRoot)].join(" ");
+  const exe = claude ? shellWord(claude, shell) : "command claude";
+  const words = [exe, ...channelFlags(pluginRoot, shell)].join(" ");
   const about = [
     SIGNATURE,
     "# claude-gh starts Claude Code with live CI events from the runners.io plugin's channel; `claude` is unchanged.",
@@ -80,13 +81,58 @@ export function removeBlock(text) {
   return (after === "" && before.endsWith("\n") ? before.slice(0, -1) : before) + after;
 }
 
-/** The rc file a shell reads for an interactive session. */
+/**
+ * The rc file a shell reads for an interactive session. Always an absolute path: an empty or relative HOME (and no
+ * absolute ZDOTDIR or XDG_CONFIG_HOME) is refused, where join() would quietly name a file in the current folder.
+ */
 export function rcFor(shell, env = process.env) {
+  if (!SHELLS.includes(shell)) throw new Error(`claude-gh can be set up for zsh, bash or fish, not ${shell}: add it to your shell by hand`);
   const home = env.HOME ?? "";
-  if (shell === "zsh") return join(env.ZDOTDIR || home, ".zshrc");
-  if (shell === "bash") return join(home, ".bashrc");
-  if (shell === "fish") return join(env.XDG_CONFIG_HOME || join(home, ".config"), "fish", "config.fish");
-  throw new Error(`claude-gh can be set up for zsh, bash or fish, not ${shell}: add it to your shell by hand`);
+  const base = (dir) => {
+    if (dir && isAbsolute(dir)) return dir;
+    if (isAbsolute(home)) return null;
+    throw new Error(`HOME is ${home ? `not an absolute path (${home})` : "empty"}, so there is no rc file to write: pass --rc <file>`);
+  };
+  if (shell === "zsh") return join(base(env.ZDOTDIR) ?? home, ".zshrc");
+  if (shell === "bash") return join(base("") ?? home, ".bashrc");
+  return join(base(env.XDG_CONFIG_HOME) ?? join(home, ".config"), "fish", "config.fish");
+}
+
+/**
+ * Replaces an rc file in one step: the new text goes to a temporary file beside the real one, which is renamed over
+ * it, so a crash or a full disk never leaves a half-written rc file. A symlink (dotfiles kept in a repository) is
+ * followed and stays a symlink; the file keeps its mode.
+ */
+export function writeRc(file, text) {
+  const target = existsSync(file) ? realpathSync(file) : file;
+  const mode = existsSync(target) ? statSync(target).mode & 0o777 : null;
+  const tmp = join(dirname(target), `.${basename(target)}.runners-io-${process.pid}`);
+  try {
+    writeFileSync(tmp, text, { mode: mode ?? 0o644, flag: "wx" });
+    if (mode !== null) chmodSync(tmp, mode);
+    renameSync(tmp, target);
+  } catch (error) {
+    rmSync(tmp, { force: true });
+    throw error;
+  }
+}
+
+/** The absolute paths /etc/shells lists, one per line, comments and blank lines left out. */
+export function listedShells(text) {
+  return new Set(
+    String(text ?? "")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith("/")),
+  );
+}
+
+function readListedShells() {
+  try {
+    return listedShells(readFileSync("/etc/shells", "utf8"));
+  } catch {
+    return new Set();
+  }
 }
 
 /**
@@ -98,11 +144,13 @@ export function rcFor(shell, env = process.env) {
  * fish (the setup skill cannot write for it), and when the shell failed, hung (4 s) or could not start. The
  * command and its arguments are fixed: nothing from the environment but the shell's own path goes into them.
  */
-export async function claudeGhPresent(env = process.env, { platform = process.platform, run = runShell, timeoutMs = 4000 } = {}) {
+export async function claudeGhPresent(env = process.env, { platform = process.platform, run = runShell, timeoutMs = 4000, shells } = {}) {
   if (platform === "win32") return null;
   const shellPath = env.SHELL ?? "";
   const shell = basename(shellPath);
   if (!shellPath.startsWith("/") || !SHELLS.includes(shell)) return null;
+  // SHELL is run with -lic, so it must be a login shell this machine lists, not any program a variable points at.
+  if (!(shells ?? readListedShells()).has(shellPath)) return null;
   for (const dir of (env.PATH ?? "").split(":")) {
     if (!dir) continue;
     try {
@@ -122,6 +170,59 @@ export async function claudeGhPresent(env = process.env, { platform = process.pl
   return answered ? false : null;
 }
 
+/** After the user says no, the offer is not made again for this long; then once more. */
+export const DECLINE_FOR_MS = 7 * 24 * 60 * 60_000;
+
+/**
+ * The plugin's state folder: $XDG_STATE_HOME/runners-io, else ~/.local/state/runners-io. Kept apart from the cache,
+ * which is deleted freely. null when neither gives an absolute path: a no is then not remembered, never written
+ * into the current folder.
+ */
+export function stateRootFor(env = process.env) {
+  if (env.XDG_STATE_HOME && isAbsolute(env.XDG_STATE_HOME)) return join(env.XDG_STATE_HOME, "runners-io");
+  return env.HOME && isAbsolute(env.HOME) ? join(env.HOME, ".local", "state", "runners-io") : null;
+}
+
+const DECLINED = "claude-gh-declined.json";
+
+/** Whether the user said no less than DECLINE_FOR_MS ago: only from a real file, in a real folder of this user's. */
+function declined(env, now) {
+  const root = stateRootFor(env);
+  if (!root) return false;
+  try {
+    if (!ownFolder(root)) return false;
+    const st = lstatSync(join(root, DECLINED));
+    if (!st.isFile() || (process.getuid !== undefined && st.uid !== process.getuid())) return false;
+    const { at } = JSON.parse(readFileSync(join(root, DECLINED), "utf8"));
+    return typeof at === "number" && now - at >= 0 && now - at < DECLINE_FOR_MS;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Records the user's no (the time only): a 0600 file in a 0700 folder, never through a symlink or into another
+ * user's folder. false when it could not be written, so the offer simply comes again.
+ */
+export function recordDecline(env = process.env, now = Date.now()) {
+  const root = stateRootFor(env);
+  if (!root) return false;
+  try {
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    if (!ownFolder(root)) return false;
+    const file = join(root, DECLINED);
+    try {
+      if (lstatSync(file).isSymbolicLink()) rmSync(file);
+    } catch {}
+    const tmp = join(root, `.${DECLINED}.${process.pid}`);
+    writeFileSync(tmp, JSON.stringify({ at: now }), { mode: 0o600 });
+    renameSync(tmp, file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** A claude-gh found is believed this long before the shell is asked again. */
 const FOUND_FOR_MS = 24 * 60 * 60_000;
 
@@ -136,10 +237,12 @@ export function cacheRootFor(env = process.env) {
  * Asking the shell runs the user's startup files, which can be slow or start things, so a claude-gh FOUND is
  * remembered for a day (per shell, in the cache folder: 0700, a 0600 file, never through a symlink or another
  * user's folder) and the shell is not started again until then. One MISSING is asked at every launch: that is
- * when the offer is made, and the user may have just added it.
+ * when the offer is made, and the user may have just added it. After the user says no (recordDecline), there is no
+ * offer and no shell is started for DECLINE_FOR_MS; then it is offered once again.
  */
 export async function claudeGhForOffer(env = process.env, present = claudeGhPresent, { now = Date.now(), cacheRoot = cacheRootFor(env) } = {}) {
   if (env.RUNNERS_IO_NO_CLAUDE_GH_OFFER === "1") return null;
+  if (declined(env, now)) return null;
   const shell = env.SHELL ?? "";
   const file = join(cacheRoot, "claude-gh.json");
   try {
@@ -220,8 +323,18 @@ function arg(argv, name) {
 
 function main(argv) {
   const command = argv[0];
+  if (command === "decline") {
+    const now = Date.now();
+    if (!recordDecline(process.env, now)) {
+      process.stderr.write("could not record the no (no absolute HOME, or the state folder is not a plain folder of yours); the offer will come again\n");
+      return 3;
+    }
+    const until = new Date(now + DECLINE_FOR_MS).toISOString().slice(0, 10);
+    process.stdout.write(`noted: runners.io will not offer claude-gh again for 7 days (until ${until}). To set it up sooner: /runners-io:setup-github\n`);
+    return 0;
+  }
   if (!["show", "add", "remove"].includes(command)) {
-    process.stderr.write("usage: claude-gh.mjs show|add|remove [--shell zsh|bash|fish] [--rc <file>]\n");
+    process.stderr.write("usage: claude-gh.mjs show|add|remove|decline [--shell zsh|bash|fish] [--rc <file>]\n");
     return 64;
   }
   const shell = arg(argv, "--shell") ?? (process.env.SHELL ?? "").split("/").at(-1);
@@ -256,7 +369,7 @@ function main(argv) {
     }
     mkdirSync(dirname(rc), { recursive: true });
     if (command === "add" && existsSync(rc) && !existsSync(`${rc}.before-runners-io`)) copyFileSync(rc, `${rc}.before-runners-io`);
-    writeFileSync(rc, next);
+    writeRc(rc, next);
   } catch (error) {
     process.stderr.write(`${error.message}\n`);
     return 3;

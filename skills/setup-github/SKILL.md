@@ -48,7 +48,7 @@ Call the runners-io `ci_status` tool, which defaults to the current branch's pul
 
 ## 5. Offer a `claude-gh` command (ask first)
 
-The plugin's SessionStart hook also brings you here: while the user has no `claude-gh`, it asks you at every launch to offer it once in the session. If they say no, leave it for this session.
+The plugin's SessionStart hook also brings you here: while the user has no `claude-gh`, it asks you to offer it once in the session. If they say no, run `node "<this skill's base directory>/claude-gh.mjs" decline` so it is not offered again for 7 days, and leave it.
 
 Live CI events reach a session only when Claude Code is started with the channel flag, which is long to type. Offer the user a separate command, `claude-gh`, that starts Claude Code with it. Plain `claude` is never changed. The script `claude-gh.mjs` in this skill's base directory does the edit, so it is the same every time.
 
