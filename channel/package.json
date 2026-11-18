@@ -1,6 +1,6 @@
 {
   "name": "runners-io-claude-channel",
-  "version": "0.2.4",
+  "version": "0.2.6",
   "private": true,
   "description": "The runners.io CI channel for Claude Code: a stdio MCP server that reads pull requests' CI from GitHub with the user's own login and pushes changes into the session.",
   "license": "MIT",

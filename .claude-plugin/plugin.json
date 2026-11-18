@@ -1,7 +1,7 @@
 {
   "name": "runners-io",
   "displayName": "runners.io",
-  "version": "0.2.4",
+  "version": "0.2.6",
   "description": "CI results and merge conflicts for your pull requests, read from GitHub with your own GitHub login and pushed into your Claude Code session as they happen (a Channels research preview). It watches the pull request for your branch, and one just opened by you in the same repository; Claude subscribes to any other. Plus the runners.io MCP server for runners.io customers.",
   "author": {
     "name": "runners.io",
