@@ -190,3 +190,19 @@ test("baseRuns reads the push runs on a branch", async () => {
   assert.deepEqual(r.kind === "ok" && r.value.map((x) => [x.name, x.conclusion, x.updated_at]), [["CI", "failure", "2026-11-18T01:10:00Z"]]);
   assert.ok(gh.requests.some((q) => q.path.includes("branch=main") && q.path.includes("event=push")));
 });
+
+test("a github.com token is only ever read for api.github.com (or loopback, for tests); another host gets that host's own login", async () => {
+  const asked: string[][] = [];
+  const gh = async (_c: string, args: readonly string[]) => {
+    asked.push([...args]);
+    return { code: 0, stdout: `token-for-${args.at(-1)}\n` };
+  };
+  const env = { GH_TOKEN: "gho_githubcom", GITHUB_TOKEN: "gho_githubcom2" };
+  assert.deepEqual(await readGhAuth(env, gh, "https://api.github.com"), { kind: "ok", token: "gho_githubcom", source: "env" });
+  assert.deepEqual(await readGhAuth(env, gh, "http://127.0.0.1:4567"), { kind: "ok", token: "gho_githubcom", source: "env" });
+  const ghe = await readGhAuth(env, gh, "https://ghe.example.com/api/v3");
+  assert.deepEqual(ghe, { kind: "ok", token: "token-for-ghe.example.com", source: "gh" }, "GH_TOKEN is github.com's, never sent elsewhere");
+  assert.deepEqual(asked.at(-1), ["auth", "token", "--hostname", "ghe.example.com"]);
+  const enterprise = await readGhAuth({ ...env, GH_ENTERPRISE_TOKEN: "ghe_own" }, gh, "https://ghe.example.com/api/v3");
+  assert.deepEqual(enterprise, { kind: "ok", token: "ghe_own", source: "env" });
+});

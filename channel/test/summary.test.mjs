@@ -146,7 +146,7 @@ test("with --github, the new kinds are checked too: labels and draft from issue 
   assert.equal(r.code, 1, r.stderr);
   const s = JSON.parse(r.stdout);
   assert.deepEqual(
-    s.github.misses.map((m) => `${m.kind}:${m.run_id ?? m.train_state ?? ""}`).sort(),
+    s.github.misses.map((m) => `${m.kind}:${m.run_id ?? m.state ?? ""}`).sort(),
     expected.sort(),
   );
   assert.match(s.github.not_checked, /pr.head_moved/);

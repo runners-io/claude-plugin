@@ -63,7 +63,7 @@ test("inOwnHistory: a commit is this work tree's own only when it is HEAD or beh
   const two = g(other, "rev-parse", "HEAD");
 
   assert.equal(await inOwnHistory(main, one), true, "HEAD");
-  assert.equal(await inOwnHistory(main, two), false, "in the shared object store, but another worktree's commit: the 2026-11-18 miss");
+  assert.equal(await inOwnHistory(main, two), false, "in the shared object store, but another worktree's commit: a presence check misses it");
   assert.equal(await inOwnHistory(other, two), true);
   assert.equal(await inOwnHistory(other, one), true, "an ancestor of HEAD: this work tree has moved on past it");
   assert.equal(await inOwnHistory(main, "f".repeat(40)), false, "a commit this machine has never seen");

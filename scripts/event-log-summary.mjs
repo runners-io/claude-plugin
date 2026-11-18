@@ -326,7 +326,7 @@ function text(s) {
   if (s.github) {
     out.push(`GitHub check: ${s.github.checked_prs} PR(s), ${s.github.misses.length} miss(es), ${s.github.superseded} superseded failure(s) rightly not sent; not checked: ${s.github.not_checked}`);
     for (const m of s.github.misses) {
-      out.push(`  MISS ${m.kind} ${m.repo}#${m.pr}${m.run_id ? ` run ${m.run_id} "${m.workflow}"` : ""}${m.train_state ? ` ${m.train_state}` : ""} at ${m.github_at}`);
+      out.push(`  MISS ${m.kind} ${m.repo}#${m.pr}${m.run_id ? ` run ${m.run_id} "${m.workflow}"` : ""}${m.state ? ` ${m.state}` : ""} at ${m.github_at}`);
     }
   }
   return `${out.join("\n")}\n`;

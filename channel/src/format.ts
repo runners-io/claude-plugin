@@ -61,13 +61,21 @@ function jobs(names: readonly string[] | undefined): string {
   return list.length > 5 ? `${shown} and ${list.length - 5} more` : shown;
 }
 
+/**
+ * A branch name plain enough to put into a command Claude is told to run. Whoever pushes chooses the name (a
+ * fork's author, on a public repository), and git allows `$(`, backticks, `;` and `|` in it; anything else is
+ * written as <branch>.
+ */
+const PLAIN_BRANCH = /^[A-Za-z0-9._][A-Za-z0-9._/-]{0,199}$/;
+
 export function toMessage(c: Change): ChannelMessage {
   const s = c.snapshot;
   const workflow = clean(c.run?.name) || "a workflow";
   const runUrl = safeLink(c.run?.htmlUrl);
   const prUrl = safeLink(s.prUrl);
   const at = where(s);
-  const branch = clean(s.headRef, 60);
+  // In the text only when plain (PLAIN_BRANCH); the branch attribute still carries it, cleaned, as data.
+  const branch = PLAIN_BRANCH.test(s.headRef) ? s.headRef : "";
 
   let content: string;
   switch (c.kind) {
@@ -129,7 +137,7 @@ export function toMessage(c: Change): ChannelMessage {
       content = `PR #${s.pr} was marked ready for review. ${prUrl}`;
       break;
     case "pr.converted_to_draft":
-      content = `PR #${s.pr} was converted to a draft: do not arm or attempt a merge. ${prUrl}`;
+      content = `PR #${s.pr} was converted to a draft: it is not ready, so do not try to merge it. ${prUrl}`;
       break;
     case "pr.body_edited":
       content =

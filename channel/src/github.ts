@@ -15,6 +15,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 
 import { log } from "./log.ts";
+import type { LoginStore, SharedStore, Stored } from "./shared.ts";
 
 export type GhAuth =
   | { readonly kind: "ok"; readonly token: string; readonly source: "env" | "gh" }
@@ -43,12 +44,27 @@ const runCommand: Runner = (command, args) =>
 
 type Env = Record<string, string | undefined>;
 
-export async function readGhAuth(env: Env = process.env, run: Runner = runCommand): Promise<GhAuth> {
-  for (const name of ["GH_TOKEN", "GITHUB_TOKEN"] as const) {
+/**
+ * The GitHub host whose login is used for an API address: github.com for api.github.com (and for loopback, the
+ * tests' fake GitHub), otherwise the address's own host (GitHub Enterprise Server). A token is only ever read
+ * for the host it is sent to, so pointing RUNNERS_IO_GITHUB_API somewhere else can never carry a github.com
+ * token there.
+ */
+export function loginHost(apiBase: string): string {
+  const host = new URL(apiBase).hostname;
+  return host === "api.github.com" || LOOPBACK_HOSTS.has(host) ? "github.com" : host;
+}
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+
+/** The token for the API address's host, the way gh picks it: the host's environment variables, then gh's login. */
+export async function readGhAuth(env: Env = process.env, run: Runner = runCommand, apiBase = "https://api.github.com"): Promise<GhAuth> {
+  const host = loginHost(apiBase);
+  const names = host === "github.com" ? (["GH_TOKEN", "GITHUB_TOKEN"] as const) : (["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"] as const);
+  for (const name of names) {
     const value = env[name]?.trim();
     if (value) return { kind: "ok", token: value, source: "env" };
   }
-  const result = await run("gh", ["auth", "token", "--hostname", "github.com"]);
+  const result = await run("gh", ["auth", "token", "--hostname", host]);
   if (result.errorCode === "ENOENT") return { kind: "not_installed" };
   const token = result.stdout.trim();
   if (result.code !== 0 || !token) return { kind: "signed_out" };
@@ -144,9 +160,22 @@ const TOKEN_TTL_MS = 5 * 60_000;
 
 type Fetch = typeof fetch;
 
+/** How long a session waits for another session's request to the same path before asking GitHub itself. */
+const LEASE_WAIT_MS = 3000;
+
+export interface ClientOptions {
+  /** The machine-wide store several sessions share their reads through (shared.ts); none: ask GitHub every time. */
+  readonly shared?: SharedStore | null;
+  /** Test seam for the store's clock. */
+  readonly now?: () => number;
+}
+
 export class GitHubClient {
-  /** `x-ratelimit-remaining` from the last answer, or null before the first. */
-  rateRemaining: number | null = null;
+  /**
+   * How old a stored answer may be and still be used instead of asking GitHub, when a shared store is set. The
+   * poller sets it to its own interval, so a path is asked at most once per interval on the whole machine.
+   */
+  freshMs = 0;
   /**
    * The token's OAuth scopes from the last answer's `x-oauth-scopes`, or null when GitHub sent none
    * (a fine-grained token, or before the first answer). A classic token without `repo` cannot see a
@@ -154,29 +183,47 @@ export class GitHubClient {
    */
   scopes: string[] | null = null;
   /** Answers since start, for the event log's heartbeat: 200s, 304s (free) and anything else. */
-  readonly requests = { ok: 0, not_modified: 0, other: 0 };
-  private readonly cache = new Map<string, { etag: string; body: unknown }>();
+  readonly requests = { ok: 0, not_modified: 0, other: 0, shared: 0 };
+  private readonly cache = new Map<string, { etag: string; value: unknown }>();
+  private readonly shared: SharedStore | null;
+  private readonly now: () => number;
+  private store: LoginStore | null = null;
+  private ownRate: { remaining: number; at: number } | null = null;
   private auth: { value: GhAuth; at: number } | null = null;
   private readonly base: string;
   private readonly readAuth: () => Promise<GhAuth>;
   private readonly fetchImpl: Fetch;
 
-  constructor(base: string, readAuth: () => Promise<GhAuth>, fetchImpl: Fetch = fetch) {
+  constructor(base: string, readAuth: () => Promise<GhAuth>, fetchImpl: Fetch = fetch, options: ClientOptions = {}) {
     this.base = base.replace(/\/+$/, "");
     this.readAuth = readAuth;
     this.fetchImpl = fetchImpl;
+    this.shared = options.shared ?? null;
+    this.now = options.now ?? Date.now;
+  }
+
+  /**
+   * `x-ratelimit-remaining` from the newest answer any session on this machine got for this login (this one's
+   * own without a shared store), or null before the first: the backoff is one for the whole machine.
+   */
+  get rateRemaining(): number | null {
+    const other = this.store?.readRate() ?? null;
+    const newest = other && (!this.ownRate || other.at >= this.ownRate.at) ? other : this.ownRate;
+    return newest ? newest.remaining : null;
   }
 
   /** The login as it stands now: read again when older than five minutes, or when `fresh`. */
   async login(fresh = false): Promise<GhAuth> {
     if (fresh || !this.auth || this.auth.value.kind !== "ok" || Date.now() - this.auth.at > TOKEN_TTL_MS) {
       this.auth = { value: await this.readAuth(), at: Date.now() };
+      const a = this.auth.value;
+      this.store = a.kind === "ok" && this.shared ? this.shared.forLogin(this.base, a.token) : null;
     }
     return this.auth.value;
   }
 
   getPull(repo: string, pr: number): Promise<ApiResult<PullInfo>> {
-    return this.get(`/repos/${repo}/pulls/${pr}`, (j) => {
+    return this.get(`/repos/${repo}/pulls/${pr}`, this.freshMs, (j) => {
       const p = (j ?? {}) as GhPullJson;
       return {
         number: Number(p.number),
@@ -199,7 +246,7 @@ export class GitHubClient {
   findOpenPull(repo: string, branch: string): Promise<ApiResult<number | null>> {
     const owner = repo.split("/")[0];
     const q = new URLSearchParams({ head: `${owner}:${branch}`, state: "open", per_page: "5" });
-    return this.get(`/repos/${repo}/pulls?${q}`, (j) => {
+    return this.get(`/repos/${repo}/pulls?${q}`, this.freshMs, (j) => {
       const first = Array.isArray(j) ? (j[0] as { number?: unknown } | undefined) : undefined;
       return first && Number.isInteger(first.number) ? (first.number as number) : null;
     });
@@ -207,7 +254,7 @@ export class GitHubClient {
 
   runsForSha(repo: string, sha: string): Promise<ApiResult<RunInfo[]>> {
     const q = new URLSearchParams({ head_sha: sha, per_page: "100" });
-    return this.get(`/repos/${repo}/actions/runs?${q}`, (j) => {
+    return this.get(`/repos/${repo}/actions/runs?${q}`, this.freshMs, (j) => {
       const runs = ((j as { workflow_runs?: unknown }).workflow_runs ?? []) as GhRunJson[];
       return runs.map((r) => ({
         id: Number(r.id),
@@ -223,9 +270,9 @@ export class GitHubClient {
   }
 
   /** The latest push runs on a branch: the base branch's health (rules.mjs `baseVerdict`). */
-  baseRuns(repo: string, branch: string): Promise<ApiResult<BaseRunInfo[]>> {
+  baseRuns(repo: string, branch: string, freshMs = this.freshMs): Promise<ApiResult<BaseRunInfo[]>> {
     const q = new URLSearchParams({ branch, event: "push", per_page: "30" });
-    return this.get(`/repos/${repo}/actions/runs?${q}`, (j) => {
+    return this.get(`/repos/${repo}/actions/runs?${q}`, freshMs, (j) => {
       const runs = ((j as { workflow_runs?: unknown }).workflow_runs ?? []) as GhRunJson[];
       return runs.map((r) => ({
         id: Number(r.id),
@@ -239,16 +286,59 @@ export class GitHubClient {
   }
 
   failedJobs(repo: string, runId: number): Promise<ApiResult<string[]>> {
-    return this.get(`/repos/${repo}/actions/runs/${runId}/jobs?per_page=100`, (j) => {
+    return this.get(`/repos/${repo}/actions/runs/${runId}/jobs?per_page=100`, this.freshMs, (j) => {
       const jobs = ((j as { jobs?: unknown }).jobs ?? []) as { name?: unknown; conclusion?: unknown }[];
       return jobs.filter((x) => typeof x.conclusion === "string" && FAILED_JOB.has(x.conclusion)).map((x) => String(x.name));
     });
   }
 
-  private async get<T>(path: string, map: (json: unknown) => T): Promise<ApiResult<T>> {
-    let auth = await this.login();
+  /**
+   * One GET. With a shared store and a freshness window: a stored answer young enough is used as it is (no
+   * request); otherwise this session takes the path's lease, or waits briefly for the session that holds it,
+   * and asks GitHub with the newest ETag any session stored. Without a store: every call asks GitHub.
+   */
+  private async get<T>(path: string, freshMs: number, map: (json: unknown) => T): Promise<ApiResult<T>> {
+    const auth = await this.login();
     if (auth.kind !== "ok") return { kind: "auth", auth };
-    let res = await this.request(path, auth.token);
+    const store = freshMs > 0 ? this.store : null;
+    if (!store) return this.ask(path, auth, map, null, null);
+    const usable = (): Stored<T> | null => {
+      const s = store.read<T>(path);
+      return s && this.now() - s.at < freshMs ? s : null;
+    };
+    let hit = usable();
+    let release = hit ? null : store.lease(path, this.now());
+    const waitUntil = Date.now() + LEASE_WAIT_MS;
+    while (!hit && !release && Date.now() < waitUntil) {
+      await new Promise((r) => setTimeout(r, 50));
+      hit = usable();
+      if (!hit) release = store.lease(path, this.now());
+    }
+    if (!hit && release) hit = usable(); // answered while this session was taking the lease
+    if (hit) {
+      release?.();
+      this.requests.shared++;
+      return { kind: "ok", value: hit.value };
+    }
+    try {
+      return await this.ask(path, auth, map, store, store.read<T>(path));
+    } finally {
+      release?.();
+    }
+  }
+
+  private async ask<T>(
+    path: string,
+    first: Extract<GhAuth, { kind: "ok" }>,
+    map: (json: unknown) => T,
+    store: LoginStore | null,
+    stored: Stored<T> | null,
+  ): Promise<ApiResult<T>> {
+    let auth = first;
+    // The newest ETag on this machine, with the value it stands for: another session's when it is newer.
+    const own = this.cache.get(path) as { etag: string; value: T } | undefined;
+    const known = stored ? { etag: stored.etag, value: stored.value } : own;
+    let res = await this.request(path, auth.token, known?.etag);
     if ("kind" in res) return res;
     if (res.status === 401) {
       await res.body?.cancel();
@@ -256,23 +346,25 @@ export class GitHubClient {
       if (fresh.kind !== "ok") return { kind: "auth", auth: fresh };
       if (fresh.token === auth.token) return { kind: "auth", auth: { kind: "signed_out" } };
       auth = fresh;
-      res = await this.request(path, auth.token);
-      if ("kind" in res) return res;
-      if (res.status === 401) {
-        await res.body?.cancel();
-        return { kind: "auth", auth: { kind: "signed_out" } };
-      }
+      return this.ask(path, auth, map, this.store, null);
     }
+    const now = this.now();
     if (res.status === 200) this.requests.ok++;
     else if (res.status === 304) this.requests.not_modified++;
     else this.requests.other++;
     const scopeHeader = res.headers.get("x-oauth-scopes");
     this.scopes = scopeHeader === null ? null : scopeHeader.split(",").map((x) => x.trim()).filter(Boolean);
     const remaining = Number(res.headers.get("x-ratelimit-remaining"));
-    if (res.headers.has("x-ratelimit-remaining") && Number.isFinite(remaining)) this.rateRemaining = remaining;
+    if (res.headers.has("x-ratelimit-remaining") && Number.isFinite(remaining)) {
+      this.ownRate = { remaining, at: now };
+      store?.writeRate(remaining, now);
+    }
 
-    const cached = this.cache.get(path);
-    if (res.status === 304 && cached) return { kind: "ok", value: map(cached.body) };
+    if (res.status === 304 && known) {
+      await res.body?.cancel().catch(() => undefined);
+      store?.write({ path, etag: known.etag, value: known.value, at: now });
+      return { kind: "ok", value: known.value };
+    }
     if (res.status === 403 || res.status === 429) {
       const wait = rateLimitWait(res.headers) ?? (await secondaryLimitWait(res));
       await res.body?.cancel().catch(() => undefined);
@@ -293,19 +385,22 @@ export class GitHubClient {
     } catch {
       return { kind: "retry", reason: "GitHub answered something that is not JSON" };
     }
+    const value = map(body);
     const etag = res.headers.get("etag");
-    if (etag) this.cache.set(path, { etag, body });
-    return { kind: "ok", value: map(body) };
+    if (etag) {
+      this.cache.set(path, { etag, value });
+      store?.write({ path, etag, value, at: now });
+    }
+    return { kind: "ok", value };
   }
 
-  private async request(path: string, token: string): Promise<Response | { kind: "retry"; reason: string }> {
+  private async request(path: string, token: string, etag: string | undefined): Promise<Response | { kind: "retry"; reason: string }> {
     const headers: Record<string, string> = {
       authorization: `Bearer ${token}`,
       accept: "application/vnd.github+json",
       "x-github-api-version": "2022-11-28",
       "user-agent": "runners-io-claude-channel",
     };
-    const etag = this.cache.get(path)?.etag;
     if (etag) headers["if-none-match"] = etag;
     try {
       return await this.fetchImpl(`${this.base}${path}`, { headers, signal: AbortSignal.timeout(20_000), redirect: "error" });

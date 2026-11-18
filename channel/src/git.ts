@@ -58,8 +58,8 @@ export async function readGitScope(dir: string): Promise<GitScope> {
  * `pr.head_moved`: someone (another person, another session, another worktree) pushed it.
  *
  * Not "is the commit anywhere in this repository": git worktrees share one object store, so a commit made in
- * another worktree of the same clone is already present here. That is how the first rule missed a push on
- * 2026-11-18. null when this is not a work tree or the sha is not a sha.
+ * another worktree of the same clone is already present here, and an "is it present" rule misses that push.
+ * null when this is not a work tree or the sha is not a sha.
  */
 export async function inOwnHistory(dir: string, sha: string): Promise<boolean | null> {
   if (!/^[0-9a-f]{40}$/.test(sha)) return null;

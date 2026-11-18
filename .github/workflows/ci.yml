@@ -1,7 +1,7 @@
 name: ci
 
-# The plugin's checks, on the copy a user installs from. It runs on runners.io's own runners, and needs no secrets,
-# so a pull request from a fork runs it the same way.
+# The plugin's checks, on the copy a user installs from. A GitHub-hosted runner, never one of our own: this is a
+# public repository, so a pull request from a fork can change what this file runs. It needs no secrets.
 on:
   push:
     branches: [main]
@@ -18,7 +18,7 @@ concurrency:
 jobs:
   check:
     name: manifest, bundle and tests
-    runs-on: runnersio-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

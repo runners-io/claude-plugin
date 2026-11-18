@@ -168,7 +168,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       if (known && Date.now() - known.readAt < baseEveryMs) continue;
       const first = entries[0];
       const base = first.last?.baseRef as string;
-      const r = await gh.baseRuns(first.repo, base);
+      const r = await gh.baseRuns(first.repo, base, baseEveryMs);
       if (r.kind !== "ok") {
         if (r.kind === "retry") events.write("api_error", { repo: first.repo, base, result: "retry", reason: r.reason });
         continue;
@@ -186,6 +186,10 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
 
   while (!signal.aborted) {
     let waitMs = config.pollSeconds * 1000;
+    const belowFloor = () => gh.rateRemaining !== null && gh.rateRemaining < config.rateFloor;
+    // With other sessions on this machine (shared.ts), an answer younger than one interval is read from the
+    // shared store instead of asking GitHub again, so N sessions cost what one does.
+    gh.freshMs = belowFloor() ? waitMs * 4 : waitMs;
     const auth = await gh.login();
     if (auth.kind !== "ok") {
       await problem(auth);
@@ -314,7 +318,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       });
     }
 
-    if (gh.rateRemaining !== null && gh.rateRemaining < config.rateFloor) waitMs *= 4;
+    if (belowFloor()) waitMs *= 4; // the newest reading, this pass's answers included
     await sleep(waitMs, signal);
   }
 }

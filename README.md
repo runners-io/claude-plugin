@@ -168,8 +168,10 @@ in memory, and never writes it to a file or a log.
 
 **Your GitHub token.** The channel asks `gh auth token` for it when it starts, and again every few minutes, or reads
 `GH_TOKEN` / `GITHUB_TOKEN` if you set one. It keeps it in memory only. It sends it in one place: the
-`Authorization` header of its requests to `https://api.github.com` (or the https address in `RUNNERS_IO_GITHUB_API`,
-for GitHub Enterprise). It never writes it to disk, never puts it on a command line, and never prints or logs it: every
+`Authorization` header of its requests to `https://api.github.com`. For GitHub Enterprise Server, set
+`RUNNERS_IO_GITHUB_API` to your server's https API address: the channel then reads that server's own login
+(`GH_ENTERPRISE_TOKEN`, or `gh auth token --hostname <your server>`), never your github.com token, so a token only
+ever goes to the host it belongs to. It never writes it to disk, never puts it on a command line, and never prints or logs it: every
 line of the event log and of the channel's own log goes through a redaction of GitHub token shapes and bearer
 headers first, which `channel/test/secrets.test.ts` and `channel/test/eventlog.test.ts` check. The events sent to
 Claude are built from named fields of GitHub's answers and never include it.
@@ -234,7 +236,7 @@ The script exits 0 when it finds nothing, 1 on a miss, a gap or an error, and 2 
   for it.
 - **"blocked by org policy".** Your organisation has not turned channels on; see Team and Enterprise above.
 - **The channel connects but never registers.** The channel answers on MCP protocol revision 2025-11-25 or earlier,
-  because Claude Code does not register a channel on 2026-07-28. If your Claude Code still does not register it, set
+  because Claude Code does not register a channel that answers with revision 2026-07-28. If your Claude Code still does not register it, set
   `MCP_PROTOCOL_NEGOTIATION=legacy` in the environment you start Claude Code from.
 
 ## Development

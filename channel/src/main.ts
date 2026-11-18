@@ -9,6 +9,7 @@
  * runners.io. Bundled to one file (dist/runners-io-channel.mjs) for Node 20
  * or later, so the plugin installs nothing at run time.
  */
+import { SharedStore, defaultSharedRoot } from "./shared.ts";
 import { loadConfig } from "./config.ts";
 import { inOwnHistory, readGitScope } from "./git.ts";
 import { GitHubClient, readGhAuth } from "./github.ts";
@@ -35,7 +36,9 @@ export const INSTRUCTIONS = [
 
 function serve(): void {
   const config = loadConfig();
-  const gh = new GitHubClient(config.githubApi, () => readGhAuth());
+  const gh = new GitHubClient(config.githubApi, () => readGhAuth(process.env, undefined, config.githubApi), fetch, {
+    shared: new SharedStore(defaultSharedRoot()),
+  });
   const subs = new Subscriptions();
   const readScope = () => readGitScope(config.projectDir);
   const stop = new AbortController();
@@ -88,7 +91,7 @@ function serve(): void {
 
 async function status(): Promise<void> {
   const config = loadConfig();
-  const auth = await readGhAuth();
+  const auth = await readGhAuth(process.env, undefined, config.githubApi);
   const scope = await readGitScope(config.projectDir);
   const login =
     auth.kind === "ok"
