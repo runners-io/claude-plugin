@@ -63,6 +63,7 @@ export async function fetchSnapshot(gh: GitHubClient, repo: string, pr: number, 
       ...(p.closedAt ? { closedAt: p.closedAt } : {}),
       ...(p.createdAt ? { createdAt: p.createdAt } : {}),
       ...(p.author ? { author: p.author } : {}),
+      ...(p.headRepo ? { headRepo: p.headRepo } : {}),
       ...(p.updatedAt ? { updatedAt: p.updatedAt } : {}),
       ...(p.baseRef ? { baseRef: p.baseRef } : {}),
       ...(p.draft !== undefined ? { draft: p.draft } : {}),
@@ -274,7 +275,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       if (!live?.last) continue;
       const { changes, keep } = reviewChanges(seen?.state ?? null, r.value, live.last);
       reviews.set(entry.key, { state: keep, next: now() + reviewEveryMs * p.stretch });
-      for (const change of changes) await send(toMessage(change), change, wants(live, change.kind));
+      for (const change of changes) await send(await message(change), change, wants(live, change.kind));
     }
   };
 
@@ -303,7 +304,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
           const a = await gh.jobAnnotations(entry.repo, change.job.id);
           if (a.kind === "ok") full = { ...change, job: { ...change.job, annotations: a.value } };
         }
-        await send(toMessage(full), full, wants(entry, change.kind));
+        await send(await message(full), full, wants(entry, change.kind));
       }
     }
     // No run left to read: the baseline is "nothing", so a later run's first failure is news. A read that failed
@@ -377,7 +378,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       if (!about?.last) continue;
       const prs = [...new Set((wanting.length ? wanting : seen).map((e) => e.pr))].sort((a, b) => a - b);
       const change: Change = { kind, snapshot: about.last, failing: v.failing, prs, ...(v.at ? { at: v.at } : {}) };
-      await send(toMessage(change), change, wanting.length > 0);
+      await send(await message(change), change, wanting.length > 0);
     }
   };
 
@@ -550,17 +551,17 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       for (let change of changes) {
         if (change.kind === "ci.workflow_started") {
           if (startedAlready || change !== starts[0]) {
-            await send(toMessage(change), change, false, "collapsed");
+            await send(await message(change), change, false, "collapsed");
             continue;
           }
           change = { ...change, workflows: starts.length };
         }
         if (!wants(live, change.kind)) {
-          await send(toMessage(change), change, false);
+          await send(await message(change), change, false);
           continue;
         }
         const full = await withFailedJobs(gh, change);
-        await send(toMessage(full), full);
+        await send(await message(full), full);
       }
       if (snap.state === "open") await checkJobs(live, snap);
       if (first && live.source === "auto" && needsAttention(snap)) await send(currentState(snap), null);
@@ -605,6 +606,16 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       left -= piece;
       if (left > 0 && !signal.aborted) beat(left);
     }
+  }
+
+  /**
+   * The message for a change. A failure's wording depends on whose PR it is (format.ts `notYours`), so for the two
+   * failure kinds the signed-in login is looked up; the client caches it for hours, so this costs a request a session.
+   */
+  async function message(change: Change): Promise<ChannelMessage> {
+    if (change.kind !== "ci.workflow_failed" && change.kind !== "ci.job_failed") return toMessage(change);
+    const me = await gh.viewerLogin();
+    return toMessage(change, me.kind === "ok" ? me.value : null);
   }
 
   function beat(waitingMs?: number): void {

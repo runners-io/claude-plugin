@@ -129,7 +129,7 @@ test("the messages carry logins, kinds, file:line and links, never a review's or
     latestOpinionatedReviews: { nodes: [review("2", "CHANGES_REQUESTED", person("eve<script>", "NONE"))] },
     reviewThreads: { totalCount: 1, nodes: [thread("11", false, bot("coderabbitai"))] },
   });
-  const messages = reviewChanges(before, after, snap).changes.map(toMessage);
+  const messages = reviewChanges(before, after, snap).changes.map((c) => toMessage(c));
   const kinds = messages.map((m) => m.meta.kind);
   assert.deepEqual(kinds, ["pr.changes_requested", "pr.review_thread_added", "pr.ready_to_merge"]);
   for (const m of messages) {

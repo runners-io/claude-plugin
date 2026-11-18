@@ -60,8 +60,10 @@ export interface Snapshot {
   readonly closedAt?: string;
   /** When the PR was opened (GitHub's time); read only to screen a PR the hook handed over. */
   readonly createdAt?: string;
-  /** Who opened it; read only to screen a PR the hook handed over. */
+  /** Who opened it: screens a PR the hook handed over, and decides a failure's wording (format.ts `notYours`). */
   readonly author?: string;
+  /** The head branch's repository: another repository than `repo` is a fork, whose CI logs a stranger can write. */
+  readonly headRepo?: string;
   /** When GitHub last changed the PR, for the latency of a label, draft or body change. */
   readonly updatedAt?: string;
   readonly baseRef?: string;

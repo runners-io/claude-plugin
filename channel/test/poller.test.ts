@@ -124,6 +124,39 @@ test("off means no automatic subscription", async () => {
   }
 });
 
+test("a fork PR's failure reaches Claude as tell the user, not as read the log", async () => {
+  const t = await setup();
+  try {
+    // As on GitHub: a fork PR's runs live in the base repository and name the fork as their head repository.
+    const fork = { full_name: "stranger/widgets" };
+    t.gh.setPull("acme/widgets", 7, { head: { repo: fork } });
+    t.gh.setRuns("acme/widgets", SHA, [{ id: 41, name: "CI", status: "queued", head_repository: fork }]);
+    await until("baseline", () => t.subs.list()[0]?.last !== null && t.subs.list().length === 1);
+    t.gh.setJobs(41, [{ name: "unit tests", conclusion: "failure" }]);
+    t.gh.setRuns("acme/widgets", SHA, [{ id: 41, name: "CI", status: "completed", conclusion: "failure", head_repository: fork }]);
+    await until("the failure", () => t.kinds().includes("ci.workflow_failed"));
+    const m = t.messages.find((x) => x.meta.kind === "ci.workflow_failed");
+    assert.match(m?.content ?? "", /Tell the user\. .*comes from a fork.*only if the user asks/);
+    assert.ok(!(m?.content ?? "").includes("before changing anything"), m?.content);
+  } finally {
+    await t.stop();
+  }
+});
+
+test("the user's own PR's failure still says to read the log first", async () => {
+  const t = await setup();
+  try {
+    await until("baseline", () => t.subs.list()[0]?.last !== null && t.subs.list().length === 1);
+    t.gh.setJobs(41, [{ name: "unit tests", conclusion: "failure" }]);
+    t.gh.setRuns("acme/widgets", SHA, [{ id: 41, name: "CI", status: "completed", conclusion: "failure" }]);
+    await until("the failure", () => t.kinds().includes("ci.workflow_failed"));
+    const m = t.messages.find((x) => x.meta.kind === "ci.workflow_failed");
+    assert.match(m?.content ?? "", /Read the failed job's log .*before changing anything\./);
+  } finally {
+    await t.stop();
+  }
+});
+
 test("after the quiet baseline, each change is pushed once, with the failed jobs named", async () => {
   const t = await setup();
   try {
@@ -577,7 +610,9 @@ test("each rate_backoff record says why: low, recovered, or reset", async () => 
     t.gh.setRate(4000, 5000);
     await until("recovered", () => backoffs().length === 2);
     assert.deepEqual([backoffs()[1].level, backoffs()[1].reason, backoffs()[1].remaining], ["normal", "recovered", 4000]);
-    t.gh.setRate(1200, 5000, Math.floor(Date.now() / 1000) + 1);
+    // The reset must be clearly ahead. At floor(now) + 1 it was under a second away, and on a slow runner it had
+    // already passed when the poller read it, so the quota counted as reset, never as slowed again.
+    t.gh.setRate(1200, 5000, Math.floor(Date.now() / 1000) + 60);
     await until("slowed again", () => backoffs().length === 3);
     t.gh.setRate(1200, 5000, Math.floor(Date.now() / 1000) - 60);
     await until("reset", () => backoffs().length === 4, 5000);
@@ -799,6 +834,11 @@ test("a subscription that asked for no job event, or a run that has finished, co
     await until("the PR read", () => t.subs.get("acme/widgets", 7)?.last != null);
     await settle();
     t.gh.setRuns("acme/widgets", SHA, [{ id: 41, name: "CI", status: "completed", conclusion: "success" }]);
+    // Widen only once the poller has seen the run finish. Widened at once, a pass already in flight still holds the
+    // in-progress run, sees an entry that now wants job events, and reads the jobs: a race on a slow runner, not the
+    // behaviour this test is about (a finished run costs no jobs read).
+    await until("the finished run seen", () => t.subs.get("acme/widgets", 7)?.last?.runs.every((r) => r.status === "completed") === true);
+    await settle();
     t.subs.add({ repo: "acme/widgets", pr: 7, source: "tool" });
     await settle();
     await settle();
