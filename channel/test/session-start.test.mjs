@@ -60,8 +60,8 @@ test("run as Claude Code runs it, it exits 0 and prints JSON or nothing, whateve
   }
 });
 
-// ---- the claude-gh offer: asked at every launch while claude-gh is missing, whatever the
-// user answered before; silent once it exists, and never in a headless run.
+// ---- the claude-gh offer: made while claude-gh is missing, except for 7 days after a no (claude-gh.mjs
+// decline); silent once it exists, and never in a headless run.
 
 const ROOT = "/Users/me/.claude/plugins/cache/runners-io/runners-io/0.2.0";
 
@@ -73,6 +73,14 @@ test("channel on and no claude-gh: Claude is asked to offer it once in this sess
   assert.match(ctx, /setup-github/);
   assert.match(ctx, /once in this session/i);
   assert.match(ctx, /no/i);
+});
+
+test("a no is recorded by a command the offer names, and the user is told it will be asked again in a week", () => {
+  const ctx = noticeFor(input(), { state: "on" }, ROOT, { claudeGh: false }).hookSpecificOutput.additionalContext;
+  assert.ok(ctx.includes(`node ${ROOT}/skills/setup-github/claude-gh.mjs decline`), ctx);
+  assert.match(ctx, /7 days/);
+  const spaced = noticeFor(input(), { state: "on" }, "/a path/plugin", { claudeGh: false }).hookSpecificOutput.additionalContext;
+  assert.ok(spaced.includes("node '/a path/plugin/skills/setup-github/claude-gh.mjs' decline"), "the path is one shell word");
 });
 
 test("claude-gh already exists, or whether it does cannot be told: no offer", () => {

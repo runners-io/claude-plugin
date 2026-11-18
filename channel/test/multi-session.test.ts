@@ -41,6 +41,8 @@ async function run(sessions: number, rounds: number) {
   fakes.push(gh);
   gh.setPull("octo-org/example", 7, { head: { ref: "feat", sha: SHA }, base: { ref: "main" } });
   gh.setRuns("octo-org/example", SHA, [{ id: 41, name: "CI", status: "in_progress" }]);
+  // The review read (GraphQL) is shared too: an answer any session got in the last minute is used as it is.
+  gh.setReviewPull("octo-org/example", 7, { headRefOid: SHA, mergeStateStatus: "BLOCKED", reviewDecision: null, latestOpinionatedReviews: { nodes: [] }, reviewThreads: { nodes: [] } });
   const root = mkdtempSync(join(tmpdir(), "rio-multi-"));
   let t = 1_700_000_000_000;
   let asleep = 0;
@@ -85,7 +87,7 @@ async function run(sessions: number, rounds: number) {
   stop.abort();
   wake();
   await Promise.all(done);
-  return { requests: gh.requests.length, inboxes };
+  return { requests: gh.requests.length, graphql: gh.requests.filter((r) => r.path === "/graphql").length, inboxes };
 }
 
 test("one, three and six sessions watching the same PR cost GitHub the same requests, and every session gets the failure", async () => {
@@ -95,6 +97,8 @@ test("one, three and six sessions watching the same PR cost GitHub the same requ
   assert.ok(one.requests > 0);
   if (process.env.SHOW_COUNTS) console.log(`requests: 1 session ${one.requests}, 3 sessions ${three.requests}, 6 sessions ${six.requests}`);
   assert.deepEqual([one.requests, three.requests, six.requests], [one.requests, one.requests, one.requests]);
+  assert.ok(one.graphql >= 2, `the review read ran (${one.graphql})`);
+  assert.deepEqual([three.graphql, six.graphql], [one.graphql, one.graphql], "and is shared");
   for (const { inboxes } of [one, three, six]) {
     for (const inbox of inboxes) {
       assert.ok(

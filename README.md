@@ -12,8 +12,8 @@ The plugin bundles four things:
   [research preview](https://code.claude.com/docs/en/channels.md#research-preview), and this channel is in research
   preview too.
 - **Tools to choose what to watch**, per session: `subscribe`, `unsubscribe`, `list_subscriptions` and `ci_status`.
-- **A hook** that, when Claude opens a pull request (`gh pr create`, or a GitHub MCP server's `create_pull_request`),
-  prompts it to subscribe to that pull request.
+- **A hook** that watches a pull request just opened in your session's own repository, by your GitHub login, whether
+  Claude or a script opened it. A pull request anywhere else is never watched without Claude subscribing to it.
 - **The runners.io MCP server** (`https://mcp.runners.io/mcp`), for runners.io customers: tools to read your jobs, logs,
   test results, cache and spend.
 
@@ -34,6 +34,27 @@ claude plugin install runners-io@runners-io
 
 Or from inside a session: `/plugin marketplace add runners-io/claude-plugin`, then `/plugin install runners-io@runners-io`.
 
+### Pinned install
+
+The commands above follow `main`. Every release has a new version and a tag of its own (`v0.2.1` is this one), so you
+can install exactly the release you have read instead: add `#` and the tag to the marketplace source.
+
+```bash
+claude plugin marketplace add runners-io/claude-plugin#v0.2.1
+claude plugin install runners-io@runners-io
+```
+
+A tag does not move, so updating that marketplace never takes you past the release you chose. To move to a newer
+release, run `claude plugin marketplace remove runners-io` (which uninstalls the plugin), then the two commands above
+with the newer tag. `claude plugin list` shows the version you have. To install from a copy you have checked out and
+read yourself:
+
+```bash
+git clone --branch v0.2.1 --depth 1 https://github.com/runners-io/claude-plugin.git
+claude plugin marketplace add ./claude-plugin
+claude plugin install runners-io@runners-io
+```
+
 runners.io customers sign the MCP server in the first time they use it: run `/mcp`, choose `runners-io-mcp`, and
 approve on runners.io. The channel does not need this.
 
@@ -52,11 +73,14 @@ yet.** Until it is, start with the development flag instead:
 claude --dangerously-load-development-channels plugin:runners-io@runners-io
 ```
 
-Claude Code shows a warning first. Choose **I am using this for local development** to continue. Neither flag
-appears in `claude --help` during the preview, and both work anyway.
+Claude Code shows a warning first. Choose **I am using this for local development** to continue, because that is
+how Claude Code asks you to accept a channel it has not reviewed; read what that means under
+[What the development-channels flag allows](#security) first. Neither flag appears in `claude --help` during the
+preview, and both work anyway.
 
-**A shorter command: `claude-gh`.** While you have no `claude-gh`, Claude offers to set it up at the start of each
-session; say yes, or run `/runners-io:setup-github` yourself. After asking you, it adds a separate
+**A shorter command: `claude-gh`.** While you have no `claude-gh`, Claude offers to set it up at the start of a
+session; say yes, or run `/runners-io:setup-github` yourself. Say no and it is not offered again for 7 days (the time
+of the no is kept in `~/.local/state/runners-io`, or `$XDG_STATE_HOME/runners-io`). After asking you, it adds a separate
 `claude-gh` command to your shell's rc file (zsh, bash or fish), between `# >>> runners.io claude channel >>>` and
 `# <<< runners.io claude channel <<<` markers, so it can be taken out exactly. `claude` itself is unchanged. Then
 `claude-gh` starts a session with the channel on, and `claude-gh --resume <session id>` reopens one with it on. Until
@@ -95,6 +119,17 @@ use. Pro, Max and Ultra accounts outside an organisation skip both settings.
 **Automatically:** the pull request for the branch your session's folder is on. The channel reads the repository from
 `git remote get-url origin` and the branch from `git branch --show-current`, and follows you when you switch branch.
 Turn this off with the channel's `auto_subscribe` option (`pr` or `off`) in `/config`, or when the plugin is enabled.
+`off` also turns off the hook's watching (below).
+
+### Review requests (off by default)
+
+With the channel's `review_requests` option set to `on`, the session hears `review.requested` when somebody asks your
+GitHub login, or one of its teams, to review a pull request, including one the session is not watching. Meta:
+`repo`, `pr`, `requester`, `requester_type` (`bot` or `user`), `reviewer` (your login, or `org/team`) and `url`; never
+the title. It is one GraphQL search (`is:pr is:open review-requested:@me`, the 30 most recently updated) every 3
+minutes, 1 point of GraphQL's own budget, shared by every session on the machine. Each request is sent once (asked
+again is a new request), and a request made before the session first looked is never sent. Every session with the
+option on hears every request, which is why it is off by default.
 
 **By Claude, per session**, with the channel's tools:
 
@@ -108,8 +143,13 @@ Turn this off with the channel's `auto_subscribe` option (`pr` or `off`) in `/co
 Subscriptions live in the channel's process, so each session has its own, and they end with the session. A merged or
 closed pull request ends its own subscription.
 
-**When Claude opens a pull request**, the plugin's hook prompts it to subscribe. That matters when the pull request is
-opened from another worktree or repository, which the automatic watch cannot see. Claude Code asks before the first
+**A pull request just opened in this repository** is watched without a subscribe call when a tool's output names it,
+whether Claude ran `gh pr create` or a script opened it, but only when all of these hold: it is in the repository your
+session's folder belongs to; GitHub says your login opened it, minutes ago; the channel is on; and `auto_subscribe` is
+not `off`. A pull request URL in a log, a README or a comment is text anyone can write, so nothing else is watched
+this way. The hook adds at most 5 pull requests, and a session watches at most 20 in all; past a budget of events for
+one pull request in 10 minutes, the channel says so once and holds back the rest. **For any other pull request**
+Claude opens (another repository, or with the channel off), the hook asks Claude to subscribe, and Claude chooses. Claude Code asks before the first
 `subscribe` call like any tool; to allow the channel's tools without asking, add this to your settings:
 
 ```json
@@ -136,11 +176,22 @@ CI failed: "CI" on PR #123 (fix-login @ 3f2a9c1), failed jobs: lint, test-unit. 
 | `pr.merged`, `pr.closed` | the pull request is merged or closed; the channel stops watching it |
 | `ci.current_state` | once, when the automatic watch starts on a pull request that is already failing, waiting or conflicted |
 | `ci.flaky` | a re-run of the same commit passed after its previous attempt failed |
+| `ci.job_failed` | a job failed while its run is still going, minutes before `ci.workflow_failed`: `job`, `job_id`, and `annotations` as `path:line (level)` (never an annotation's message, which is build output) |
+| `ci.job_stuck_queued` | a job has waited 5 minutes for a runner: `job`, `labels` (the `runs-on` labels it asks for) and `queued_seconds`. A job waiting for an environment's approval is `ci.approval_waiting` instead |
 | `pr.head_moved` | the branch on GitHub moved to a commit that is not this session's own (not its HEAD or behind it): a person, another session or worktree, or a merge queue pushed or force-pushed it (only for the session's own repository) |
 | `pr.labels_changed` | labels were added or removed (the names are sent, cleaned) |
 | `pr.ready_for_review`, `pr.converted_to_draft` | the pull request left or entered draft |
 | `pr.body_edited` | the description changed; only the fact is sent, never the text |
 | `base.red`, `base.green` | the base branch's latest push runs turned red, or green again: one event per base, naming every watched pull request on it in `prs`; read once a minute while one of them is busy, every 10 minutes otherwise |
+| `pr.approved`, `pr.changes_requested` | a reviewer's new review approves or requests changes: `reviewer`, `author_type` (`bot`, `member` or `outside`), `review_decision` |
+| `pr.review_thread_added`, `pr.review_thread_resolved` | a review thread was opened, or resolved: who opened it and their `author_type`, `path`, `line`, its link, and the count of `unresolved` threads |
+| `pr.ready_to_merge` | GitHub says the pull request can merge (`merge_state` `CLEAN` or `HAS_HOOKS`: every required check passed, the review rules are met, no conflict); once per head commit |
+
+The review events come from one GraphQL query per watched open pull request, about once a minute. It costs 1 point of
+GraphQL's own hourly budget, which is separate from the REST budget the CI reads use: about 60 points an hour per
+pull request, shared by every session on the machine. The text of a review or a comment is never sent: only who, where
+and a link, so Claude reads it itself with `gh`, as information. A subscription that asks for none of these kinds
+costs no GraphQL read. GraphQL's budget backs off the same way as REST's (below), on its own reading.
 
 How often the channel looks at a watched pull request depends on what it is doing:
 
@@ -152,16 +203,35 @@ How often the channel looks at a watched pull request depends on what it is doin
 
 So a push to a settled pull request is seen within 5 minutes, and from then on every 20 seconds until its CI finishes.
 A quiet pull request costs about 24 GitHub requests an hour. The channel sends GitHub the previous answer's ETag, and
-GitHub does not count an unchanged answer against your hourly API limit. When fewer than 200 requests are left in the
-hour, it looks four times less often.
+GitHub does not count an unchanged answer against your hourly API limit.
+
+When your hourly limit runs low (the newest reading any session on this machine got), the channel backs off:
+
+| left of the hour's limit | what changes |
+|---|---|
+| more than 20% | nothing |
+| below 20% | every interval above is longer in proportion: a third longer at 15%, twice as long at 10%, up to eight times |
+| 10% or less | also paused: finished pull requests, the base branch and the search for a new pull request. A pull request whose CI is running is still read, so its result still arrives |
+
+The pause ends when GitHub resets the limit (`x-ratelimit-reset`). Separately, below 200 requests left
+(`RUNNERS_IO_RATE_FLOOR`) it looks four times less often, whichever is slower.
 
 ## What is sent, and what is never sent
 
 **From your machine to GitHub, with your own `gh` login:** requests to read the watched pull requests, their workflow
 runs and, for a failed run, its jobs. Nothing is written to GitHub.
 
-**To runners.io:** nothing, by the channel. (The runners.io MCP server, if you sign it in, reads your runners.io
-organisation's data from runners.io when Claude calls its tools.)
+**To runners.io, by the channel:** nothing.
+
+**To runners.io, by the MCP server the plugin also installs (`https://mcp.runners.io/mcp`):** Claude Code connects to
+it when a session starts, in every session, whether or not you use runners.io. Before you sign in, that connection
+sends no token and nothing from your session: runners.io sees your IP address and Claude Code's name and version, and
+answers that sign-in is needed. After you sign in (`/runners-io:sign-in`), it reads your runners.io organisation's
+jobs, logs, test results, cache and spend when Claude calls its tools. Two of its tools can change your account,
+`cancel_job` and `delete_cache_entry`. They do nothing unless you approved the connection for write access, your
+organisation has switched write tools on, and the call passes `confirm: true`; otherwise they refuse and change
+nothing. If you do not use runners.io, turn it off in `/mcp` (the server is `runners-io-mcp`), and Claude Code stops
+connecting to it.
 
 **Never sent, by the channel, to anyone:** your code, diffs or files, your prompts, the conversation, Claude's replies,
 or anything else about the session.
@@ -201,7 +271,10 @@ label names, head commits, links to GitHub and CI results, plus each answer's ET
 
 Delete the folder whenever you like: the next look at GitHub rebuilds what it needs.
 
-**What the development-channels flag allows.** During the research preview, Claude Code loads only allowlisted
+**What the development-channels flag allows.** The risk, plainly: Anthropic has not reviewed this channel, so the
+flag lets code that no one but us has checked put text into your session; and it applies to every later update of
+the plugin too, not only the version you read. To review each change before it runs, use a
+[Pinned install](#pinned-install) and move the pin yourself. During the research preview, Claude Code loads only allowlisted
 channels unless it is started with `--dangerously-load-development-channels plugin:runners-io@<marketplace>`. That flag
 lifts the allowlist **for this one entry** and nothing else: it does not turn off permission prompts, it does not
 apply to any other plugin or server, and your organisation's `channelsEnabled` policy still applies. On Team and
@@ -225,7 +298,7 @@ These are read from the environment you start Claude Code from. None is needed.
 |---|---|---|
 | `RUNNERS_IO_NO_CLAUDE_GH_OFFER` | unset | `1`: Claude never offers to set up `claude-gh` at the start of a session |
 | `RUNNERS_IO_POLL_SECONDS` | `20` | seconds between looks at a pull request whose CI is running, 5 to 300; the slower looks are never shorter than this |
-| `RUNNERS_IO_RATE_FLOOR` | `200` | below this many GitHub requests left in the hour, look four times less often. Raise it when the same `gh` login also drives other tools |
+| `RUNNERS_IO_RATE_FLOOR` | `200` | below this many GitHub requests left in the hour, look four times less often (on top of the backoff at 20% and 10% left). Raise it when the same `gh` login also drives other tools |
 | `RUNNERS_IO_EVENT_LOG_DIR` | off | an absolute directory for the event log (below) |
 
 ### The event log
@@ -236,7 +309,8 @@ deletes files older than 14 days. A record is one of these:
 - each event it pushed or held back, with the time from GitHub's own timestamp to the push;
 - each subscription and why it ended;
 - each API error or setup problem;
-- a heartbeat every five minutes, with the requests made.
+- each change in the rate-limit backoff (slowed, paused, normal again);
+- a heartbeat every five minutes, with the requests made and the rate limit left.
 
 It holds no token and no response body. The directory is 0700 and the files are 0600.
 
@@ -246,8 +320,9 @@ node scripts/event-log-summary.mjs --dir "$RUNNERS_IO_EVENT_LOG_DIR" --since 24h
 ```
 
 `--github` uses your `gh` login to ask GitHub what happened on each pull request the log says was watched. It lists
-as a miss any failed run, or any close or merge, that no session was sent. Merge conflicts are not checked, because
-GitHub keeps no history of them.
+as a miss any failed run, any close or merge, any label or draft change, any flaky re-run, any base-branch turn, any
+approval or request for changes, and any new review thread that no session was sent. Merge conflicts, resolved threads
+and "ready to merge" are not checked, because GitHub keeps no history of them.
 
 The script exits 0 when it finds nothing, 1 on a miss, a gap or an error, and 2 when it could not evaluate.
 

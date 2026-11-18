@@ -165,17 +165,24 @@ export class LoginStore {
     return null;
   }
 
-  readRate(): { remaining: number; at: number } | null {
+  /** `file`: rate.json for REST's budget, rate-graphql.json for GraphQL's, which is separate. */
+  readRate(file = "rate.json"): { remaining: number; at: number; limit?: number; reset?: number } | null {
     try {
-      const r = JSON.parse(readFileSync(join(this.dir, "rate.json"), "utf8")) as { remaining?: unknown; at?: unknown };
-      return typeof r.remaining === "number" && typeof r.at === "number" ? { remaining: r.remaining, at: r.at } : null;
+      const r = JSON.parse(readFileSync(join(this.dir, file), "utf8")) as { remaining?: unknown; at?: unknown; limit?: unknown; reset?: unknown };
+      if (typeof r.remaining !== "number" || typeof r.at !== "number") return null;
+      return {
+        remaining: r.remaining,
+        at: r.at,
+        ...(typeof r.limit === "number" ? { limit: r.limit } : {}),
+        ...(typeof r.reset === "number" ? { reset: r.reset } : {}),
+      };
     } catch {
       return null;
     }
   }
 
-  writeRate(remaining: number, at: number): void {
-    this.atomic("rate.json", JSON.stringify({ remaining, at }));
+  writeRate(remaining: number, at: number, limit?: number, reset?: number, file = "rate.json"): void {
+    this.atomic(file, JSON.stringify({ remaining, at, limit, reset }));
   }
 
   prune(now: number): void {

@@ -19,10 +19,18 @@ test("a log line never carries a bearer token or a GitHub token", () => {
 
 test("the GitHub API is only ever reached over https, or plain http to this machine", () => {
   assert.equal(checkTokenUrl("https://api.github.com/", "x"), "https://api.github.com");
-  assert.equal(checkTokenUrl("http://127.0.0.1:8790", "x"), "http://127.0.0.1:8790");
+  assert.equal(checkTokenUrl("http://127.0.0.1:8790", "x", { RUNNERS_IO_TEST_FAKE_GITHUB: "1" }), "http://127.0.0.1:8790");
   assert.throws(() => checkTokenUrl("http://api.github.com", "x"), /must be https/);
   assert.throws(() => checkTokenUrl("http://10.0.0.5", "x"), /must be https/);
   assert.throws(() => loadConfig({ RUNNERS_IO_GITHUB_API: "http://example.com" }), /RUNNERS_IO_GITHUB_API/);
+});
+
+test("an address on this machine is accepted only under the tests' switch: any local process could listen there", () => {
+  for (const local of ["http://127.0.0.1:8790", "https://localhost:8443", "http://[::1]:9"]) {
+    assert.throws(() => checkTokenUrl(local, "x", {}), /RUNNERS_IO_TEST_FAKE_GITHUB/, local);
+    assert.throws(() => loadConfig({ RUNNERS_IO_GITHUB_API: local }), /RUNNERS_IO_GITHUB_API/, local);
+  }
+  assert.equal(loadConfig({ RUNNERS_IO_GITHUB_API: "http://127.0.0.1:8790", ...{ RUNNERS_IO_TEST_FAKE_GITHUB: "1" } }).githubApi, "http://127.0.0.1:8790");
 });
 
 test("the defaults are api.github.com, the branch's PR watched automatically, every 20 seconds", () => {
@@ -33,6 +41,9 @@ test("the defaults are api.github.com, the branch's PR watched automatically, ev
   assert.equal(c.pollSeconds, 20);
   assert.equal(loadConfig({ RUNNERS_IO_AUTO_SUBSCRIBE: "${user_config.auto_subscribe}" }).autoSubscribe, "pr");
   assert.equal(loadConfig({ RUNNERS_IO_AUTO_SUBSCRIBE: "off" }).autoSubscribe, "off");
+  assert.equal(c.reviewRequests, false, "review requests are off unless asked for");
+  assert.equal(loadConfig({ RUNNERS_IO_REVIEW_REQUESTS: "${user_config.review_requests}" }).reviewRequests, false);
+  assert.equal(loadConfig({ RUNNERS_IO_REVIEW_REQUESTS: "on" }).reviewRequests, true);
   assert.equal(loadConfig({ RUNNERS_IO_POLL_SECONDS: "1" }).pollSeconds, 5);
   assert.equal(loadConfig({ RUNNERS_IO_POLL_SECONDS: "9999" }).pollSeconds, 300);
 });

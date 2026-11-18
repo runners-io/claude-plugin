@@ -127,6 +127,8 @@ test("the rate limit left, as any session last saw it, is what every session bac
   await b.login(); // every pass starts with this; it is what tells b which login's store to read
   assert.equal(typeof a.rateRemaining, "number");
   assert.equal(b.rateRemaining, a.rateRemaining, "b has made no request and still knows the machine's rate limit");
+  assert.equal(a.rateLimit, 5000);
+  assert.equal(b.rateLimit, 5000, "and the limit it is a share of");
 });
 
 test("the store is private to the user and holds no token and no response body: only the fields the channel reads", async () => {

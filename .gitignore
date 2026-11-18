@@ -3,3 +3,7 @@ node_modules/
 *.jsonl
 *.log
 .env*
+.DS_Store
+*.tgz
+coverage/
+.claude/settings.local.json

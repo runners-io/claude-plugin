@@ -24,15 +24,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The whole history, so the base branch is there for the new-version check below.
+          fetch-depth: 0
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           package-manager-cache: false
 
+      - name: A changed plugin is a new version
+        # A pull request that changes the plugin must raise its version (every field, the check says which), so
+        # each release can be installed and told apart by its version and tag. The check fails, never passes, when
+        # the base is not in the checkout.
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: node scripts/check-plugin.mjs . --against "origin/$BASE_REF"
+
       - name: Install the channel's build tools
         working-directory: channel
-        run: npm ci --no-audit --no-fund
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Typecheck, rebuild, and require the committed bundle to match
         working-directory: channel

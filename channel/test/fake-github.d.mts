@@ -15,7 +15,14 @@ export interface FakeGitHub {
   setBaseRuns(repo: string, branch: string, runs: Record<string, unknown>[]): void;
   setIssueEvents(repo: string, number: number, events: Record<string, unknown>[]): void;
   setAttempt(runId: number, attempt: number, run: Record<string, unknown>): void;
-  setJobs(runId: number, jobs: { name: string; conclusion: string | null }[]): void;
+  setReviews(repo: string, number: number, reviews: Record<string, unknown>[]): void;
+  setReviewComments(repo: string, number: number, comments: Record<string, unknown>[]): void;
+  setReviewRequests(nodes: Record<string, unknown>[], viewer?: string): void;
+  setReviewPull(repo: string, number: number, node: Record<string, unknown>): void;
+  setGraphqlRate(remaining: number, limit?: number): void;
+  setRate(remaining: number, limit?: number, resetEpochSeconds?: number | null): void;
+  setJobs(runId: number, jobs: ({ name: string; conclusion: string | null } & Record<string, unknown>)[]): void;
+  setAnnotations(jobId: number, list: Record<string, unknown>[]): void;
   close(): Promise<void>;
 }
 

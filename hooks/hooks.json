@@ -1,5 +1,5 @@
 {
-  "description": "After Claude opens a pull request, prompt it to subscribe the runners-io CI channel to it; at launch, tell the user when live CI events are off in the session.",
+  "description": "When a tool's output names a pull request just opened by you in this session's own repository, hand it to the runners-io CI channel to watch (unless auto_subscribe is off or the channel is not on); otherwise, after Claude opens a pull request, ask it to subscribe. At launch, tell the user when live CI events are off in the session.",
   "hooks": {
     "PostToolUse": [
       {
