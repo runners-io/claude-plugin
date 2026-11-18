@@ -48,7 +48,8 @@ const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
 export function parseJobs(body: unknown): JobInfo[] {
   const list = Array.isArray(obj(body).jobs) ? (obj(body).jobs as unknown[]).map(obj) : [];
   return list
-    .filter((j) => typeof j.id === "number")
+    // The id goes into a gh command (format.ts): only a safe positive integer is a job.
+    .filter((j) => typeof j.id === "number" && Number.isSafeInteger(j.id) && j.id > 0)
     .map((j) => ({
       id: j.id as number,
       name: str(j.name) ?? "a job",

@@ -192,6 +192,9 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
           conclusion: null,
           run_attempt: 1,
           head_sha: sha,
+          // As GitHub reports a pull request's own run: started by a push to it, by the signed-in login.
+          event: "pull_request",
+          triggering_actor: { login: state.reviewRequests.viewer },
           html_url: `https://github.com/${repo}/actions/runs/${r.id}`,
           ...r,
         })),

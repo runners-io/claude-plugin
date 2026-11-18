@@ -86,9 +86,15 @@ export function resetRequests(root: string, claudePid: number, uid: number | und
   takeRequests(root, claudePid, uid, Number.POSITIVE_INFINITY);
 }
 
-/** At exit: the folder goes, so a later process given the same pid starts with none. A symlink is unlinked, never followed. */
+/**
+ * At exit: the folder goes, so a later process given the same pid starts with none. A symlink is unlinked, never
+ * followed, and nothing is removed under a `requests` folder that is not plainly the user's own (takeRequests' check):
+ * a `requests` that is a symlink would otherwise lead the removal into whatever folder it points at.
+ */
 export function removeRequests(root: string, claudePid: number, uid: number | undefined = process.getuid?.()): void {
-  const dir = join(root, "requests", String(claudePid));
+  const requests = join(root, "requests");
+  const dir = join(requests, String(claudePid));
+  if (!safeFolder(requests, uid)) return;
   try {
     const s = lstatSync(dir);
     if (s.isSymbolicLink()) unlinkSync(dir);

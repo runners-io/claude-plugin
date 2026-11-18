@@ -50,11 +50,13 @@ type Env = Record<string, string | undefined>;
 
 /**
  * The GitHub host whose login is used for an API address: github.com for api.github.com, otherwise the address's own
- * host (GitHub Enterprise Server). A token is only ever read for the host it is sent to, so pointing
- * RUNNERS_IO_GITHUB_API somewhere else, a local port included, can never carry a github.com token there.
+ * host and port (GitHub Enterprise Server). A token is only ever read for the host it is sent to, so pointing
+ * RUNNERS_IO_GITHUB_API somewhere else, a local port included, can never carry a github.com token there; and the port
+ * is part of the host, since another port on the same name can be another server or a local listener. https's own
+ * port (443) is no port: `new URL` leaves it out.
  */
 export function loginHost(apiBase: string): string {
-  const host = new URL(apiBase).hostname;
+  const host = new URL(apiBase).host;
   return host === "api.github.com" ? "github.com" : host;
 }
 
@@ -148,6 +150,13 @@ export interface RunInfo {
   readonly updatedAt?: string;
   /** When GitHub created the run (a re-run keeps it): near the push that made it, for the all-done hold. */
   readonly createdAt?: string;
+  /**
+   * What started the run (GitHub's `event`: push, pull_request, pull_request_review, issue_comment, ...) and who
+   * (`triggering_actor.login`). A review or a comment can start a workflow on the pull request's head, so its log can
+   * hold that person's text: format.ts `notYours` trusts only a push or pull_request run the signed-in login started.
+   */
+  readonly event?: string;
+  readonly triggeringActor?: string;
 }
 
 export type ApiResult<T> =
@@ -190,9 +199,51 @@ interface GhRunJson {
   created_at?: string;
   run_started_at?: string;
   updated_at?: string;
+  event?: unknown;
+  triggering_actor?: { login?: unknown } | null;
 }
 
 const FAILED_JOB = new Set(["failure", "timed_out", "startup_failure", "cancelled"]);
+
+/** Every status GitHub gives a workflow run or a job (a check run). A stored entry with any other is not trusted. */
+export const RUN_STATUSES: ReadonlySet<string> = new Set(["requested", "queued", "pending", "waiting", "in_progress", "completed"]);
+/** Every conclusion GitHub gives a finished run or job; null while it runs. */
+export const CONCLUSIONS: ReadonlySet<string> = new Set([
+  "success",
+  "failure",
+  "neutral",
+  "cancelled",
+  "skipped",
+  "timed_out",
+  "action_required",
+  "stale",
+  "startup_failure",
+]);
+
+/** A run's, job's or PR's id as GitHub gives one: it goes into a `gh` command, so nothing else is let through. */
+export function isId(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+type Loose = Record<string, unknown>;
+const each = (v: unknown, ok: (x: Loose) => boolean): boolean => Array.isArray(v) && v.every((x) => x !== null && typeof x === "object" && ok(x as Loose));
+const optString = (v: unknown): boolean => v === undefined || typeof v === "string";
+const nullString = (v: unknown): boolean => v === null || typeof v === "string";
+/** A status and conclusion GitHub uses, and an id. */
+const runShape = (r: Loose): boolean =>
+  isId(r.id) && typeof r.name === "string" && typeof r.status === "string" && RUN_STATUSES.has(r.status) && (r.conclusion === null || (typeof r.conclusion === "string" && CONCLUSIONS.has(r.conclusion)));
+
+/**
+ * What a stored answer must look like to be used (shared.ts): another process of this user can write the store, and
+ * a run's or job's id goes into a `gh run view` sentence, its status decides the cadence and the events.
+ */
+const STORED = {
+  runs: (v: unknown) =>
+    each(v, (r) => runShape(r) && nullString(r.headBranch) && nullString(r.headRepo) && optString(r.event) && optString(r.triggeringActor) && Number.isFinite(r.runAttempt)),
+  baseRuns: (v: unknown) => each(v, runShape),
+  jobs: (v: unknown) => each(v, (j) => runShape(j) && Array.isArray(j.labels) && typeof j.url === "string"),
+  prNumber: (v: unknown) => v === null || isId(v),
+};
 /** A token is re-read from gh this often, so a `gh auth login` as another account is picked up. */
 const TOKEN_TTL_MS = 5 * 60_000;
 
@@ -270,7 +321,7 @@ export class GitHubClient {
    * that time has passed: a session that backed off and stopped asking would otherwise never see the refill.
    */
   private newestRate(file = "rate.json", own = this.ownRate): RateReading | null {
-    const other = this.store?.readRate(file) ?? null;
+    const other = this.store?.readRate(file, this.now()) ?? null;
     const newest = other && (!own || other.at >= own.at) ? other : own;
     return newest && newest.reset !== undefined && this.now() >= newest.reset ? null : newest;
   }
@@ -340,8 +391,8 @@ export class GitHubClient {
     const q = new URLSearchParams({ head: `${owner}:${branch}`, state: "open", per_page: "5" });
     return this.get(`/repos/${repo}/pulls?${q}`, this.freshMs, (j) => {
       const first = Array.isArray(j) ? (j[0] as { number?: unknown } | undefined) : undefined;
-      return first && Number.isInteger(first.number) ? (first.number as number) : null;
-    });
+      return first && isId(first.number) ? first.number : null;
+    }, STORED.prNumber);
   }
 
   /**
@@ -354,7 +405,7 @@ export class GitHubClient {
   async runsForSha(repo: string, sha: string, head: { readonly ref: string; readonly repo: string | null }): Promise<ApiResult<RunInfo[]>> {
     const q = new URLSearchParams({ head_sha: sha, branch: head.ref, per_page: "100" });
     const all = await this.get(`/repos/${repo}/actions/runs?${q}`, this.freshMs, (j) => {
-      const runs = ((j as { workflow_runs?: unknown }).workflow_runs ?? []) as GhRunJson[];
+      const runs = (((j as { workflow_runs?: unknown }).workflow_runs ?? []) as GhRunJson[]).filter((r) => isId(r.id));
       return runs.map((r) => ({
         headBranch: typeof r.head_branch === "string" ? r.head_branch : null,
         headRepo: typeof r.head_repository?.full_name === "string" ? r.head_repository.full_name : null,
@@ -367,8 +418,10 @@ export class GitHubClient {
         ...(typeof (r.run_started_at ?? r.created_at) === "string" ? { startedAt: String(r.run_started_at ?? r.created_at) } : {}),
         ...(typeof r.updated_at === "string" ? { updatedAt: r.updated_at } : {}),
         ...(typeof r.created_at === "string" ? { createdAt: r.created_at } : {}),
+        ...(typeof r.event === "string" ? { event: r.event } : {}),
+        ...(typeof r.triggering_actor?.login === "string" ? { triggeringActor: r.triggering_actor.login } : {}),
       }));
-    });
+    }, STORED.runs);
     if (all.kind !== "ok") return all;
     const own = head.repo?.toLowerCase();
     return {
@@ -384,7 +437,7 @@ export class GitHubClient {
     // 100, the most one request returns: main fires dozens of workflows a push, and 30 runs is two pushes.
     const q = new URLSearchParams({ branch, event: "push", per_page: "100" });
     return this.get(`/repos/${repo}/actions/runs?${q}`, freshMs, (j) => {
-      const runs = ((j as { workflow_runs?: unknown }).workflow_runs ?? []) as GhRunJson[];
+      const runs = (((j as { workflow_runs?: unknown }).workflow_runs ?? []) as GhRunJson[]).filter((r) => isId(r.id));
       return runs.map((r) => ({
         id: Number(r.id),
         name: String(r.name ?? r.display_title ?? "a workflow"),
@@ -393,12 +446,12 @@ export class GitHubClient {
         ...(typeof r.created_at === "string" ? { created_at: r.created_at } : {}),
         ...(typeof r.updated_at === "string" ? { updated_at: r.updated_at } : {}),
       }));
-    });
+    }, STORED.baseRuns);
   }
 
   /** A run's jobs (jobs.ts), with an ETag through the shared store: an unchanged answer is a 304. */
   runJobs(repo: string, runId: number): Promise<ApiResult<JobInfo[]>> {
-    return this.get(`/repos/${repo}/actions/runs/${runId}/jobs?per_page=100`, this.freshMs, parseJobs);
+    return this.get(`/repos/${repo}/actions/runs/${runId}/jobs?per_page=100`, this.freshMs, parseJobs, STORED.jobs);
   }
 
   /** A job's annotations, path, line and level only (jobs.ts): a job is a check run, and has the same id. */
@@ -493,11 +546,21 @@ export class GitHubClient {
    * With a shared store and a freshness window, a stored answer young enough is used as it is; otherwise this
    * session takes the key's lease (or waits briefly for the session that holds it) and runs `fresh`.
    */
-  private async viaStore<T>(key: string, freshMs: number, fresh: (store: LoginStore | null, stored: Stored<T> | null) => Promise<ApiResult<T>>): Promise<ApiResult<T>> {
+  private async viaStore<T>(
+    key: string,
+    freshMs: number,
+    fresh: (store: LoginStore | null, stored: Stored<T> | null) => Promise<ApiResult<T>>,
+    valid: (value: unknown) => boolean = () => true,
+  ): Promise<ApiResult<T>> {
     const store = freshMs > 0 ? this.store : null;
     if (!store) return fresh(null, null);
+    // A stored value of the wrong shape is no value: not used, and its ETag not sent (a 304 would hand it back).
+    const read = (): Stored<T> | null => {
+      const s = store.read<T>(key, this.now());
+      return s && valid(s.value) ? s : null;
+    };
     const usable = (): Stored<T> | null => {
-      const s = store.read<T>(key);
+      const s = read();
       return s && this.now() - s.at < freshMs ? s : null;
     };
     let hit = usable();
@@ -515,7 +578,7 @@ export class GitHubClient {
       return { kind: "ok", value: hit.value };
     }
     try {
-      return await fresh(store, store.read<T>(key));
+      return await fresh(store, read());
     } finally {
       release?.();
     }
@@ -526,10 +589,10 @@ export class GitHubClient {
    * request); otherwise this session takes the path's lease, or waits briefly for the session that holds it,
    * and asks GitHub with the newest ETag any session stored. Without a store: every call asks GitHub.
    */
-  private async get<T>(path: string, freshMs: number, map: (json: unknown) => T): Promise<ApiResult<T>> {
+  private async get<T>(path: string, freshMs: number, map: (json: unknown) => T, valid?: (value: unknown) => boolean): Promise<ApiResult<T>> {
     const auth = await this.login();
     if (auth.kind !== "ok") return { kind: "auth", auth };
-    return this.viaStore<T>(path, freshMs, (store, stored) => this.ask(path, auth, map, store, stored));
+    return this.viaStore<T>(path, freshMs, (store, stored) => this.ask(path, auth, map, store, stored), valid);
   }
 
   private async ask<T>(

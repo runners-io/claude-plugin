@@ -64,6 +64,12 @@ export const RATE_SLOW = 0.3;
 /** At or below this share, only the reads a running CI needs go on: a finished PR, the base and the search pause. */
 export const RATE_PAUSE = 0.15;
 const STRETCH_MAX = 8;
+/**
+ * At or below this many REST requests left, the reads that only add detail stop entirely until GitHub's reset: a
+ * running PR's jobs and a failed job's annotations (poller.ts). Paused still reads a PR whose CI runs; this keeps the
+ * last requests for that, and for the user's own gh and tools on the same login.
+ */
+export const JOB_READS_FLOOR = 200;
 
 /**
  * How hard to back off, from the newest `x-ratelimit-remaining` and `x-ratelimit-limit` (any session's on this

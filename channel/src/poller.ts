@@ -10,14 +10,15 @@
  *   the user installs gh or signs in, the channel starts by itself.
  * - RATE LIMITS: an unchanged resource costs nothing (ETags, github.ts); the
  *   interval stretches fourfold when fewer than 200 requests are left this
- *   hour, and a rate-limit answer is waited out.
+ *   hour, and a rate-limit answer is waited out. At JOB_READS_FLOOR left,
+ *   no run's jobs or annotations are read at all until the reset.
  * - EACH PR HAS ITS OWN CADENCE (cadence.ts): every pass while its CI runs,
  *   up to five minutes once it has settled. The branch's PR is looked for only
  *   while none is watched, and a base branch is read every minute only while
  *   one of its PRs is busy.
  */
 import type { Config } from "./config.ts";
-import { PENDING_WINDOW_MS, type Phase, REQUESTS_EVERY_MS, REVIEW_EVERY_MS, RUNS_EVERY_MS, lookEveryMs, passSleepMs, phaseOf, ratePressure } from "./cadence.ts";
+import { JOB_READS_FLOOR, PENDING_WINDOW_MS, type Phase, REQUESTS_EVERY_MS, REVIEW_EVERY_MS, RUNS_EVERY_MS, lookEveryMs, passSleepMs, phaseOf, ratePressure } from "./cadence.ts";
 import { type JobsSeen, jobChanges } from "./jobs.ts";
 import { type RequestsSeen, requestChanges, requestMessage } from "./requests.ts";
 import { type ReviewState, reviewChanges } from "./reviews.ts";
@@ -162,12 +163,22 @@ export const NOT_FOUND_LIMIT = 3;
  */
 export const HOOK_NEW_MS = 15 * 60_000;
 
+/**
+ * The most messages one session is sent in an hour, across every PR it watches. The per-PR throttle bounds one busy PR;
+ * this bounds twenty, or a run of review threads and comments from people outside the repository: every event puts
+ * text from the repository into the session.
+ */
+export const SESSION_EVENTS_PER_HOUR = 120;
+
 /** The limits a session watches within (deps.limits overrides any of them, for tests). */
 export const DEFAULT_LIMITS = {
   total: MAX_SUBSCRIPTIONS,
   hook: MAX_HOOK_SUBSCRIPTIONS,
   eventsPerPr: 20,
   eventWindowMs: 10 * 60_000,
+  /** Across every PR: at most this many messages a session is sent in `sessionWindowMs` (heldBack past it). */
+  sessionEvents: SESSION_EVENTS_PER_HOUR,
+  sessionWindowMs: 60 * 60_000,
 };
 
 /** Said once when a PR's events pass the budget; nothing more is pushed for it until the window moves on. */
@@ -177,6 +188,16 @@ function throttled(repo: string, pr: string, windowMs: number): ChannelMessage {
       `${repo} PR #${pr} changed more often than this session is told about in ${Math.round(windowMs / 60_000)} minutes, ` +
       "so further events for it are held back for now. Call ci_status for its current state.",
     meta: { kind: "channel_throttled", repo, pr },
+  };
+}
+
+/** Said once an hour while the session's own budget is spent; nothing more is pushed until the hour moves on. */
+function heldBack(windowMs: number): ChannelMessage {
+  return {
+    content:
+      `This session has been told about as many CI and pull-request events as it is told about in ${Math.round(windowMs / 60_000)} minutes, ` +
+      "so further events, on every watched pull request, are being held back for now. Call ci_status for a pull request's current state.",
+    meta: { kind: "channel_held_back" },
   };
 }
 
@@ -196,6 +217,10 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
   // nothing for that PR until the window moves on. A PR whose CI changes faster than a person reads is noise, and
   // every event carries text from the repository.
   const sentAt = new Map<string, number[]>();
+  // Across every PR: when each message of the session's current window was sent (at most limits.sessionEvents), and
+  // when the one heldBack notice of a spent window was. Past the budget nothing is sent but that notice, once a window.
+  let sessionSent: number[] = [];
+  let heldBackAt = Number.NEGATIVE_INFINITY;
   let lastBeat = 0;
   const unsubscribe = (e: Entry, reason: string) => {
     subs.remove(e.repo, e.pr);
@@ -208,6 +233,15 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
     // This session's mutes (the mute tool, or an unsubscribed automatic watch): held back, and logged as such.
     if (change && subs.mutes.matching({ repo: change.snapshot.repo, pr: change.snapshot.pr, kind: change.kind, workflow: change.run ? clean(change.run.name) : "" })) {
       return events.write("event", { ...fields, outcome: "filtered", reason: "muted" });
+    }
+    sessionSent = sessionSent.filter((t) => now() - t < limits.sessionWindowMs);
+    if (sessionSent.length >= limits.sessionEvents) {
+      events.write("event", { ...fields, outcome: "filtered", reason: "budget" });
+      if (now() - heldBackAt < limits.sessionWindowMs) return;
+      heldBackAt = now();
+      message = heldBack(limits.sessionWindowMs);
+      fields = { ...eventFields(message, null), ...extra };
+      return notifyAndLog(message, fields);
     }
     const meta = message.meta as Record<string, unknown>;
     if (typeof meta.repo === "string" && typeof meta.pr === "string") {
@@ -222,6 +256,10 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
         fields = { ...eventFields(message, null), ...extra };
       }
     }
+    sessionSent.push(now());
+    return notifyAndLog(message, fields);
+  };
+  async function notifyAndLog(message: ChannelMessage, fields: Record<string, unknown>): Promise<void> {
     try {
       await deps.notify(message);
       events.write("event", { ...fields, outcome: "sent" });
@@ -229,7 +267,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       events.write("event", { ...fields, outcome: "error", error: (error as Error).message });
       throw error;
     }
-  };
+  }
   const baseEveryMs = deps.baseEveryMs ?? 60_000;
   const baseIdleMs = Math.max(baseEveryMs, deps.baseIdleMs ?? 600_000);
   const now = deps.now ?? Date.now;
@@ -237,6 +275,12 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
   /** Per watched PR: when it is next looked at, and what the cadence needs to know. */
   /** The rate limit's back-off, from the newest reading any session on this machine got (cadence.ts). */
   const pressure = () => ratePressure(gh.rateRemaining, gh.rateLimit);
+  /**
+   * At or below JOB_READS_FLOOR requests left (cadence.ts), no jobs and no annotations are read until GitHub's reset
+   * voids the reading: they add detail to an event, and a running PR's own reads, still made while paused, need what
+   * is left. A run's failure is still sent, without its failed jobs' names.
+   */
+  const atJobFloor = () => gh.rateRemaining !== null && gh.rateRemaining <= JOB_READS_FLOOR;
   let rateLevel: "normal" | "slowed" | "paused" = "normal";
   const looks = new Map<string, { next: number; quiet: number; phase: Phase; headSha: string; headSeenAt: number; runsReadAt: number }>();
   let findLabel = "";
@@ -320,7 +364,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
    * such run per look, a 304 when nothing changed. The PR's first look is a baseline (jobs.ts).
    */
   const checkJobs = async (entry: Entry, snap: Snapshot) => {
-    if (!JOB_KINDS.some((k) => wants(entry, k))) return;
+    if (!JOB_KINDS.some((k) => wants(entry, k)) || atJobFloor()) return;
     let seen = jobsSeen.get(entry.key) ?? null;
     for (const run of snap.runs) {
       if (run.status === "completed" || signal.aborted) continue;
@@ -652,7 +696,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
           await send(await message(change), change, false);
           continue;
         }
-        const full = await withFailedJobs(gh, change);
+        const full = atJobFloor() ? change : await withFailedJobs(gh, change);
         await send(await message(full), full);
       }
       if (snap.state === "open") await checkJobs(live, snap);

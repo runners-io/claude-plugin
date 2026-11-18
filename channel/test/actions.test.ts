@@ -31,6 +31,9 @@ const run = (id: number, name: string, conclusion: string | null, status = "comp
   conclusion,
   htmlUrl: `https://github.com/acme/widgets/actions/runs/${id}`,
   runAttempt: 1,
+  // Started by the signed-in login's own pull-request push (format.ts notYours).
+  event: "pull_request",
+  triggeringActor: "octocat",
 });
 const snap: Snapshot = {
   repo: "acme/widgets",

@@ -19,7 +19,9 @@
  *
  * - a folder, the cache folder itself or a login's, that is a symlink or is not owned by this user is refused;
  * - a login's folder unused for a day is deleted, with everything in it, whichever login or format it was;
- * - a plugin that changes what an entry holds raises STORE_FORMAT, so it never reads the old shape.
+ * - a plugin that changes what an entry holds raises STORE_FORMAT, so it never reads the old shape;
+ * - any process of this user can write the folder, so nothing read back is trusted for its shape: an entry dated in
+ *   the future is dropped here (FUTURE_SKEW_MS), and github.ts checks each value's fields before using it.
  *
  * Anything that goes wrong with it is not an outage: the session falls back to asking GitHub itself, as it did
  * before the store existed.
@@ -37,6 +39,12 @@ export const STORE_FORMAT = 1;
 export const LEASE_MS = 30_000;
 /** Stored answers are deleted once they are this old. */
 const PRUNE_MS = 24 * 60 * 60_000;
+/**
+ * How far ahead of this clock a stored time may be and still be believed: two processes on one machine share a clock,
+ * so only a small skew is real. A time further ahead would keep an entry fresh, a lease held, or a rate reading the
+ * newest, for ever: whatever wrote it is not the channel, and the entry is dropped.
+ */
+export const FUTURE_SKEW_MS = 60_000;
 
 export interface Stored<T = unknown> {
   readonly path: string;
@@ -124,10 +132,12 @@ export class LoginStore {
     this.keyFor = keyFor;
   }
 
-  read<T>(path: string): Stored<T> | null {
+  /** The stored answer for `path`, or null: none, unreadable, another path's, or dated past `now` + FUTURE_SKEW_MS. */
+  read<T>(path: string, now = Date.now()): Stored<T> | null {
     try {
       const s = JSON.parse(readFileSync(join(this.dir, `${this.keyFor(path)}.json`), "utf8")) as Stored<T>;
-      return s && s.path === path && typeof s.etag === "string" && typeof s.at === "number" && "value" in s ? s : null;
+      const plain = s && s.path === path && typeof s.etag === "string" && Number.isFinite(s.at) && "value" in s;
+      return plain && s.at <= now + FUTURE_SKEW_MS ? s : null;
     } catch {
       return null;
     }
@@ -156,7 +166,7 @@ export class LoginStore {
       try {
         held = JSON.parse(readFileSync(file, "utf8"));
       } catch {}
-      const abandoned = typeof held.at !== "number" || now - held.at > LEASE_MS || !alive(held.pid);
+      const abandoned = typeof held.at !== "number" || now - held.at > LEASE_MS || held.at > now + FUTURE_SKEW_MS || !alive(held.pid);
       if (!abandoned) return null;
       try {
         unlinkSync(file);
@@ -165,11 +175,15 @@ export class LoginStore {
     return null;
   }
 
-  /** `file`: rate.json for REST's budget, rate-graphql.json for GraphQL's, which is separate. */
-  readRate(file = "rate.json"): { remaining: number; at: number; limit?: number; reset?: number } | null {
+  /**
+   * `file`: rate.json for REST's budget, rate-graphql.json for GraphQL's, which is separate. A reading dated past
+   * `now` + FUTURE_SKEW_MS is null: it would otherwise be the newest for ever.
+   */
+  readRate(file = "rate.json", now = Date.now()): { remaining: number; at: number; limit?: number; reset?: number } | null {
     try {
       const r = JSON.parse(readFileSync(join(this.dir, file), "utf8")) as { remaining?: unknown; at?: unknown; limit?: unknown; reset?: unknown };
-      if (typeof r.remaining !== "number" || typeof r.at !== "number") return null;
+      if (typeof r.remaining !== "number" || typeof r.at !== "number" || !Number.isFinite(r.at)) return null;
+      if (r.at > now + FUTURE_SKEW_MS) return null;
       return {
         remaining: r.remaining,
         at: r.at,

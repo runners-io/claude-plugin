@@ -63,14 +63,49 @@ test(".gitignore keeps local and packed files out", () => {
 });
 
 // A pull request from a fork runs the fork's own copy of this file, so nothing here can stop a fork from asking for
-// any runner. What this file can do is run nothing for one: the check runs for pushes, for a person's dispatch, and
-// for pull requests from a branch of this repository (which is how a release is published).
-test("the CI job runs for a pull request only when its branch is in this repository, never a fork's", () => {
-  const ci = readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8");
-  const job = /\n {2}check:\n([\s\S]*?)\n {4}steps:/.exec(ci);
+// any runner. What this file can do is run nothing of a fork's: the check runs for pushes, for a person's dispatch, and
+// for pull requests from a branch of this repository (which is how a release is published). A fork's pull request
+// FAILS the check before anything is checked out, rather than skipping it: a ruleset requires this check by name, and
+// GitHub counts a skipped required check as passing.
+const ciText = () => readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8");
+const FORK = "github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository";
+
+/** The check job's header (up to `steps:`) and its steps, each step's text from its `- ` line. */
+function checkJob() {
+  const ci = ciText();
+  const job = /\n {2}check:\n([\s\S]*?)\n {4}steps:\n([\s\S]*?)(?=\n {2}\S|$)/.exec(ci);
   assert.ok(job, "the check job");
-  assert.match(
-    job[1],
-    /\n {4}if: github\.event_name != 'pull_request' \|\| github\.event\.pull_request\.head\.repo\.full_name == github\.repository\n/,
-  );
+  const steps = job[2].split(/\n(?= {6}- )/).filter((s) => s.trim());
+  assert.ok(steps.length > 3, "its steps were read");
+  return { header: job[1], steps };
+}
+
+test("the required check keeps its name, and the job has no if: of its own, so a fork's pull request never skips it", () => {
+  const { header } = checkJob();
+  assert.match(`\n${header}\n`, /\n {4}name: manifest, bundle and tests\n/, "the ruleset requires the check by this exact name");
+  assert.doesNotMatch(`\n${header}`, /\n {4}if:/, "a job-level if: skips the job, and a skipped required check passes");
+});
+
+test("on a fork's pull request the first step fails the check, with a message, before anything is checked out", () => {
+  const { steps } = checkJob();
+  const first = steps[0];
+  assert.doesNotMatch(first, /uses:/, "the first step checks nothing out and runs no action");
+  assert.ok(first.includes(`if: ${FORK}`), `the first step runs only for a fork's pull request:\n${first}`);
+  assert.match(first, /::error[^\n]*fork/i, "it says why");
+  assert.match(first, /\n\s+exit 1\s*$/, "and fails");
+  // Every later step runs only after the steps before it succeeded: none overrides that with always() or failure().
+  for (const s of steps.slice(1)) assert.doesNotMatch(s, /\b(always|failure|cancelled)\(\)/, s.split("\n")[0]);
+  // The control: for this repository's own branch the condition is false, so the check goes on.
+  assert.ok(!FORK.includes("== github.repository"));
+});
+
+test("the workflow stays read-only and secret-free: no pull_request_target, no secrets, no persisted credentials", () => {
+  const ci = ciText();
+  assert.doesNotMatch(ci, /pull_request_target/);
+  assert.doesNotMatch(ci, /\$\{\{[^}]*\bsecrets\b/, "no expression reads a secret");
+  assert.match(ci, /\npermissions:\n {2}contents: read\n/);
+  const { steps } = checkJob();
+  const checkout = steps.find((s) => /uses: actions\/checkout@/.test(s));
+  assert.ok(checkout, "the checkout step");
+  assert.match(checkout, /persist-credentials: false/);
 });

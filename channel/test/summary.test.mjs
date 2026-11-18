@@ -1,7 +1,7 @@
 // The event log's one-command check (scripts/event-log-summary.mjs), run as a user would run it.
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
@@ -75,6 +75,20 @@ test("the summary counts events by kind and outcome, gives median and worst late
   const text = await run(["--dir", dir, "--since", "24h"]);
   assert.match(text.stdout, /ci\.workflow_failed\s+sent 3/);
   assert.match(text.stdout, /median 20\.0 s, worst 30\.0 s/);
+});
+
+// The channel writes into a subfolder of its own (eventlog.ts EVENT_LOG_SUBDIR); a log written before it did is
+// directly in the directory. --dir is the directory the user set either way, and both are read.
+test("the summary reads the channel's own subfolder of --dir, as well as day files directly in it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "rio-summary-"));
+  const own = join(dir, "runners-io-events");
+  mkdirSync(own);
+  const rec = (min, run_id) => ({ ...base, t: ago(min), type: "event", kind: "ci.workflow_failed", repo: "acme/widgets", pr: 7, run_id, outcome: "sent", latency_ms: 1_000 });
+  writeFileSync(join(own, `${ago(30).slice(0, 10)}.jsonl`), `${JSON.stringify({ ...base, t: ago(31), type: "start" })}\n${JSON.stringify(rec(30, 1))}\n`);
+  writeFileSync(join(dir, `${ago(20).slice(0, 10)}.jsonl`), `${JSON.stringify(rec(20, 2))}\n`);
+  const r = await run(["--dir", dir, "--since", "24h", "--json"]);
+  const s = JSON.parse(r.stdout);
+  assert.deepEqual(s.events["ci.workflow_failed"], { sent: 2, filtered: 0, error: 0 }, r.stderr);
 });
 
 test("with --github, a failure or a close GitHub shows inside a watched window and no session got is a miss; a superseded commit's failure is not", async () => {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
 
-import { type GhAuth, GitHubClient, readGhAuth } from "../src/github.ts";
+import { type GhAuth, GitHubClient, loginHost, readGhAuth } from "../src/github.ts";
 import { fetchSnapshot } from "../src/poller.ts";
 import { setQuiet } from "../src/log.ts";
 import { type FakeGitHub, startFakeGitHub } from "./fake-github.mjs";
@@ -37,7 +37,7 @@ test("a local API address never gets the github.com login, unless the tests' swi
     return { code: 1, stdout: "" };
   };
   assert.deepEqual(await readGhAuth({ GH_TOKEN: "gho_real" }, gh, "http://127.0.0.1:9"), { kind: "signed_out" });
-  assert.deepEqual(asked, [["auth", "token", "--hostname", "127.0.0.1"]], "asked for the local host's own login, not github.com's");
+  assert.deepEqual(asked, [["auth", "token", "--hostname", "127.0.0.1:9"]], "asked for the local host's own login, port and all, not github.com's");
   const never = async () => {
     throw new Error("gh must not run when the environment has a token");
   };
@@ -75,6 +75,26 @@ test("an Enterprise token from the environment goes only to the host GH_HOST nam
     source: "gh",
   });
   assert.deepEqual(await readGhAuth({ ...env, GH_HOST: "ghe.corp.example" }, gh, "https://ghe.corp.example/api/v3"), { kind: "ok", token: "ghe_own", source: "env" });
+});
+
+// A login is a host's: the same name on another port can be another server (or a local listener), so the port is part
+// of the host a token is matched to.
+test("the host a token is read for includes the API address's port", async () => {
+  assert.equal(loginHost("https://api.github.com"), "github.com");
+  assert.equal(loginHost("https://api.github.com:443/"), "github.com", "https's own port is no port");
+  assert.equal(loginHost("https://api.github.com:8443"), "api.github.com:8443", "not github.com on another port");
+  assert.equal(loginHost("https://ghe.corp.example/api/v3"), "ghe.corp.example");
+  assert.equal(loginHost("https://GHE.corp.example:8443/api/v3"), "ghe.corp.example:8443");
+  const asked: string[][] = [];
+  const gh = async (_c: string, args: readonly string[]) => {
+    asked.push([...args]);
+    return { code: 0, stdout: `token-for-${args.at(-1)}\n` };
+  };
+  const env = { GH_HOST: "ghe.corp.example", GH_ENTERPRISE_TOKEN: "ghe_own" };
+  assert.deepEqual(await readGhAuth(env, gh, "https://ghe.corp.example:8443/api/v3"), { kind: "ok", token: "token-for-ghe.corp.example:8443", source: "gh" });
+  assert.deepEqual(asked, [["auth", "token", "--hostname", "ghe.corp.example:8443"]]);
+  // The control: GH_HOST naming that port too is that server.
+  assert.deepEqual(await readGhAuth({ ...env, GH_HOST: "ghe.corp.example:8443" }, gh, "https://ghe.corp.example:8443/api/v3"), { kind: "ok", token: "ghe_own", source: "env" });
 });
 
 test("readGhAuth maps a missing gh to not_installed and a failing or empty one to signed_out", async () => {
@@ -204,6 +224,37 @@ test("runsForSha keeps only runs from the pull request's own head repository and
   assert.deepEqual(gone.kind === "ok" && gone.value, [], "a head repository GitHub no longer names matches nothing");
 });
 
+test("runsForSha keeps each run's event and who started it, and leaves either out when GitHub does not say", async () => {
+  const gh = await fake();
+  const sha = "d".repeat(40);
+  gh.setRuns("acme/widgets", sha, [
+    { id: 21, name: "CI", head_branch: "fix-login", event: "pull_request", triggering_actor: { login: "octocat" } },
+    { id: 22, name: "CI", head_branch: "fix-login", event: "pull_request_review", triggering_actor: { login: "stranger" } },
+    { id: 23, name: "CI", head_branch: "fix-login", event: 7, triggering_actor: null },
+  ]);
+  const r = await new GitHubClient(gh.base, ok()).runsForSha("acme/widgets", sha, { ref: "fix-login", repo: "acme/widgets" });
+  assert.equal(r.kind, "ok");
+  const runs = r.kind === "ok" ? r.value : [];
+  assert.deepEqual(runs.map((x) => [x.id, x.event, x.triggeringActor]), [
+    [21, "pull_request", "octocat"],
+    [22, "pull_request_review", "stranger"],
+    [23, undefined, undefined],
+  ]);
+});
+
+test("a run GitHub answers with an id that is not a safe positive integer is left out: the id goes into a gh command", async () => {
+  const gh = await fake();
+  const sha = "9".repeat(40);
+  gh.setRuns("acme/widgets", sha, [
+    { id: 31, name: "CI", head_branch: "fix-login" },
+    { id: "32", name: "CI", head_branch: "fix-login" },
+    { id: -33, name: "CI", head_branch: "fix-login" },
+    { id: 2 ** 60, name: "CI", head_branch: "fix-login" },
+  ]);
+  const r = await new GitHubClient(gh.base, ok()).runsForSha("acme/widgets", sha, { ref: "fix-login", repo: "acme/widgets" });
+  assert.deepEqual(r.kind === "ok" && r.value.map((x) => x.id), [31]);
+});
+
 test("a pull request's snapshot holds no run of a stranger's pull request on the same commit", async () => {
   const gh = await fake();
   const sha = "e".repeat(40);
@@ -311,7 +362,7 @@ test("a github.com token is only ever read for api.github.com (or loopback, for 
   // A loopback address is a test's fake GitHub only under the tests' switch; without it, it is just another host.
   const tests = { ...env, RUNNERS_IO_TEST_FAKE_GITHUB: "1", RUNNERS_IO_TEST_GITHUB_TOKEN: "gho_testsown" };
   assert.deepEqual(await readGhAuth(tests, gh, "http://127.0.0.1:4567"), { kind: "ok", token: "gho_testsown", source: "env" });
-  assert.deepEqual(await readGhAuth(env, gh, "http://127.0.0.1:4567"), { kind: "ok", token: "token-for-127.0.0.1", source: "gh" }, "no switch: the github.com token stays home");
+  assert.deepEqual(await readGhAuth(env, gh, "http://127.0.0.1:4567"), { kind: "ok", token: "token-for-127.0.0.1:4567", source: "gh" }, "no switch: the github.com token stays home, and the port is part of the host");
   const ghe = await readGhAuth(env, gh, "https://ghe.example.com/api/v3");
   assert.deepEqual(ghe, { kind: "ok", token: "token-for-ghe.example.com", source: "gh" }, "GH_TOKEN is github.com's, never sent elsewhere");
   assert.deepEqual(asked.at(-1), ["auth", "token", "--hostname", "ghe.example.com"]);

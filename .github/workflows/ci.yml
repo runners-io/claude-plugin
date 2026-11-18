@@ -19,11 +19,19 @@ jobs:
   check:
     name: manifest, bundle and tests
     # A pull request from a fork runs nothing here: only pushes, a person's dispatch, and pull requests from a branch
-    # of this repository (which is how a release is published).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # of this repository (which is how a release is published). A fork's pull request FAILS this check at its first
+    # step instead of skipping it: a ruleset requires the check by name, and GitHub counts a skipped one as passing.
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      - name: A pull request from a fork is refused
+        # Before anything is checked out: nothing of the fork's is fetched or run. Every later step runs only if this
+        # one passed.
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "::error::This check does not run for a pull request from a fork, so it fails here rather than passing unrun. A maintainer publishes changes from a branch of this repository."
+          exit 1
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

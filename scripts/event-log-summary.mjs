@@ -18,8 +18,8 @@
 // Exit 0: nothing found. Exit 1: a miss, a gap, an event that could not be sent, or a setup problem.
 // Exit 2: could not evaluate (no records in the window, or GitHub could not be read); never an all-clear.
 import { execFileSync } from "node:child_process";
-import { readFileSync, readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { basename, join } from "node:path";
 
 import { baseVerdict } from "../channel/src/rules.mjs";
 
@@ -86,7 +86,11 @@ let files = [];
 try {
   // Every day's file: the window's records come from those on or after its first day, and a subscription made before
   // the window (its choice of events) from any of them.
-  files = readdirSync(dir).filter((f) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(f));
+  // The channel writes into a subfolder of its own (channel/src/eventlog.ts EVENT_LOG_SUBDIR); a log written before it
+  // did lies directly in the directory. Both are read.
+  const days = (d) => readdirSync(d).filter((f) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(f)).map((f) => join(d, f));
+  const own = join(dir, "runners-io-events");
+  files = [...days(dir), ...(existsSync(own) ? days(own) : [])];
 } catch (error) {
   couldNotEvaluate(`${dir} cannot be read: ${error.message}`);
 }
@@ -95,15 +99,15 @@ const records = [];
 const before = [];
 let unreadable = 0;
 const firstDay = new Date(since).toISOString().slice(0, 10);
-for (const f of files.sort()) {
-  for (const line of readFileSync(join(dir, f), "utf8").split("\n")) {
+for (const f of files.sort((a, b) => basename(a).localeCompare(basename(b)))) {
+  for (const line of readFileSync(f, "utf8").split("\n")) {
     if (!line.trim()) continue;
     try {
       const r = JSON.parse(line);
       if (Date.parse(r.t) >= since) records.push(r);
       else if (r.type === "subscribe" || r.type === "unsubscribe") before.push(r);
     } catch {
-      if (f.slice(0, 10) >= firstDay) unreadable++;
+      if (basename(f).slice(0, 10) >= firstDay) unreadable++;
     }
   }
 }

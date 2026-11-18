@@ -7,6 +7,7 @@ import type { GitScope } from "../src/git.ts";
 import { type GhAuth, GitHubClient } from "../src/github.ts";
 import { setQuiet } from "../src/log.ts";
 import type { EventLog } from "../src/eventlog.ts";
+import { JOB_READS_FLOOR } from "../src/cadence.ts";
 import { runPoller } from "../src/poller.ts";
 import { Subscriptions } from "../src/subscriptions.ts";
 import { makeTools } from "../src/tools.ts";
@@ -46,7 +47,7 @@ async function setup(
     reviewRequests?: boolean;
     now?: () => number;
     hookRequests?: { repo: string; pr: number; at: number }[];
-    limits?: { total?: number; hook?: number; eventsPerPr?: number; eventWindowMs?: number };
+    limits?: { total?: number; hook?: number; eventsPerPr?: number; eventWindowMs?: number; sessionEvents?: number; sessionWindowMs?: number };
   } = {},
 ) {
   const gh = await startFakeGitHub({ token: TOKEN });
@@ -156,6 +157,23 @@ test("the user's own PR's failure still says to read the log first", async () =>
     assert.match(m?.content ?? "", /Read the failed job's log .*before changing anything\./);
   } finally {
     await t.stop();
+  }
+});
+
+test("on the user's own PR, a failed run a review or someone else started reaches Claude as tell the user", async () => {
+  for (const started of [{ event: "pull_request_review" }, { triggering_actor: { login: "stranger" } }]) {
+    const t = await setup();
+    try {
+      await until("baseline", () => t.subs.list()[0]?.last !== null && t.subs.list().length === 1);
+      t.gh.setJobs(41, [{ name: "unit tests", conclusion: "failure" }]);
+      t.gh.setRuns("acme/widgets", SHA, [{ id: 41, name: "CI", status: "completed", conclusion: "failure", ...started }]);
+      await until("the failure", () => t.kinds().includes("ci.workflow_failed"));
+      const m = t.messages.find((x) => x.meta.kind === "ci.workflow_failed");
+      assert.match(m?.content ?? "", /Tell the user\. This run was not started by a push or pull request of the signed-in GitHub login/, JSON.stringify(started));
+      assert.ok(!(m?.content ?? "").includes("before changing anything"), m?.content);
+    } finally {
+      await t.stop();
+    }
   }
 });
 
@@ -833,6 +851,40 @@ test("a job that fails while its run goes on, and a job left queued, each reach 
   }
 });
 
+// Paused (cadence.ts RATE_PAUSE) still reads a PR whose CI runs. At or below JOB_READS_FLOOR requests left, the jobs
+// and annotations it would also read are not read at all until the reset: the run's own result still arrives.
+test("at or below the job-reads floor, no run's jobs or annotations are read, and a failure still arrives", async () => {
+  assert.ok(JOB_READS_FLOOR >= 100 && JOB_READS_FLOOR <= 500, `a floor of ${JOB_READS_FLOOR}`);
+  const t = await setup({ autoSubscribe: "off" });
+  try {
+    t.gh.setRate(JOB_READS_FLOOR, 5000);
+    t.gh.setRuns("acme/widgets", SHA, [{ id: 41, name: "CI", status: "in_progress" }]);
+    t.gh.setJobs(41, [{ id: 1, name: "unit", status: "completed", conclusion: "failure", labels: [], created_at: new Date().toISOString() }]);
+    t.gh.setAnnotations(1, [{ path: "src/a.ts", start_line: 1, annotation_level: "failure" }]);
+    t.subs.add({ repo: "acme/widgets", pr: 7, source: "tool", events: ["ci.workflow_failed", "ci.job_failed", "ci.job_stuck_queued"] });
+    await until("the baseline", () => t.subs.list()[0]?.last != null);
+    for (let i = 0; i < 5; i++) await settle();
+    t.gh.setRuns("acme/widgets", SHA, [{ id: 41, name: "CI", status: "completed", conclusion: "failure" }]);
+    await until("the failure", () => t.kinds().includes("ci.workflow_failed"));
+    await settle();
+    const jobReads = t.gh.requests.filter((r) => r.path.includes("/jobs") || r.path.includes("/annotations"));
+    assert.deepEqual(jobReads.map((r) => r.path), [], "no jobs or annotations read at the floor");
+  } finally {
+    await t.stop();
+  }
+  // The control: one request above the floor, the same run's jobs are read.
+  const c = await setup({ autoSubscribe: "off" });
+  try {
+    c.gh.setRate(JOB_READS_FLOOR + 1, 5000);
+    c.gh.setRuns("acme/widgets", SHA, [{ id: 41, name: "CI", status: "in_progress" }]);
+    c.gh.setJobs(41, [{ id: 1, name: "unit", status: "in_progress", conclusion: null, labels: [], created_at: new Date().toISOString() }]);
+    c.subs.add({ repo: "acme/widgets", pr: 7, source: "tool", events: ["ci.job_failed"] });
+    await until("a jobs read", () => c.gh.requests.some((r) => r.path.includes("/actions/runs/41/jobs")));
+  } finally {
+    await c.stop();
+  }
+});
+
 test("a subscription that asked for no job event, or a run that has finished, costs no jobs read", async () => {
   const t = await setup({ autoSubscribe: "off" });
   try {
@@ -998,6 +1050,43 @@ test("a PR that changes faster than the event budget is reported up to the budge
     assert.ok(forPr.filter((m) => m.meta.kind === "ci.workflow_failed").length < 4, "not every failure: the rest were held back");
     assert.equal(forPr.filter((m) => m.meta.kind === "channel_throttled").length, 1);
     assert.match(forPr.find((m) => m.meta.kind === "channel_throttled")?.content ?? "", /ci_status/);
+  } finally {
+    await t.stop();
+  }
+});
+
+// Per PR, the throttle above. Across every PR, a session is sent at most limits.sessionEvents an hour: past that, ONE
+// notice that events are held back, then nothing more that hour, every one logged as filtered for budget.
+test("past the session's hourly event budget, one held-back notice is sent and the rest are logged as filtered for budget", async () => {
+  let shift = 0;
+  const t = await setup({ autoSubscribe: "off", now: () => Date.now() + shift, limits: { sessionEvents: 3, sessionWindowMs: 60 * 60_000 } });
+  try {
+    const SHA8 = "8".repeat(40);
+    t.gh.setPull("acme/widgets", 8, { head: { ref: "other", sha: SHA8 } });
+    t.gh.setRuns("acme/widgets", SHA8, [{ id: 80, name: "A", status: "queued" }]);
+    for (const pr of [7, 8]) t.subs.add({ repo: "acme/widgets", pr, source: "tool", events: ["ci.workflow_failed"] });
+    await until("baselines", () => t.subs.list().every((e) => e.last !== null));
+    const runs: Record<number, { id: number; name: string; status: string; conclusion: string }[]> = { 7: [], 8: [] };
+    const failed = () => t.records.filter((r) => r.type === "event" && r.kind === "ci.workflow_failed").length;
+    const fail = async (pr: 7 | 8, id: number) => {
+      const before = failed();
+      runs[pr].push({ id, name: `W${id}`, status: "completed", conclusion: "failure" });
+      t.gh.setRuns("acme/widgets", pr === 7 ? SHA : SHA8, [...runs[pr]]);
+      await until(`failure ${id} seen`, () => failed() > before);
+    };
+    for (const [pr, id] of [[7, 701], [8, 801], [7, 702], [8, 802], [7, 703], [8, 803]] as const) await fail(pr, id);
+    const sent = t.messages.filter((m) => m.meta.kind === "ci.workflow_failed");
+    assert.equal(sent.length, 3, "three events: the budget");
+    const notices = t.messages.filter((m) => m.meta.kind === "channel_held_back");
+    assert.equal(notices.length, 1, "one notice, not one per held-back event");
+    assert.match(notices[0].content, /held back/);
+    assert.match(notices[0].content, /ci_status/);
+    const budget = t.records.filter((r) => r.type === "event" && r.outcome === "filtered" && r.reason === "budget");
+    assert.equal(budget.length, 3, JSON.stringify(budget));
+    // An hour on, the session hears again.
+    shift = 61 * 60_000;
+    await fail(7, 704);
+    await until("sent again", () => t.messages.filter((m) => m.meta.kind === "ci.workflow_failed").length === 4);
   } finally {
     await t.stop();
   }

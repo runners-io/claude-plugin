@@ -276,8 +276,9 @@ function ownFolder(dir) {
  *
  * The shell runs the user's startup files, which may start things in the background (`sleep 60 &`, a watcher).
  * It is started in a process group of its own, and the whole group is killed when the shell exits or the limit
- * passes, so nothing it started outlives the check. A daemon that put itself in a new session (ssh-agent, a tmux
- * server) is not in the group and is left alone, as it would be after any terminal closed.
+ * passes, so nothing it started IN THAT GROUP outlives the check. A program that left the group (a daemon that put
+ * itself in a new session or group: ssh-agent, a tmux server) is not reached and is left alone, as it would be after
+ * any terminal closed.
  */
 function runShell(file, args, env, timeoutMs) {
   return new Promise((resolve) => {

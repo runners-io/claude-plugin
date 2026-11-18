@@ -86,3 +86,8 @@ test("the messages name the job, the workflow, labels or file:line, and how to r
   assert.equal(sm.meta.queued_seconds, "300");
   assert.match(sm.content, /queued for 5 min/);
 });
+
+test("a job whose id is not a safe positive integer is left out: the id goes into a gh command", () => {
+  const read = jobs({ id: 7, name: "ok" }, { id: -1, name: "neg" }, { id: 0, name: "zero" }, { id: 1.5, name: "frac" }, { id: 2 ** 60, name: "big" }, { id: "8", name: "text" });
+  assert.deepEqual(read.map((j) => j.name), ["ok"]);
+});

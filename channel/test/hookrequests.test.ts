@@ -78,3 +78,18 @@ test("at exit the channel removes its pid's folder, but never follows a symlink"
   removeRequests(root, 4243);
   assert.deepEqual(readdirSync(elsewhere), ["keep.json"]);
 });
+
+test("at exit, a requests folder that is a symlink is never followed into, even to a plain folder of the user's", () => {
+  const root = mkdtempSync(join(tmpdir(), "rio-req-"));
+  const elsewhere = mkdtempSync(join(tmpdir(), "rio-req-"));
+  mkdirSync(join(elsewhere, "4242"), { mode: 0o700 });
+  writeFileSync(join(elsewhere, "4242", "keep.json"), "{}");
+  symlinkSync(elsewhere, join(root, "requests"));
+  removeRequests(root, 4242);
+  assert.deepEqual(readdirSync(join(elsewhere, "4242")), ["keep.json"], "the folder the link points at is untouched");
+  // The control: the same layout as a real folder is removed.
+  const plain = mkdtempSync(join(tmpdir(), "rio-req-"));
+  const dir = put(plain, 4242, "a", { repo: "acme/widgets", pr: 1, at: Date.now() });
+  removeRequests(plain, 4242);
+  assert.equal(existsSync(dir), false);
+});

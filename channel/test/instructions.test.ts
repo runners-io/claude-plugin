@@ -12,6 +12,7 @@ test("the instructions name every event kind the channel can send", () => {
   assert.ok(INSTRUCTIONS.includes("ci.current_state"));
   assert.ok(INSTRUCTIONS.includes("review.requested"), "the session-wide kind too");
   assert.ok(INSTRUCTIONS.includes("channel_throttled"), "a PR whose events are held back, and what to do instead");
+  assert.ok(INSTRUCTIONS.includes("channel_held_back"), "a session whose events are held back for the hour, and what to do instead");
   assert.ok(INSTRUCTIONS.includes(NAMES_LABEL), "Claude is told what the label in each event means");
   for (const kind of ["label", "file path", "login"]) assert.ok(INSTRUCTIONS.includes(kind), kind);
 });
