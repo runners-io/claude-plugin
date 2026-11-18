@@ -28,11 +28,11 @@ in to github.com. If you don't have `gh`, the plugin's `setup-github` skill walk
 your agreement, and you sign in with `! gh auth login --web --scopes repo`.
 
 ```bash
-claude plugin marketplace add runners-io/claude-plugin#v0.2.6
+claude plugin marketplace add runners-io/claude-plugin#v0.2.8
 claude plugin install runners-io@runners-io
 ```
 
-This installs exactly one release: every release has a new version and a tag of its own (`v0.2.6` is this one), and
+This installs exactly one release: every release has a new version and a tag of its own (`v0.2.8` is this one), and
 the `#` and tag pin the marketplace to it. We do not move a release tag once it is published, so updating that
 marketplace never takes you past the release you chose. To move to a newer release, run
 `claude plugin marketplace remove runners-io` (which uninstalls the plugin), then the two commands above with the newer
@@ -55,7 +55,7 @@ Or from inside a session: `/plugin marketplace add runners-io/claude-plugin`, th
 To install from a copy you have checked out and read yourself:
 
 ```bash
-git clone --branch v0.2.6 --depth 1 https://github.com/runners-io/claude-plugin.git
+git clone --branch v0.2.8 --depth 1 https://github.com/runners-io/claude-plugin.git
 claude plugin marketplace add ./claude-plugin
 claude plugin install runners-io@runners-io
 ```
@@ -175,6 +175,10 @@ Workflow, job, branch and label names, file paths and logins are chosen by whoev
 so they come last, after that label, in quotes. The attributes that repeat them (`branch`, `workflow`, `job`,
 `labels`, `path`, `reviewer` and the rest) are named to Claude as data too, never instructions.
 
+A pull request's CI is the runs GitHub made for its head commit on its own branch in its own head repository. A run
+for the same commit from anyone else's fork or branch is not counted, so a stranger cannot report a pull request
+failed or green by pushing its commit elsewhere.
+
 | kind | when |
 |---|---|
 | `ci.workflow_started` | CI starts on a new head commit: one event per push, with how many workflows started (`workflows`); further starts on the same commit, re-runs included, are logged but not sent |
@@ -223,7 +227,8 @@ When your hourly limit runs low (the newest reading any session on this machine 
 | 15% or less | also paused: finished pull requests, the base branch and the search for a new pull request. A pull request whose CI is running is still read, so its result still arrives |
 
 The pause ends when GitHub resets the limit (`x-ratelimit-reset`). Separately, below 200 requests left
-(`RUNNERS_IO_RATE_FLOOR`) it looks four times less often, whichever is slower.
+(`RUNNERS_IO_RATE_FLOOR`) it looks four times less often, whichever is slower. A longer interval never runs past the
+reset, and when GitHub refuses a request for the limit, the channel waits until the reset and no longer.
 
 ## What is sent, and what is never sent
 
@@ -322,7 +327,8 @@ deletes files older than 14 days. A record is one of these:
 - each subscription and why it ended;
 - each API error or setup problem;
 - each change in the rate-limit backoff (slowed, paused, normal again);
-- a heartbeat every five minutes, with the requests made and the rate limit left.
+- a heartbeat every five minutes, with the requests made and the rate limit left, including while it waits for a
+  rate-limit reset (`waiting_ms` says how long is left).
 
 It holds no token and no response body. The directory is 0700 and the files are 0600.
 
@@ -331,10 +337,16 @@ node scripts/event-log-summary.mjs --dir "$RUNNERS_IO_EVENT_LOG_DIR" --since 24h
 node scripts/event-log-summary.mjs --dir "$RUNNERS_IO_EVENT_LOG_DIR" --since 24h --github   # and check against GitHub
 ```
 
-`--github` uses your `gh` login to ask GitHub what happened on each pull request the log says was watched. It lists
+`--github` uses your `gh` login to ask GitHub what happened on each pull request the log says was watched. It reads
+each pull request's runs per head branch and each base branch once, prints how many requests it made, and stops
+with "could not evaluate" (exit 2) when the login has fewer than 1,500 requests left (`--github-floor`), so it never
+spends what your other sessions and tools need. It lists
 as a miss any failed run, any close or merge, any label or draft change, any flaky re-run, any base-branch turn, any
 approval or request for changes, and any new review thread that no session was sent. Merge conflicts, resolved threads
-and "ready to merge" are not checked, because GitHub keeps no history of them.
+and "ready to merge" are not checked, because GitHub keeps no history of them. A kind the subscription left out is
+not expected, a base-branch turn is told once per session on any one of its pull requests on that branch, and a
+change overtaken within one poll (a commit replaced seconds after it failed, a watch ended
+seconds after a merge) is counted as overtaken, not missed.
 
 The script exits 0 when it finds nothing, 1 on a miss, a gap or an error, and 2 when it could not evaluate.
 

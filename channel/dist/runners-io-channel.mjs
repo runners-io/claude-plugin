@@ -1038,6 +1038,10 @@ var GitHubClient = class {
     const newest = other && (!own || other.at >= own.at) ? other : own;
     return newest && newest.reset !== void 0 && this.now() >= newest.reset ? null : newest;
   }
+  /** When GitHub refills the REST limit (epoch ms), from the newest reading; null when unknown or already past. */
+  get rateResetAt() {
+    return this.newestRate()?.reset ?? null;
+  }
   /** GraphQL's own budget (points), as the newest review read on this machine reported it, or null. */
   get graphqlRemaining() {
     return this.newestRate("rate-graphql.json", this.ownGraphqlRate)?.remaining ?? null;
@@ -1073,6 +1077,7 @@ var GitHubClient = class {
         merged: p.merged === true || Boolean(p.merged_at),
         headSha: String(p.head?.sha ?? ""),
         headRef: String(p.head?.ref ?? ""),
+        headRepo: typeof p.head?.repo?.full_name === "string" ? p.head.repo.full_name : null,
         mergeableState: mergeability(p),
         htmlUrl: String(p.html_url ?? ""),
         ...typeof (p.merged_at ?? p.closed_at) === "string" ? { closedAt: String(p.merged_at ?? p.closed_at) } : {},
@@ -1094,11 +1099,20 @@ var GitHubClient = class {
       return first && Number.isInteger(first.number) ? first.number : null;
     });
   }
-  runsForSha(repo, sha) {
-    const q = new URLSearchParams({ head_sha: sha, per_page: "100" });
-    return this.get(`/repos/${repo}/actions/runs?${q}`, this.freshMs, (j) => {
+  /**
+   * The pull request's own runs on its head commit. GitHub answers `head_sha` with EVERY run on that commit in the
+   * repository, and anybody can push a public commit to a fork and open a pull request of their own: those runs carry
+   * the same sha, and would be reported as this pull request's CI (a failure with the stranger's log, an approval
+   * wait). So the branch narrows the page GitHub returns, and only runs on the head's own repository and branch are
+   * kept. A head repository GitHub no longer names (a deleted fork) matches nothing.
+   */
+  async runsForSha(repo, sha, head) {
+    const q = new URLSearchParams({ head_sha: sha, branch: head.ref, per_page: "100" });
+    const all = await this.get(`/repos/${repo}/actions/runs?${q}`, this.freshMs, (j) => {
       const runs = j.workflow_runs ?? [];
       return runs.map((r) => ({
+        headBranch: typeof r.head_branch === "string" ? r.head_branch : null,
+        headRepo: typeof r.head_repository?.full_name === "string" ? r.head_repository.full_name : null,
         id: Number(r.id),
         name: String(r.name ?? r.display_title ?? "a workflow"),
         status: String(r.status ?? "queued"),
@@ -1109,6 +1123,12 @@ var GitHubClient = class {
         ...typeof r.updated_at === "string" ? { updatedAt: r.updated_at } : {}
       }));
     });
+    if (all.kind !== "ok") return all;
+    const own = head.repo?.toLowerCase();
+    return {
+      kind: "ok",
+      value: all.value.filter((r) => own !== void 0 && r.headRepo?.toLowerCase() === own && r.headBranch === head.ref).map(({ headBranch: _b, headRepo: _r, ...run }) => run)
+    };
   }
   /** The latest push runs on a branch: the base branch's health (rules.mjs `baseVerdict`). */
   baseRuns(repo, branch, freshMs = this.freshMs) {
@@ -1133,11 +1153,14 @@ var GitHubClient = class {
   jobAnnotations(repo, jobId) {
     return this.get(`/repos/${repo}/check-runs/${jobId}/annotations?per_page=50`, this.freshMs, parseAnnotations);
   }
-  failedJobs(repo, runId) {
-    return this.get(`/repos/${repo}/actions/runs/${runId}/jobs?per_page=100`, this.freshMs, (j) => {
-      const jobs2 = j.jobs ?? [];
-      return jobs2.filter((x) => typeof x.conclusion === "string" && FAILED_JOB.has(x.conclusion)).map((x) => String(x.name));
-    });
+  /**
+   * The names of a run's failed jobs, read through runJobs. The two once read the same path with two parsers, and the
+   * cache is keyed on the path: whichever ran second was handed the other's shape.
+   */
+  async failedJobs(repo, runId) {
+    const jobs2 = await this.runJobs(repo, runId);
+    if (jobs2.kind !== "ok") return jobs2;
+    return { kind: "ok", value: jobs2.value.filter((x) => x.conclusion !== null && FAILED_JOB.has(x.conclusion)).map((x) => x.name) };
   }
   /**
    * One pull request's reviews, threads and merge state (reviews.ts), in ONE GraphQL query: 1 point of GraphQL's
@@ -1495,6 +1518,11 @@ function ratePressure(remaining, limit) {
   const stretch = Math.min(STRETCH_MAX, RATE_SLOW / Math.max(share, RATE_SLOW / STRETCH_MAX));
   return { stretch: Math.round(stretch * 1e6) / 1e6, pause: share <= RATE_PAUSE };
 }
+function passSleepMs(p) {
+  let stretched = p.pollMs * p.factor;
+  if (p.factor > 1 && p.msToReset !== null && p.msToReset >= 0) stretched = Math.min(stretched, Math.max(p.pollMs, p.msToReset + 1e3));
+  return Math.max(stretched, p.retryMs > 0 ? p.retryMs + 1e3 : 0);
+}
 
 // src/eventlog.ts
 import { appendFileSync, chmodSync as chmodSync2, mkdirSync as mkdirSync2, readdirSync as readdirSync3, unlinkSync as unlinkSync3 } from "node:fs";
@@ -1605,7 +1633,7 @@ async function fetchSnapshot(gh, repo, pr, reuseRunsOf = null) {
   if (state === "open" && p.headSha && unchanged) {
     runs = reuseRunsOf.runs;
   } else if (state === "open" && p.headSha) {
-    const r = await gh.runsForSha(repo, p.headSha);
+    const r = await gh.runsForSha(repo, p.headSha, { ref: p.headRef, repo: p.headRepo });
     if (r.kind !== "ok") return r;
     runs = r.value;
   }
@@ -1850,6 +1878,7 @@ async function runPoller(deps) {
   };
   while (!signal.aborted) {
     let waitMs = config.pollSeconds * 1e3;
+    let retryMs = 0;
     const belowFloor = () => gh.rateRemaining !== null && gh.rateRemaining < config.rateFloor;
     gh.freshMs = waitMs * Math.max(belowFloor() ? 4 : 1, pressure().stretch);
     {
@@ -1948,7 +1977,7 @@ async function runPoller(deps) {
       if (r.kind === "retry") {
         log(`GitHub: ${r.reason}`);
         events.write("api_error", { repo: entry.repo, pr: entry.pr, result: "retry", reason: r.reason, after_ms: r.afterMs ?? null });
-        if (r.afterMs) waitMs = Math.max(waitMs, r.afterMs);
+        if (r.afterMs) retryMs = Math.max(retryMs, r.afterMs);
         continue;
       }
       if (r.kind === "not_found") {
@@ -2028,19 +2057,32 @@ async function runPoller(deps) {
       events.write("problem", { kind: "no_repo_scope" });
       await send(scopeMessage(), null);
     }
-    if (Date.now() - lastBeat >= heartbeatMs) {
-      lastBeat = Date.now();
-      events.write("heartbeat", {
-        subscriptions: subs.list().length,
-        watching: subs.list().map((e) => `${e.repo}#${e.pr}`),
-        rate_remaining: gh.rateRemaining,
-        rate_limit: gh.rateLimit,
-        graphql_remaining: gh.graphqlRemaining,
-        requests: { ...gh.requests }
-      });
+    if (Date.now() - lastBeat >= heartbeatMs) beat();
+    const resetAt = gh.rateResetAt;
+    let left = passSleepMs({
+      pollMs: waitMs,
+      factor: Math.max(belowFloor() ? 4 : 1, pressure().stretch),
+      retryMs,
+      msToReset: resetAt === null ? null : resetAt - Date.now()
+    });
+    while (left > 0 && !signal.aborted) {
+      const piece = Math.min(left, Math.max(heartbeatMs, 1e3));
+      await sleep(piece, signal);
+      left -= piece;
+      if (left > 0 && !signal.aborted) beat(left);
     }
-    waitMs *= Math.max(belowFloor() ? 4 : 1, pressure().stretch);
-    await sleep(waitMs, signal);
+  }
+  function beat(waitingMs) {
+    lastBeat = Date.now();
+    events.write("heartbeat", {
+      subscriptions: subs.list().length,
+      watching: subs.list().map((e) => `${e.repo}#${e.pr}`),
+      rate_remaining: gh.rateRemaining,
+      rate_limit: gh.rateLimit,
+      graphql_remaining: gh.graphqlRemaining,
+      requests: { ...gh.requests },
+      ...waitingMs !== void 0 ? { waiting_ms: Math.round(waitingMs) } : {}
+    });
   }
 }
 async function withFailedJobs(gh, change) {
@@ -2316,7 +2358,7 @@ function findLaunch(pid = process.ppid, ps = psRow) {
 }
 
 // src/main.ts
-var VERSION = "0.2.6";
+var VERSION = "0.2.8";
 function serve() {
   const config = loadConfig();
   const gh = new GitHubClient(config.githubApi, () => readGhAuth(process.env, void 0, config.githubApi), fetch, {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { after, test } from "node:test";
 
 import { type GhAuth, GitHubClient, readGhAuth } from "../src/github.ts";
+import { fetchSnapshot } from "../src/poller.ts";
 import { setQuiet } from "../src/log.ts";
 import { type FakeGitHub, startFakeGitHub } from "./fake-github.mjs";
 
@@ -96,6 +97,7 @@ test("getPull maps GitHub's pull request to PullInfo", async () => {
     merged: false,
     headSha: "b".repeat(40),
     headRef: "feat",
+    headRepo: "acme/widgets",
     mergeableState: "dirty",
     htmlUrl: "https://github.com/acme/widgets/pull/7",
     author: "octocat", // the fake PR's user.login: who opened it, read to screen a handed-over PR
@@ -107,8 +109,9 @@ test("a 304 returns the cached body", async () => {
   const gh = await fake();
   gh.setRuns("acme/widgets", "c".repeat(40), [{ id: 11, name: "CI", status: "in_progress" }]);
   const client = new GitHubClient(gh.base, ok());
-  const first = await client.runsForSha("acme/widgets", "c".repeat(40));
-  const second = await client.runsForSha("acme/widgets", "c".repeat(40));
+  const own = { ref: "fix-login", repo: "acme/widgets" };
+  const first = await client.runsForSha("acme/widgets", "c".repeat(40), own);
+  const second = await client.runsForSha("acme/widgets", "c".repeat(40), own);
   assert.deepEqual(gh.requests.map((r) => r.status), [200, 304]);
   assert.deepEqual(second, first);
   assert.equal(first.kind === "ok" && first.value[0].name, "CI");
@@ -168,6 +171,53 @@ test("failedJobs names the failed, timed-out and cancelled jobs only", async () 
     { name: "e2e", conclusion: "timed_out" },
   ]);
   assert.deepEqual(await new GitHubClient(gh.base, ok()).failedJobs("acme/widgets", 21), { kind: "ok", value: ["test", "e2e"] });
+});
+
+test("runsForSha keeps only runs from the pull request's own head repository and branch", async () => {
+  // A stranger can push the same public commit to a fork and open their own pull request: its runs carry the same
+  // head_sha in this repository, and must never be reported as this pull request's CI.
+  const gh = await fake();
+  const sha = "c".repeat(40);
+  gh.setRuns("acme/widgets", sha, [
+    { id: 11, name: "CI", head_branch: "fix-login", head_repository: { full_name: "acme/widgets" } },
+    { id: 12, name: "CI", head_branch: "fix-login", head_repository: { full_name: "stranger/widgets" } },
+    { id: 13, name: "CI", head_branch: "other", head_repository: { full_name: "acme/widgets" } },
+  ]);
+  const client = new GitHubClient(gh.base, ok());
+  const r = await client.runsForSha("acme/widgets", sha, { ref: "fix-login", repo: "Acme/Widgets" });
+  assert.deepEqual(r.kind === "ok" && r.value.map((x) => x.id), [11]);
+  assert.match(gh.requests.at(-1)?.path ?? "", /branch=fix-login/, "the branch narrows GitHub's page, so a stranger's runs cannot push ours off it");
+  const forked = await client.runsForSha("acme/widgets", sha, { ref: "fix-login", repo: "stranger/widgets" });
+  assert.deepEqual(forked.kind === "ok" && forked.value.map((x) => x.id), [12], "a fork's pull request keeps the fork's runs");
+  const gone = await client.runsForSha("acme/widgets", sha, { ref: "fix-login", repo: null });
+  assert.deepEqual(gone.kind === "ok" && gone.value, [], "a head repository GitHub no longer names matches nothing");
+});
+
+test("a pull request's snapshot holds no run of a stranger's pull request on the same commit", async () => {
+  const gh = await fake();
+  const sha = "e".repeat(40);
+  gh.setPull("acme/widgets", 5, { head: { sha, ref: "fix-login", repo: { full_name: "acme/widgets" } } });
+  gh.setRuns("acme/widgets", sha, [
+    { id: 21, name: "CI", status: "completed", conclusion: "success", head_branch: "fix-login", head_repository: { full_name: "acme/widgets" } },
+    { id: 22, name: "CI", status: "completed", conclusion: "failure", head_branch: "fix-login", head_repository: { full_name: "stranger/widgets" } },
+    { id: 23, name: "CI", status: "completed", conclusion: "action_required", head_branch: "fix-login", head_repository: { full_name: "stranger/widgets" } },
+  ]);
+  const snap = await fetchSnapshot(new GitHubClient(gh.base, ok()), "acme/widgets", 5);
+  assert.deepEqual(snap.kind === "ok" && snap.value.runs.map((x) => x.id), [21]);
+});
+
+test("runJobs and failedJobs on one run each get their own shape, whichever is cached first", async () => {
+  const gh = await fake();
+  gh.setJobs(31, [
+    { id: 1, name: "lint", conclusion: "success", status: "completed" },
+    { id: 2, name: "test", conclusion: "failure", status: "completed" },
+  ]);
+  const client = new GitHubClient(gh.base, ok());
+  const jobs = await client.runJobs("acme/widgets", 31);
+  assert.deepEqual(jobs.kind === "ok" && jobs.value.map((j) => j.name), ["lint", "test"]);
+  assert.deepEqual(await client.failedJobs("acme/widgets", 31), { kind: "ok", value: ["test"] });
+  const again = await client.runJobs("acme/widgets", 31);
+  assert.deepEqual(again.kind === "ok" && again.value.map((j) => j.name), ["lint", "test"]);
 });
 
 test("a 403 whose message is a secondary rate limit is a retry after at least a minute, not not_found", async () => {

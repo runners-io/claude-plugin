@@ -99,6 +99,11 @@ export interface PullInfo {
   readonly headSha: string;
   readonly headRef: string;
   /**
+   * The repository the head branch lives in (a fork's, for a pull request from a fork); null when GitHub no longer
+   * names one, as for a deleted fork. A run counts as this pull request's only if it ran on this repository and branch.
+   */
+  readonly headRepo: string | null;
+  /**
    * `dirty` is a merge conflict, `unknown` is "still computing", `clean` is neither. Read from GitHub's
    * `mergeable` boolean first: a draft PR's `mergeable_state` is `draft` whether or not it conflicts.
    */
@@ -155,7 +160,7 @@ interface GhPullJson {
   merged?: boolean;
   merged_at?: string | null;
   closed_at?: string | null;
-  head?: { sha?: string; ref?: string };
+  head?: { sha?: string; ref?: string; repo?: { full_name?: string } | null };
   mergeable?: boolean | null;
   mergeable_state?: string;
   html_url?: string;
@@ -176,6 +181,8 @@ interface GhRunJson {
   conclusion?: string | null;
   html_url?: string;
   run_attempt?: number;
+  head_branch?: string | null;
+  head_repository?: { full_name?: string } | null;
   created_at?: string;
   run_started_at?: string;
   updated_at?: string;
@@ -256,6 +263,11 @@ export class GitHubClient {
     return newest && newest.reset !== undefined && this.now() >= newest.reset ? null : newest;
   }
 
+  /** When GitHub refills the REST limit (epoch ms), from the newest reading; null when unknown or already past. */
+  get rateResetAt(): number | null {
+    return this.newestRate()?.reset ?? null;
+  }
+
   /** GraphQL's own budget (points), as the newest review read on this machine reported it, or null. */
   get graphqlRemaining(): number | null {
     return this.newestRate("rate-graphql.json", this.ownGraphqlRate)?.remaining ?? null;
@@ -295,6 +307,7 @@ export class GitHubClient {
         merged: p.merged === true || Boolean(p.merged_at),
         headSha: String(p.head?.sha ?? ""),
         headRef: String(p.head?.ref ?? ""),
+        headRepo: typeof p.head?.repo?.full_name === "string" ? p.head.repo.full_name : null,
         mergeableState: mergeability(p),
         htmlUrl: String(p.html_url ?? ""),
         ...(typeof (p.merged_at ?? p.closed_at) === "string" ? { closedAt: String(p.merged_at ?? p.closed_at) } : {}),
@@ -318,11 +331,20 @@ export class GitHubClient {
     });
   }
 
-  runsForSha(repo: string, sha: string): Promise<ApiResult<RunInfo[]>> {
-    const q = new URLSearchParams({ head_sha: sha, per_page: "100" });
-    return this.get(`/repos/${repo}/actions/runs?${q}`, this.freshMs, (j) => {
+  /**
+   * The pull request's own runs on its head commit. GitHub answers `head_sha` with EVERY run on that commit in the
+   * repository, and anybody can push a public commit to a fork and open a pull request of their own: those runs carry
+   * the same sha, and would be reported as this pull request's CI (a failure with the stranger's log, an approval
+   * wait). So the branch narrows the page GitHub returns, and only runs on the head's own repository and branch are
+   * kept. A head repository GitHub no longer names (a deleted fork) matches nothing.
+   */
+  async runsForSha(repo: string, sha: string, head: { readonly ref: string; readonly repo: string | null }): Promise<ApiResult<RunInfo[]>> {
+    const q = new URLSearchParams({ head_sha: sha, branch: head.ref, per_page: "100" });
+    const all = await this.get(`/repos/${repo}/actions/runs?${q}`, this.freshMs, (j) => {
       const runs = ((j as { workflow_runs?: unknown }).workflow_runs ?? []) as GhRunJson[];
       return runs.map((r) => ({
+        headBranch: typeof r.head_branch === "string" ? r.head_branch : null,
+        headRepo: typeof r.head_repository?.full_name === "string" ? r.head_repository.full_name : null,
         id: Number(r.id),
         name: String(r.name ?? r.display_title ?? "a workflow"),
         status: String(r.status ?? "queued"),
@@ -333,6 +355,14 @@ export class GitHubClient {
         ...(typeof r.updated_at === "string" ? { updatedAt: r.updated_at } : {}),
       }));
     });
+    if (all.kind !== "ok") return all;
+    const own = head.repo?.toLowerCase();
+    return {
+      kind: "ok",
+      value: all.value
+        .filter((r) => own !== undefined && r.headRepo?.toLowerCase() === own && r.headBranch === head.ref)
+        .map(({ headBranch: _b, headRepo: _r, ...run }) => run),
+    };
   }
 
   /** The latest push runs on a branch: the base branch's health (rules.mjs `baseVerdict`). */
@@ -362,11 +392,14 @@ export class GitHubClient {
     return this.get(`/repos/${repo}/check-runs/${jobId}/annotations?per_page=50`, this.freshMs, parseAnnotations);
   }
 
-  failedJobs(repo: string, runId: number): Promise<ApiResult<string[]>> {
-    return this.get(`/repos/${repo}/actions/runs/${runId}/jobs?per_page=100`, this.freshMs, (j) => {
-      const jobs = ((j as { jobs?: unknown }).jobs ?? []) as { name?: unknown; conclusion?: unknown }[];
-      return jobs.filter((x) => typeof x.conclusion === "string" && FAILED_JOB.has(x.conclusion)).map((x) => String(x.name));
-    });
+  /**
+   * The names of a run's failed jobs, read through runJobs. The two once read the same path with two parsers, and the
+   * cache is keyed on the path: whichever ran second was handed the other's shape.
+   */
+  async failedJobs(repo: string, runId: number): Promise<ApiResult<string[]>> {
+    const jobs = await this.runJobs(repo, runId);
+    if (jobs.kind !== "ok") return jobs;
+    return { kind: "ok", value: jobs.value.filter((x) => x.conclusion !== null && FAILED_JOB.has(x.conclusion)).map((x) => x.name) };
   }
 
   /**

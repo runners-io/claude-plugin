@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { FINISHED_MAX_MS, FINISHED_MS, PENDING_MS, PENDING_WINDOW_MS, RUNS_EVERY_MS, lookEveryMs, phaseOf, ratePressure } from "../src/cadence.ts";
+import { FINISHED_MAX_MS, FINISHED_MS, PENDING_MS, PENDING_WINDOW_MS, RUNS_EVERY_MS, lookEveryMs, passSleepMs, phaseOf, ratePressure } from "../src/cadence.ts";
 import type { RunInfo } from "../src/github.ts";
 import type { Snapshot } from "../src/state.ts";
 
@@ -63,4 +63,18 @@ test("the rate limit: nothing changes above 30% left; below it every interval st
   assert.deepEqual(ratePressure(0, 5000), { stretch: 8, pause: true }, "capped");
   assert.deepEqual(ratePressure(60, 60), { stretch: 1, pause: false }, "an unauthenticated limit of 60 works the same");
   assert.deepEqual(ratePressure(5, 60), { stretch: 3.6, pause: true });
+});
+
+test("a pass never sleeps past GitHub's reset for a back-off, and never multiplies GitHub's own wait", () => {
+  // As an event log once had it: a 20 s interval, the back-off at its most (x8), GitHub saying to wait 107.8 s for the
+  // reset. The old rule slept (107.8 s x 8) = 862 s, a 14.4-minute gap with nothing written.
+  assert.equal(passSleepMs({ pollMs: 20_000, factor: 8, retryMs: 107_756, msToReset: 107_756 }), 108_756);
+  // A stretched interval stops at the reset: the reading is void then, and the next pass finds the limit refilled.
+  assert.equal(passSleepMs({ pollMs: 20_000, factor: 8, retryMs: 0, msToReset: 30_000 }), 31_000);
+  // ...but never below one plain interval.
+  assert.equal(passSleepMs({ pollMs: 20_000, factor: 8, retryMs: 0, msToReset: 2_000 }), 20_000);
+  // With no reset known, the stretch applies as before, and GitHub's wait is a floor, not a multiplicand.
+  assert.equal(passSleepMs({ pollMs: 20_000, factor: 4, retryMs: 0, msToReset: null }), 80_000);
+  assert.equal(passSleepMs({ pollMs: 20_000, factor: 4, retryMs: 120_000, msToReset: null }), 121_000);
+  assert.equal(passSleepMs({ pollMs: 20_000, factor: 1, retryMs: 0, msToReset: 5_000 }), 20_000);
 });

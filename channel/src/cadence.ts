@@ -78,3 +78,15 @@ export function ratePressure(remaining: number | null, limit: number | null): { 
   const stretch = Math.min(STRETCH_MAX, RATE_SLOW / Math.max(share, RATE_SLOW / STRETCH_MAX));
   return { stretch: Math.round(stretch * 1e6) / 1e6, pause: share <= RATE_PAUSE };
 }
+
+/**
+ * How long one pass of the poller sleeps. The interval stretches by `factor` (the rate back-off), but never past
+ * GitHub's reset plus a second, when the reading is void and the limit refilled, and never below one plain interval.
+ * GitHub's own wait (a 403's retry-after or reset) is a floor, never multiplied: a 107.8 s wait for the reset, times
+ * the back-off's 8, was once slept as 14.4 minutes.
+ */
+export function passSleepMs(p: { pollMs: number; factor: number; retryMs: number; msToReset: number | null }): number {
+  let stretched = p.pollMs * p.factor;
+  if (p.factor > 1 && p.msToReset !== null && p.msToReset >= 0) stretched = Math.min(stretched, Math.max(p.pollMs, p.msToReset + 1000));
+  return Math.max(stretched, p.retryMs > 0 ? p.retryMs + 1000 : 0);
+}

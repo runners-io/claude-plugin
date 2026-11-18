@@ -38,6 +38,8 @@ async function setup(
     autoSubscribe?: "pr" | "off";
     scope?: GitScope;
     heartbeatMs?: number;
+    pollSeconds?: number;
+    sleep?: (ms: number) => Promise<void>;
     rateFloor?: number;
     inOwnHistory?: (sha: string) => Promise<boolean | null>;
     baseEveryMs?: number;
@@ -55,7 +57,7 @@ async function setup(
   const client = new GitHubClient(gh.base, async () => auth.current);
   const subs = new Subscriptions();
   const scope = { current: opts.scope ?? ({ repo: "acme/widgets", branch: "feat" } as GitScope) };
-  const config: Config = { githubApi: gh.base, projectDir: "/nowhere", autoSubscribe: opts.autoSubscribe ?? "pr", pollSeconds: 20, eventLogDir: null, rateFloor: opts.rateFloor ?? 200, reviewRequests: opts.reviewRequests ?? false };
+  const config: Config = { githubApi: gh.base, projectDir: "/nowhere", autoSubscribe: opts.autoSubscribe ?? "pr", pollSeconds: opts.pollSeconds ?? 20, eventLogDir: null, rateFloor: opts.rateFloor ?? 200, reviewRequests: opts.reviewRequests ?? false };
   const messages: ChannelMessage[] = [];
   const records: Rec[] = [];
   const eventLog: EventLog = { write: (type, fields = {}) => void records.push({ type, ...fields }) };
@@ -69,7 +71,7 @@ async function setup(
       messages.push(m);
     },
     signal: stop.signal,
-    sleep: () => new Promise((r) => setTimeout(r, 5)),
+    sleep: opts.sleep ?? (() => new Promise((r) => setTimeout(r, 5))),
     eventLog,
     heartbeatMs: opts.heartbeatMs,
     inOwnHistory: opts.inOwnHistory,
@@ -335,6 +337,33 @@ test("an event the subscription does not want is logged as filtered, and a tool 
     assert.equal(pass?.outcome, "filtered");
     assert.deepEqual(t.messages, []);
     assert.ok(t.records.some((r) => r.type === "subscribe" && r.source === "tool" && r.pr === 7));
+  } finally {
+    await t.stop();
+  }
+});
+
+test("a long back-off is slept in heartbeat-sized pieces, with a heartbeat after each, so a waiting session is not taken for dead", async () => {
+  // Two sessions at a spent limit once wrote nothing for 14 and 16 minutes, and a check of the event log counted
+  // them as gaps. The wait was one sleep.
+  const slept: number[] = [];
+  const t = await setup({
+    heartbeatMs: 30_000,
+    sleep: async (ms) => {
+      slept.push(ms);
+      await new Promise((r) => setTimeout(r, 5));
+    },
+  });
+  try {
+    await until("baseline", () => t.subs.list()[0]?.last != null);
+    const resetEpoch = Math.floor(Date.now() / 1000) + 100;
+    t.gh.setRate(0, 5000, resetEpoch); // as on the day: every answer says none are left until the reset
+    t.gh.state.rateLimited = { resetEpoch };
+    await until("the limit is hit", () => t.records.some((r) => r.type === "api_error" && /rate limit/.test(String(r.reason))));
+    const from = slept.length;
+    const beats = t.records.filter((r) => r.type === "heartbeat").length;
+    await until("the wait is under way", () => slept.length >= from + 3);
+    assert.ok(Math.max(...slept.slice(from)) <= 30_000, `no single sleep longer than a heartbeat interval: ${slept.slice(from)}`);
+    assert.ok(t.records.filter((r) => r.type === "heartbeat").length > beats, "a heartbeat while it waits");
   } finally {
     await t.stop();
   }

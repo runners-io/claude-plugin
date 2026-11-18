@@ -257,6 +257,207 @@ test("with --github, the new kinds are checked too: labels and draft from issue 
   assert.match(s.github.not_checked, /pr.body_edited/);
 });
 
+// One check reported 43 MISSes, 41 of them false. Each rule below is one of their causes; PR 9 is
+// the control, a close nothing reported, which must stay a MISS.
+test("with --github, no MISS for an unsubscribe-all, a kind the subscription excluded, or an event overtaken within one poll", async () => {
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  const sha = (c) => c.repeat(40);
+  // A: closed after the session's unsubscribe-all (repo null), which must close every window of that session.
+  gh.setPull("acme/widgets", 1, { head: { sha: sha("1"), ref: "one" }, state: "closed", closed_at: ago(50) });
+  // B: the subscription asked for failures only. The merge was logged as filtered; the approval was never computed.
+  gh.setPull("acme/widgets", 2, { head: { sha: sha("2"), ref: "two" }, state: "closed", merged: true, merged_at: ago(50), closed_at: ago(50) });
+  gh.setReviews("acme/widgets", 2, [{ id: 902, state: "APPROVED", submitted_at: ago(70) }]);
+  gh.setPull("acme/widgets", 3, { head: { sha: sha("3"), ref: "three" } });
+  gh.setRuns("acme/widgets", sha("3"), [{ id: 31, name: "CI", status: "completed", conclusion: "failure", created_at: ago(90), updated_at: ago(80) }]);
+  // E: a failure on a commit replaced 20 s later, and a merge the session stopped watching 20 s after.
+  const old4 = sha("4");
+  const new4 = sha("5");
+  gh.setPull("acme/widgets", 4, { head: { sha: new4, ref: "four" } });
+  gh.setCommits("acme/widgets", 4, [old4, new4]);
+  gh.setRuns("acme/widgets", old4, [{ id: 41, name: "CI", status: "completed", conclusion: "failure", created_at: ago(90), updated_at: ago(60) }]);
+  gh.setRuns("acme/widgets", new4, [{ id: 42, name: "CI", status: "in_progress", created_at: ago(60 - 1 / 3), updated_at: ago(59) }]);
+  gh.setPull("acme/widgets", 6, { head: { sha: sha("6"), ref: "six" }, state: "closed", merged: true, merged_at: ago(40), closed_at: ago(40) });
+  // The control: watched for every kind, closed, nothing sent.
+  gh.setPull("acme/widgets", 9, { head: { sha: sha("9"), ref: "nine" }, state: "closed", closed_at: ago(30) });
+  const s2 = { session: "s2", project: "/w/repo" };
+  const dir = writeLog([
+    { ...s2, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 1, source: "tool", events: "all" },
+    { ...s2, t: ago(80), type: "unsubscribe", repo: null, pr: null, source: "tool", reason: "tool", count: 1 },
+    { ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 2, source: "tool", events: ["ci.workflow_failed"] },
+    { ...base, t: ago(49), type: "event", kind: "pr.merged", repo: "acme/widgets", pr: 2, outcome: "filtered" },
+    { ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 3, source: "tool", events: ["pr.merged"] },
+    { ...base, t: ago(79), type: "event", kind: "ci.workflow_failed", repo: "acme/widgets", pr: 3, run_id: 31, outcome: "filtered" },
+    { ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 4, source: "tool", events: "all" },
+    { ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 6, source: "tool", events: "all" },
+    { ...base, t: ago(40 - 1 / 3), type: "unsubscribe", repo: "acme/widgets", pr: 6, source: "tool", reason: "tool", count: 1 },
+    { ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 9, source: "tool", events: "all" },
+    beat(105),
+    { ...s2, t: ago(100), type: "heartbeat", subscriptions: 1, rate_remaining: 4000, requests: { ok: 1, not_modified: 1, other: 0 } },
+    { ...s2, t: ago(5), type: "heartbeat", subscriptions: 0, rate_remaining: 4000, requests: { ok: 1, not_modified: 1, other: 0 } },
+    beat(75),
+    beat(45),
+    beat(15),
+    beat(1),
+  ]);
+  const r = await run(["--dir", dir, "--since", "24h", "--json", "--github", "--github-api", gh.base]);
+  assert.equal(r.code, 1, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.deepEqual(
+    out.github.misses.map((m) => `${m.kind}#${m.pr}`),
+    ["pr.closed#9"],
+    "only the control is a MISS",
+  );
+  assert.equal(out.github.overtaken, 2, "the replaced commit's failure and the merge watched 20 s longer");
+});
+
+test("with --github, the base replay reads far enough back to know a workflow's last verdict: a red that never cleared is not a new red", async () => {
+  // Once, main's dependency audit failed, then more than 100 push runs finished. The newest 100 no longer
+  // held it, so the check saw main green, then expected a base.red that the channel rightly never sent.
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  const A = "a".repeat(40);
+  gh.setPull("acme/widgets", 7, { head: { sha: A, ref: "feat" }, base: { ref: "main" } });
+  gh.setCommits("acme/widgets", 7, [A]);
+  const runs = [{ id: 1, name: "Audit", status: "completed", conclusion: "failure", created_at: ago(100), updated_at: ago(99) }];
+  for (let i = 0; i < 120; i++) {
+    const at = 98 - i * 0.5;
+    runs.push({ id: 100 + i, name: "CI", status: "completed", conclusion: "success", created_at: ago(at), updated_at: ago(at - 0.1) });
+  }
+  runs.push({ id: 999, name: "Lint", status: "completed", conclusion: "failure", created_at: ago(20), updated_at: ago(19) });
+  gh.setBaseRuns("acme/widgets", "main", runs);
+  const dir = writeLog([
+    { ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 7, source: "auto" },
+    { ...base, t: ago(98), type: "event", kind: "base.red", repo: "acme/widgets", pr: 7, outcome: "sent", base: "main", failing: ["Audit"] },
+    beat(105),
+    beat(75),
+    beat(45),
+    beat(15),
+    beat(1),
+  ]);
+  const r = await run(["--dir", dir, "--since", "24h", "--json", "--github", "--github-api", gh.base]);
+  const out = JSON.parse(r.stdout);
+  assert.deepEqual(out.github.misses.filter((m) => m.kind.startsWith("base.")), [], r.stderr);
+});
+
+test("with --github, a watch that began before the window keeps the events its subscription chose", async () => {
+  // A session subscribed to failures only, the evening before; the check's window opened on its heartbeats' watching
+  // list, which names the PR but not the choice, so every other kind was expected of it and counted as MISSes.
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  gh.setPull("acme/widgets", 1, { head: { sha: "1".repeat(40), ref: "one" }, state: "closed", closed_at: ago(60) });
+  // The control: subscribed before the window to every kind, closed, nothing sent. It must stay a MISS.
+  gh.setPull("acme/widgets", 2, { head: { sha: "2".repeat(40), ref: "two" }, state: "closed", closed_at: ago(60) });
+  const watching = ["acme/widgets#1", "acme/widgets#2"];
+  const dir = writeLog([
+    { ...base, t: ago(30 * 60), type: "subscribe", repo: "acme/widgets", pr: 1, source: "tool", events: ["ci.workflow_failed"] },
+    { ...base, t: ago(30 * 60), type: "subscribe", repo: "acme/widgets", pr: 2, source: "tool", events: "all" },
+    beat(105, { subscriptions: 2, watching }),
+    beat(75, { subscriptions: 2, watching }),
+    beat(45, { subscriptions: 2, watching }),
+    beat(15, { subscriptions: 2, watching }),
+    beat(1, { subscriptions: 2, watching }),
+  ]);
+  const r = await run(["--dir", dir, "--since", "2h", "--json", "--github", "--github-api", gh.base]);
+  const out = JSON.parse(r.stdout);
+  assert.deepEqual(out.github.misses.map((m) => `${m.kind}#${m.pr}`), ["pr.closed#2"], r.stderr);
+});
+
+test("with --github, a base turn is told once per session and base, on any one of its PRs: the others are not MISSes", async () => {
+  // The channel reads a base branch once for all of a session's PRs on it, and sends base.red on one of them. A check
+  // looked for it on every PR, and counted the session's other PRs on main as missed.
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  for (const pr of [7, 8, 9]) {
+    const sha = String(pr).repeat(40);
+    gh.setPull("acme/widgets", pr, { head: { sha, ref: `feat-${pr}` }, base: { ref: "main" } });
+    gh.setCommits("acme/widgets", pr, [sha]);
+  }
+  gh.setBaseRuns("acme/widgets", "main", [
+    { id: 1, name: "CI", status: "completed", conclusion: "success", created_at: ago(150), updated_at: ago(140) },
+    { id: 2, name: "CI", status: "completed", conclusion: "failure", created_at: ago(65), updated_at: ago(60) },
+  ]);
+  const s2 = { session: "s2", project: "/w/other" };
+  const dir = writeLog([
+    { ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 7, source: "auto" },
+    { ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 8, source: "tool" },
+    // The control: another session watching PR 9 on the same base, told nothing. It must stay a MISS.
+    { ...s2, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 9, source: "tool" },
+    { ...base, t: ago(59), type: "event", kind: "base.red", repo: "acme/widgets", pr: 7, base: "main", failing: ["CI"], outcome: "sent" },
+    beat(105),
+    beat(75),
+    beat(45),
+    beat(15),
+    beat(1),
+    { ...s2, t: ago(100), type: "heartbeat", subscriptions: 1, rate_remaining: 4000, requests: { ok: 1, not_modified: 1, other: 0 } },
+    { ...s2, t: ago(50), type: "heartbeat", subscriptions: 1, rate_remaining: 4000, requests: { ok: 1, not_modified: 1, other: 0 } },
+    { ...s2, t: ago(2), type: "heartbeat", subscriptions: 1, rate_remaining: 4000, requests: { ok: 1, not_modified: 1, other: 0 } },
+  ]);
+  const r = await run(["--dir", dir, "--since", "24h", "--json", "--github", "--github-api", gh.base]);
+  const out = JSON.parse(r.stdout);
+  assert.deepEqual(out.github.misses.map((m) => `${m.kind}#${m.pr}`), ["base.red#9"], r.stderr);
+});
+
+test("with --github, a PR's runs are read per head branch, not once per commit, and the requests made are counted", async () => {
+  // A PR the merge queue updates collects a commit each time; one read per commit made a day's check cost thousands.
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  const shas = ["a", "b", "c", "d", "e"].map((c) => c.repeat(40));
+  gh.setPull("acme/widgets", 7, { head: { sha: shas[4], ref: "feat" } });
+  gh.setCommits("acme/widgets", 7, shas);
+  shas.forEach((sha, i) =>
+    gh.setRuns("acme/widgets", sha, [
+      { id: 40 + i, name: "CI", status: "completed", conclusion: i === 4 ? "failure" : "success", created_at: ago(100 - i * 10), updated_at: ago(98 - i * 10) },
+    ]),
+  );
+  const dir = writeLog([{ ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 7, source: "auto" }, beat(105), beat(75), beat(45), beat(15), beat(1)]);
+  const r = await run(["--dir", dir, "--since", "24h", "--json", "--github", "--github-api", gh.base]);
+  const out = JSON.parse(r.stdout);
+  assert.deepEqual(out.github.misses.map((m) => `${m.kind}:${m.run_id}`), ["ci.workflow_failed:44"], "the head's failure is still found");
+  const runReads = gh.requests.filter((q) => /\/actions\/runs\?/.test(q.path));
+  assert.equal(runReads.length, 1, runReads.map((q) => q.path).join(", "));
+  assert.equal(out.github.requests, gh.requests.length);
+});
+
+test("with --github, the check stops below the login's floor of requests left: 'could not evaluate' (exit 2), never a drain", async () => {
+  // The check shares its login with every session and tool; a check that spends the last of it stalls all of them.
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  gh.setRate(1400, 5000);
+  gh.setPull("acme/widgets", 7, { head: { sha: "a".repeat(40), ref: "feat" } });
+  gh.setCommits("acme/widgets", 7, ["a".repeat(40)]);
+  const dir = writeLog([{ ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 7, source: "auto" }, beat(105), beat(1)]);
+  const r = await run(["--dir", dir, "--since", "24h", "--json", "--github", "--github-api", gh.base]);
+  assert.equal(r.code, 2, r.stdout);
+  assert.match(r.stderr, /1400 .*left.*1500/);
+  assert.equal(gh.requests.length, 1, "it stopped at the first answer");
+});
+
+test("with --github, a base branch's history is read once for every PR on it, not once per PR", async () => {
+  // A replay of one day's log read main's history up to ten pages deep for each of 99 PRs, and spent the shared
+  // login's hourly limit, which every other tool on it also uses. The count of reads is the regression test.
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  const runs = [];
+  for (let i = 0; i < 150; i++) {
+    const at = 100 - i * 0.5;
+    runs.push({ id: 100 + i, name: "CI", status: "completed", conclusion: "success", created_at: ago(at), updated_at: ago(at - 0.1) });
+  }
+  gh.setBaseRuns("acme/widgets", "main", runs);
+  const records = [];
+  for (const pr of [7, 8, 9]) {
+    const sha = String(pr).repeat(40);
+    gh.setPull("acme/widgets", pr, { head: { sha, ref: `feat-${pr}` }, base: { ref: "main" } });
+    gh.setCommits("acme/widgets", pr, [sha]);
+    records.push({ ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr, source: "auto" });
+  }
+  const dir = writeLog([...records, beat(105), beat(75), beat(45), beat(15), beat(1)]);
+  const r = await run(["--dir", dir, "--since", "24h", "--json", "--github", "--github-api", gh.base]);
+  assert.notEqual(r.code, 2, r.stderr); // it evaluated
+  const baseReads = gh.requests.filter((q) => q.path.includes("/actions/runs?") && q.path.includes("event=push"));
+  assert.equal(baseReads.length, 2, `two pages of main's history, read once for all three PRs: ${baseReads.map((q) => q.path).join(", ")}`);
+});
+
 test("with --github, reviews and new review threads are checked against GitHub's REST history", async () => {
   const gh = await startFakeGitHub({ token: TOKEN });
   fakes.push(gh);

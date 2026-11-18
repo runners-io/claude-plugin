@@ -17,7 +17,7 @@
  *   one of its PRs is busy.
  */
 import type { Config } from "./config.ts";
-import { type Phase, REQUESTS_EVERY_MS, REVIEW_EVERY_MS, RUNS_EVERY_MS, lookEveryMs, phaseOf, ratePressure } from "./cadence.ts";
+import { type Phase, REQUESTS_EVERY_MS, REVIEW_EVERY_MS, RUNS_EVERY_MS, lookEveryMs, passSleepMs, phaseOf, ratePressure } from "./cadence.ts";
 import { type JobsSeen, jobChanges } from "./jobs.ts";
 import { type RequestsSeen, requestChanges, requestMessage } from "./requests.ts";
 import { type ReviewState, reviewChanges } from "./reviews.ts";
@@ -45,7 +45,7 @@ export async function fetchSnapshot(gh: GitHubClient, repo: string, pr: number, 
   if (state === "open" && p.headSha && unchanged) {
     runs = reuseRunsOf.runs;
   } else if (state === "open" && p.headSha) {
-    const r = await gh.runsForSha(repo, p.headSha);
+    const r = await gh.runsForSha(repo, p.headSha, { ref: p.headRef, repo: p.headRepo });
     if (r.kind !== "ok") return r;
     runs = r.value;
   }
@@ -383,6 +383,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
 
   while (!signal.aborted) {
     let waitMs = config.pollSeconds * 1000;
+    let retryMs = 0; // GitHub's own wait, from a rate-limited answer: a floor for this pass's sleep, never stretched
     const belowFloor = () => gh.rateRemaining !== null && gh.rateRemaining < config.rateFloor;
     // With other sessions on this machine (shared.ts), an answer younger than one interval is read from the
     // shared store instead of asking GitHub again, so N sessions cost what one does.
@@ -494,7 +495,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       if (r.kind === "retry") {
         log(`GitHub: ${r.reason}`);
         events.write("api_error", { repo: entry.repo, pr: entry.pr, result: "retry", reason: r.reason, after_ms: r.afterMs ?? null });
-        if (r.afterMs) waitMs = Math.max(waitMs, r.afterMs);
+        if (r.afterMs) retryMs = Math.max(retryMs, r.afterMs);
         continue;
       }
       if (r.kind === "not_found") {
@@ -586,20 +587,37 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       await send(scopeMessage(), null);
     }
 
-    if (Date.now() - lastBeat >= heartbeatMs) {
-      lastBeat = Date.now();
-      events.write("heartbeat", {
-        subscriptions: subs.list().length,
-        watching: subs.list().map((e) => `${e.repo}#${e.pr}`),
-        rate_remaining: gh.rateRemaining,
-        rate_limit: gh.rateLimit,
-        graphql_remaining: gh.graphqlRemaining,
-        requests: { ...gh.requests },
-      });
-    }
+    if (Date.now() - lastBeat >= heartbeatMs) beat();
 
-    waitMs *= Math.max(belowFloor() ? 4 : 1, pressure().stretch); // the newest reading, this pass's answers included
-    await sleep(waitMs, signal);
+    // The newest reading, this pass's answers included.
+    const resetAt = gh.rateResetAt;
+    let left = passSleepMs({
+      pollMs: waitMs,
+      factor: Math.max(belowFloor() ? 4 : 1, pressure().stretch),
+      retryMs,
+      msToReset: resetAt === null ? null : resetAt - Date.now(),
+    });
+    // A long wait (a spent limit) is slept in heartbeat-sized pieces, with a heartbeat after each: one sleep of a
+    // quarter of an hour wrote nothing, and the session looked dead.
+    while (left > 0 && !signal.aborted) {
+      const piece = Math.min(left, Math.max(heartbeatMs, 1000));
+      await sleep(piece, signal);
+      left -= piece;
+      if (left > 0 && !signal.aborted) beat(left);
+    }
+  }
+
+  function beat(waitingMs?: number): void {
+    lastBeat = Date.now();
+    events.write("heartbeat", {
+      subscriptions: subs.list().length,
+      watching: subs.list().map((e) => `${e.repo}#${e.pr}`),
+      rate_remaining: gh.rateRemaining,
+      rate_limit: gh.rateLimit,
+      graphql_remaining: gh.graphqlRemaining,
+      requests: { ...gh.requests },
+      ...(waitingMs !== undefined ? { waiting_ms: Math.round(waitingMs) } : {}),
+    });
   }
 }
 
