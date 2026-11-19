@@ -18,7 +18,7 @@
  *   one of its PRs is busy.
  */
 import type { Config } from "./config.ts";
-import { JOB_READS_FLOOR, PENDING_WINDOW_MS, type Phase, REQUESTS_EVERY_MS, REVIEW_EVERY_MS, RUNS_EVERY_MS, lookEveryMs, passSleepMs, phaseOf, ratePressure } from "./cadence.ts";
+import { JOB_READS_FLOOR, OWN_PUSH_FAST_MS, PENDING_WINDOW_MS, type Phase, REQUESTS_EVERY_MS, REVIEW_EVERY_MS, RUNS_EVERY_MS, lookEveryMs, passSleepMs, phaseOf, ratePressure } from "./cadence.ts";
 import { type JobsSeen, jobChanges } from "./jobs.ts";
 import { type RequestsSeen, requestChanges, requestMessage } from "./requests.ts";
 import { type ReviewState, reviewChanges } from "./reviews.ts";
@@ -181,15 +181,33 @@ export const DEFAULT_LIMITS = {
   sessionWindowMs: 60 * 60_000,
 };
 
-/** Said once when a PR's events pass the budget; nothing more is pushed for it until the window moves on. */
+/** Said once when a PR's events pass the budget; nothing more is pushed for it until the window moves on, but the exempt kinds. */
 function throttled(repo: string, pr: string, windowMs: number): ChannelMessage {
   return {
     content:
       `${repo} PR #${pr} changed more often than this session is told about in ${Math.round(windowMs / 60_000)} minutes, ` +
-      "so further events for it are held back for now. Call ci_status for its current state.",
+      "so further events for it are held back for now; its all-done summary, a merge or close, and the first failure on a commit are still sent, " +
+      "and its state is sent once the events are no longer held back. Call ci_status for its current state.",
     meta: { kind: "channel_throttled", repo, pr },
   };
 }
+
+/** Sent once when a throttled PR's window reopens: the state it reached while its events were held back. */
+function resumed(s: Snapshot): ChannelMessage {
+  return {
+    content: `Events for this pull request are no longer held back. Its state now, which may include what was held back: ${REPLY}\n${describe(s)}`,
+    meta: { kind: "channel_resumed", repo: s.repo, pr: String(s.pr) },
+  };
+}
+
+/**
+ * THE KINDS THE PER-PR THROTTLE NEVER HOLDS BACK: what the user is waiting for (ci.run_all_done), the end of the pull
+ * request (pr.merged, pr.closed), and the first ci.workflow_failed on each head commit. A repository with many workflows
+ * passed the budget on one bad push, and the all-done summary was dropped with the rest. Each is bounded by the PR's own
+ * life (one merge or close, one first failure a push, one all done a commit or a late workflow's), so they cannot flood.
+ * They still count towards the window, and towards the session's hourly budget, which holds everything back alike.
+ */
+export const THROTTLE_EXEMPT_KINDS = ["ci.run_all_done", "pr.merged", "pr.closed"] as const;
 
 /** Said once an hour while the session's own budget is spent; nothing more is pushed until the hour moves on. */
 function heldBack(windowMs: number): ChannelMessage {
@@ -217,6 +235,11 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
   // nothing for that PR until the window moves on. A PR whose CI changes faster than a person reads is noise, and
   // every event carries text from the repository.
   const sentAt = new Map<string, number[]>();
+  // Per PR whose events the throttle has held back this window: whether its notice was sent. The window reopening sends
+  // one state summary (resumed) and ends it.
+  const throttledPrs = new Map<string, { noticed: boolean }>();
+  // Per PR: the head commit whose first ci.workflow_failed was sent past the throttle (THROTTLE_EXEMPT_KINDS).
+  const firstFailureFor = new Map<string, string>();
   // Across every PR: when each message of the session's current window was sent (at most limits.sessionEvents), and
   // when the one heldBack notice of a spent window was. Past the budget nothing is sent but that notice, once a window.
   let sessionSent: number[] = [];
@@ -248,13 +271,20 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       const key = `${meta.repo.toLowerCase()}#${meta.pr}`;
       const recent = (sentAt.get(key) ?? []).filter((t) => now() - t < limits.eventWindowMs);
       sentAt.set(key, recent);
-      if (recent.length > limits.eventsPerPr) return events.write("event", { ...fields, outcome: "filtered", reason: "throttled" });
-      recent.push(now());
-      if (recent.length > limits.eventsPerPr) {
+      const firstFailure = change?.kind === "ci.workflow_failed" && firstFailureFor.get(key) !== change.snapshot.headSha;
+      const exempt = change !== null && ((THROTTLE_EXEMPT_KINDS as readonly string[]).includes(change.kind) || firstFailure);
+      if (firstFailure && change) firstFailureFor.set(key, change.snapshot.headSha);
+      if (!exempt && recent.length >= limits.eventsPerPr) {
         events.write("event", { ...fields, outcome: "filtered", reason: "throttled" });
+        const held = throttledPrs.get(key);
+        if (held?.noticed) return;
+        throttledPrs.set(key, { noticed: true });
         message = throttled(meta.repo, meta.pr, limits.eventWindowMs);
         fields = { ...eventFields(message, null), ...extra };
+      } else if (exempt && recent.length >= limits.eventsPerPr) {
+        fields = { ...fields, throttle_exempt: true };
       }
+      recent.push(now());
     }
     sessionSent.push(now());
     return notifyAndLog(message, fields);
@@ -283,6 +313,10 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
   const atJobFloor = () => gh.rateRemaining !== null && gh.rateRemaining <= JOB_READS_FLOOR;
   let rateLevel: "normal" | "slowed" | "paused" = "normal";
   const looks = new Map<string, { next: number; quiet: number; phase: Phase; headSha: string; headSeenAt: number; runsReadAt: number }>();
+  /** The clone's `origin/<branch>` at the last pass (git.ts `pushed`), to tell the session's own push. */
+  const lastPushed: { label: string; sha: string | null } = { label: "", sha: null };
+  /** Per watched PR: until when it is looked at every pass, after the session's own push to its branch. */
+  const fastUntil = new Map<string, number>();
   let findLabel = "";
   let findSince = 0;
   let foundAt = Number.NEGATIVE_INFINITY;
@@ -470,7 +504,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
    */
   function forgetEnded(): void {
     const watched = new Set(subs.list().map((e) => e.key));
-    const perPr: Map<string, unknown>[] = [startedFor, sentAt, misses, looks, reviews, jobsSeen, hookSeenAt, held];
+    const perPr: Map<string, unknown>[] = [startedFor, sentAt, throttledPrs, firstFailureFor, misses, looks, reviews, jobsSeen, hookSeenAt, held];
     for (const map of perPr) for (const key of map.keys()) if (!watched.has(key)) map.delete(key);
     // A hook's hand-over time matters only while the hook's own subscription stands (Claude's subscribe outranks it).
     for (const key of hookSeenAt.keys()) if (!subs.list().some((e) => e.key === key && e.source === "hook")) hookSeenAt.delete(key);
@@ -481,6 +515,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
     sentAt: sentAt.size,
     misses: misses.size,
     looks: looks.size,
+    fastUntil: fastUntil.size,
     reviews: reviews.size,
     jobsSeen: jobsSeen.size,
     hookSeenAt: hookSeenAt.size,
@@ -569,6 +604,25 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
           if (!sameBranch) unsubscribe(e, "branch_switch");
         }
       }
+    }
+
+    // THE SESSION'S OWN PUSH: `git push` from this folder moves origin/<branch> in the clone. The pull
+    // request for that branch is then looked at this pass, and every pass for OWN_PUSH_FAST_MS, so the push is seen
+    // within a pass and its CI's first result at the poll interval, not after a settled PR's five-minute wait.
+    if (scope?.repo && scope.branch && scope.pushed !== undefined) {
+      const label = `${scope.repo.toLowerCase()}@${scope.branch}`;
+      const t = now();
+      for (const [key, until] of fastUntil) if (until <= t) fastUntil.delete(key);
+      if (lastPushed.label === label && scope.pushed && scope.pushed !== lastPushed.sha) {
+        for (const e of subs.list()) {
+          if (e.repo.toLowerCase() !== scope.repo.toLowerCase() || e.last?.state !== "open" || e.last.headRef !== scope.branch) continue;
+          fastUntil.set(e.key, t + OWN_PUSH_FAST_MS);
+          const look = looks.get(e.key);
+          if (look) look.next = t;
+        }
+      }
+      lastPushed.label = label;
+      lastPushed.sha = scope.pushed;
     }
 
     for (const req of deps.takeHookRequests?.() ?? []) {
@@ -707,7 +761,10 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
         const phase = held.has(entry.key) ? "pending" : phaseOf(snap, headSeenAt, t);
         const quiet = changes.length === 0 && look?.phase === "finished" && phase === "finished" ? look.quiet + 1 : 0;
         const runsReadAt = look && reuse !== null && snap.runs === reuse.runs ? look.runsReadAt : t;
-        looks.set(entry.key, { next: t + lookEvery(phase, config.pollSeconds * 1000, quiet) * pressure().stretch, quiet, phase, headSha: snap.headSha, headSeenAt, runsReadAt });
+        const pollMs = config.pollSeconds * 1000;
+        // After the session's own push, every pass for OWN_PUSH_FAST_MS, whatever the phase.
+        const every = (fastUntil.get(entry.key) ?? 0) > t ? Math.min(pollMs, lookEvery(phase, pollMs, quiet)) : lookEvery(phase, pollMs, quiet);
+        looks.set(entry.key, { next: t + every * pressure().stretch, quiet, phase, headSha: snap.headSha, headSeenAt, runsReadAt });
       }
       live.last = carry(live.last, snap);
       if (snap.state !== "open") unsubscribe(live, snap.state);
@@ -722,6 +779,15 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       log("the gh login has no repo scope");
       events.write("problem", { kind: "no_repo_scope" });
       await send(scopeMessage(), null);
+    }
+
+    // A throttled PR whose window has room again: one summary of the state it reached while held back.
+    for (const key of [...throttledPrs.keys()]) {
+      const recent = (sentAt.get(key) ?? []).filter((t) => now() - t < limits.eventWindowMs);
+      if (recent.length >= limits.eventsPerPr) continue;
+      throttledPrs.delete(key);
+      const last = subs.list().find((e) => e.key === key)?.last;
+      if (last && last.state === "open") await send(resumed(last), null);
     }
 
     forgetEnded();

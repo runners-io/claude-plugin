@@ -28,11 +28,11 @@ in to github.com. If you don't have `gh`, the plugin's `setup-github` skill walk
 your agreement, and you sign in with `! gh auth login --web --scopes repo`.
 
 ```bash
-claude plugin marketplace add runners-io/claude-plugin#v0.3.1
+claude plugin marketplace add runners-io/claude-plugin#v0.3.4
 claude plugin install runners-io@runners-io
 ```
 
-This installs exactly one release: every release has a new version and a tag of its own (`v0.3.1` is this one), and
+This installs exactly one release: every release has a new version and a tag of its own (`v0.3.4` is this one), and
 the `#` and tag pin the marketplace to it. We do not move a release tag once it is published, so updating that
 marketplace never takes you past the release you chose. To move to a newer release, run
 `claude plugin marketplace remove runners-io` (which uninstalls the plugin), then the two commands above with the newer
@@ -60,7 +60,7 @@ Or from inside a session: `/plugin marketplace add runners-io/claude-plugin`, th
 To install from a copy you have checked out and read yourself:
 
 ```bash
-git clone --branch v0.3.1 --depth 1 https://github.com/runners-io/claude-plugin.git
+git clone --branch v0.3.4 --depth 1 https://github.com/runners-io/claude-plugin.git
 claude plugin marketplace add ./claude-plugin
 claude plugin install runners-io@runners-io
 ```
@@ -150,7 +150,7 @@ option on hears every request, which is why it is off by default.
 | tool | what it does |
 |---|---|
 | `subscribe` | watch a pull request (`repo` and `pr`; by default the current branch's), optionally only some `events`. It answers the PR's state now; after that only changes are pushed |
-| `unsubscribe` | stop watching one pull request, every one in a repository, or everything (`all: true`) |
+| `unsubscribe` | stop watching one pull request (with no arguments, the current branch's), every one in a repository (`whole_repo: true`), or everything (`all: true`) |
 | `list_subscriptions` | what this session watches |
 | `ci_status` | a pull request's state now, without subscribing |
 | `mute` | stop hearing, in this session only, a pull request (`repo` and `pr`), some `kinds` on every pull request, kinds on one pull request, or one `workflow` by name. At most 50 |
@@ -167,8 +167,10 @@ whether Claude ran `gh pr create` or a script opened it, but only when all of th
 session's folder belongs to; GitHub says your login opened it, minutes ago; the channel is on; and `auto_subscribe` is
 not `off`. A pull request URL in a log, a README or a comment is text anyone can write, so nothing else is watched
 this way. The hook adds at most 5 pull requests, and a session watches at most 20 in all; past a budget of events for
-one pull request in 10 minutes, the channel says so once and holds back the rest. **For any other pull request**
-Claude opens (another repository, or with the channel off), the hook asks Claude to subscribe, and Claude chooses. Claude Code asks before the first
+one pull request in 10 minutes, the channel says so once and holds back the rest. **When Claude opens a pull request
+in this repository and it is not handed over** (the channel is off, `auto_subscribe` is `off`, or the hand-over
+failed), the hook asks Claude to subscribe, and Claude chooses. **A pull request in another repository** is neither
+watched nor prompted for by the hook: Claude subscribes to it only when asked. Claude Code asks before the first
 `subscribe` call like any tool; to allow the channel's tools without asking, add this to your settings:
 
 ```json
@@ -235,9 +237,12 @@ pull request, shared by every session on the machine. The text of a review or a 
 and a link, so Claude reads it itself with `gh`, as information. A subscription that asks for none of these kinds
 costs no GraphQL read. GraphQL's budget backs off the same way as REST's (below), on its own reading.
 
-A session is told at most 20 events about one pull request in 10 minutes (then `channel_throttled`, once), and at
-most 120 events in an hour across all the pull requests it watches (then `channel_held_back`, once that hour). Both
-say to call `ci_status` for the current state; the events held back are in the event log, filtered.
+A session watches at most 20 pull requests. It is told at most 20 events about one pull request in 10 minutes (then
+`channel_throttled`, once), and at most 120 events in an hour across all the pull requests it watches (then
+`channel_held_back`, once that hour). Both say to call `ci_status` for the current state; the events held back are in
+the event log, filtered. The per-pull-request limit never holds back `ci.run_all_done`, `pr.merged`, `pr.closed` or
+the first `ci.workflow_failed` on a commit, and when it stops holding a pull request's events back the session is sent
+its state once (`channel_resumed`). The hourly limit holds back every kind alike.
 
 How often the channel looks at a watched pull request depends on what it is doing:
 
@@ -247,7 +252,11 @@ How often the channel looks at a watched pull request depends on what it is doin
 | a run waiting for approval, a push whose CI has not started yet, or a merge check GitHub is still computing | every minute |
 | everything finished | after 2 minutes, then a little less often each time nothing has changed, down to every 5 minutes; its runs are read again only when the PR changes, or every 10 minutes for a re-run |
 
-So a push to a settled pull request is seen within 5 minutes, and from then on every 20 seconds until its CI finishes.
+A push from the session's own folder moves `origin/<branch>` in your clone, and the channel reads that from git at
+every pass: the pull request for that branch is then looked at at once and every 20 seconds for the next 5 minutes,
+whatever it was doing, so the push is seen at the next pass and its CI's first result within about half a minute of
+GitHub's. A push from anywhere else to a settled pull request is seen within 5 minutes, and from then on every 20
+seconds until its CI finishes.
 A quiet pull request costs about 24 GitHub requests an hour. The channel sends GitHub the previous answer's ETag, and
 GitHub does not count an unchanged answer against your hourly API limit.
 

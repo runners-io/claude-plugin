@@ -290,8 +290,16 @@ export function toMessage(c: Change, viewer: string | null = null): ChannelMessa
       names = fenced(workflow, headBranch);
       break;
     case "ci.approval_waiting":
-      what = `CI is waiting for approval on ${at}: a workflow is held for a deployment review.`;
-      todo = "A person must approve it on GitHub; do not try to approve it yourself. Tell the user.";
+      // By cause: a fork's run waiting for a maintainer is no deployment, and saying so sent the user to the wrong place.
+      // Without the cause recorded, the run says it: a completed action_required run waits for a maintainer; a run whose
+      // status is waiting is held for an environment's reviewers.
+      if ((c.approval ?? (c.run?.status === "completed" && c.run.conclusion === "action_required" ? "maintainer" : "deployment")) === "maintainer") {
+        what = `CI is waiting for approval on ${at}: a workflow run is waiting for a maintainer to approve the run.`;
+        todo = "A maintainer of the repository must approve it on GitHub (a fork's or a first-time contributor's run); do not try to approve it yourself. Tell the user.";
+      } else {
+        what = `CI is waiting for approval on ${at}: a workflow is held for a deployment review.`;
+        todo = "An environment's required reviewer must approve it on GitHub; do not try to approve it yourself. Tell the user.";
+      }
       link = runUrl;
       names = fenced(workflow, headBranch);
       break;

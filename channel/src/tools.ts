@@ -7,6 +7,7 @@
  * message anywhere, or writes to GitHub, so the channel still declares no
  * `claude/channel/permission` and every tool is `readOnlyHint`.
  */
+import { relaunchSentence } from "../../hooks/launch.mjs";
 import { NO_EVENT_LOG } from "./eventlog.ts";
 import type { EventLog } from "./eventlog.ts";
 import { NAMES_LABEL, clean, describe, setupText } from "./format.ts";
@@ -40,6 +41,15 @@ export interface ToolHost {
 export const CHANNEL_NOTE =
   'Results arrive as <channel source="runners-io"> events if this session was started with the runners-io channel; if none arrive, call ci_status to check.';
 
+/**
+ * What a watch costs, in the subscribe description: Claude learned of the cap only from the refusal at the next one, and an
+ * orchestrating session that watched everything it opened spent a GitHub login shared with gh. The figures are the README's.
+ */
+export const WATCH_COST =
+  "Each watch reads GitHub on the user's own GitHub login and its hourly limit, shared with gh: about 24 GitHub requests an hour " +
+  "while the pull request is quiet, more while its CI runs, and about 60 GraphQL points an hour for the review kinds " +
+  `(a watch whose events name no review kind costs no review reads). A session watches at most ${MAX_SUBSCRIPTIONS} pull requests.`;
+
 const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
 
 const target = {
@@ -70,13 +80,21 @@ const DEFS: ToolDef[] = [
     "Watch a pull request's CI",
     "Push this pull request's CI results and merge-conflict changes into the session as they happen. Call it after you open a pull request, " +
       "or when the user asks you to watch one. Answers the PR's current state; after that only changes are pushed. " +
-      `events limits what is pushed (default: all of ${EVENT_KINDS.join(", ")}).`,
+      `events limits what is pushed (default: all of ${EVENT_KINDS.join(", ")}). ` +
+      WATCH_COST,
     { ...target, events: { type: "array", items: { type: "string", enum: [...EVENT_KINDS] }, description: "Kinds to push. Omit for all." } },
   ),
-  def("unsubscribe", "Stop watching CI", "Stop pushing a pull request's CI results, every pull request of a repository (no pr), or everything (all: true).", {
-    ...target,
-    all: { type: "boolean", description: "Stop watching everything." },
-  }),
+  def(
+    "unsubscribe",
+    "Stop watching CI",
+    "Stop pushing one pull request's CI results: pr, or with no arguments the current branch's pull request, as subscribe takes it. " +
+      "whole_repo: true stops every pull request of a repository (repo, default this session's), and all: true stops everything.",
+    {
+      ...target,
+      whole_repo: { type: "boolean", description: "Stop watching every pull request of the repository (repo, default this session's), not just one." },
+      all: { type: "boolean", description: "Stop watching everything." },
+    },
+  ),
   def("list_subscriptions", "List watched pull requests", "The pull requests this session is watching, which events each pushes, and this session's mutes.", {}),
   def("ci_status", "Read a pull request's CI now", "The pull request's current CI and merge-conflict state, read from GitHub now. Does not subscribe.", target),
   def(
@@ -103,9 +121,10 @@ interface Deps {
   readonly liveEvents?: boolean;
 }
 
+/** The relaunch is launch.mjs's one sentence, as the launch notice and the watch-this-pr skill say it. */
 export const EVENTS_OFF_NOTE =
   "But live CI events are OFF in this session: it was started without the channel flag, so nothing will be pushed. " +
-  "Relaunch with `claude-gh --continue` (or /runners-io:setup-github to set claude-gh up); ci_status still reads a PR's state on request.";
+  `To turn them on, ${relaunchSentence(null)}; /runners-io:setup-github sets claude-gh up. ci_status still reads a PR's state on request.`;
 
 type Target = { ok: true; repo: string; pr: number } | { ok: false; text: string };
 
@@ -234,7 +253,12 @@ export function makeTools(deps: Deps): ToolHost {
           const snap = await read(t.repo, t.pr);
           if ("text" in snap) return snap;
           if (snap.state !== "open") return { text: `${describe(snap)}\nThe pull request is ${snap.state}, so it is not subscribed.` };
-          deps.subs.add({ repo: t.repo, pr: t.pr, events: events.events, source: "tool", last: snap });
+          // A PR already watched keeps the state the poller last saw as its baseline; this read only answers the call.
+          // Taking it as the baseline swallowed whatever changed since the last look: a PR marked ready for review
+          // thirteen seconds before a repeat subscribe, and before the next poll, was never reported. A PR seen for the
+          // first time (or a hand-over not yet looked at) starts from this read.
+          const seen = deps.subs.get(t.repo, t.pr)?.last ?? null;
+          deps.subs.add({ repo: t.repo, pr: t.pr, events: events.events, source: "tool", last: seen ?? snap });
           // Asked for by name: a mute of the whole pull request no longer holds. Kind and workflow mutes stay.
           const lifted = deps.subs.mutes.remove({ repo: t.repo, pr: t.pr });
           (deps.eventLog ?? NO_EVENT_LOG).write("subscribe", {
@@ -278,12 +302,42 @@ export function makeTools(deps: Deps): ToolHost {
           }
           if (args.repo !== undefined && (typeof args.repo !== "string" || !REPO.test(args.repo))) return err("repo must be owner/name.");
           if (args.pr !== undefined && (typeof args.pr !== "number" || !Number.isInteger(args.pr) || args.pr < 1)) return err("pr must be a positive whole number.");
-          const repo = (args.repo as string | undefined) ?? (await deps.readScope()).repo;
-          if (!repo) return err("Pass repo, or all: true.");
-          const note = await muteBranchPr(repo, args.pr as number | undefined);
-          const count = deps.subs.remove(repo, args.pr as number | undefined);
-          record(repo, (args.pr as number | undefined) ?? null, count);
-          return { text: `Stopped watching ${count} pull request(s).${note}` };
+          if (args.whole_repo === true) {
+            // A whole repository only when asked for by name: no pr used to mean this, while the parameter
+            // said "the current branch's pull request", so "stop watching this one" silenced every other PR too.
+            if (args.pr !== undefined) return err("Pass pr or whole_repo: true, not both.");
+            const repo = (args.repo as string | undefined) ?? (await deps.readScope()).repo;
+            if (!repo) return err("Pass repo with whole_repo: true, or all: true.");
+            const note = await muteBranchPr(repo);
+            const count = deps.subs.remove(repo);
+            record(repo, null, count);
+            return { text: `Stopped watching ${count} pull request(s) of ${repo}.${note}` };
+          }
+          let one: { repo: string; pr: number };
+          if (args.pr !== undefined) {
+            const repo = (args.repo as string | undefined) ?? (await deps.readScope()).repo;
+            if (!repo) return err("This session's folder has no GitHub origin remote: pass repo (owner/name) with pr, or all: true.");
+            one = { repo, pr: args.pr as number };
+          } else {
+            // No pr: the current branch's pull request, as subscribe takes it. One already watched for this branch is
+            // found without asking GitHub; otherwise GitHub is asked, as subscribe does.
+            const scope = await deps.readScope();
+            const repo = (args.repo as string | undefined) ?? scope.repo;
+            const watched =
+              repo && scope.branch && scope.repo?.toLowerCase() === repo.toLowerCase()
+                ? deps.subs.list().find((e) => e.repo.toLowerCase() === repo.toLowerCase() && (e.source === "auto" || e.last?.headRef === scope.branch))
+                : undefined;
+            if (watched) one = { repo: watched.repo, pr: watched.pr };
+            else {
+              const t = await resolveTarget(deps, args);
+              if (!t.ok) return err(`${t.text} To stop every pull request of a repository, pass whole_repo: true; to stop everything, all: true.`);
+              one = { repo: t.repo, pr: t.pr };
+            }
+          }
+          const note = await muteBranchPr(one.repo, one.pr);
+          const count = deps.subs.remove(one.repo, one.pr);
+          record(one.repo, one.pr, count);
+          return { text: count ? `Stopped watching ${one.repo} PR #${one.pr}.${note}` : `${one.repo} PR #${one.pr} was not watched.${note}` };
         }
         case "list_subscriptions": {
           const all = deps.subs.list();

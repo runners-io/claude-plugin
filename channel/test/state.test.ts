@@ -69,6 +69,7 @@ test("waiting is approval_waiting, once", () => {
   const b = snap([run(1, "waiting")]);
   assert.deepEqual(kinds(a, b), ["ci.approval_waiting:1"]);
   assert.deepEqual(kinds(b, b), []);
+  assert.equal(diff(a, b)[0]?.approval, "deployment", "a waiting run is held for a deployment review");
   assert.deepEqual(kinds(snap([]), b), ["ci.approval_waiting:1"], "a run that appears already waiting is reported as waiting");
 });
 
@@ -131,6 +132,7 @@ test("action_required (a fork's run waiting for a maintainer) is approval_waitin
   const b = snap([run(1, "completed", "action_required")]);
   assert.deepEqual(kinds(a, b), ["ci.approval_waiting:1", "ci.run_all_done"]);
   assert.equal(diff(a, b).find((c) => c.kind === "ci.run_all_done")?.conclusion, "action_required");
+  assert.equal(diff(a, b).find((c) => c.kind === "ci.approval_waiting")?.approval, "maintainer", "the cause is recorded on the event");
   assert.equal(needsAttention(b), true);
 });
 

@@ -12,3 +12,7 @@ export function pollsIn(state: LaunchState): boolean;
 export function shellWord(s: string, shell?: string): string;
 
 export function channelFlags(pluginRoot: string, shell?: string): string[];
+
+export const SESSION_ID: RegExp;
+
+export function relaunchSentence(sessionId?: string | null): string;

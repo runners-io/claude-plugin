@@ -86,6 +86,12 @@ export interface Change {
   readonly snapshot: Snapshot;
   /** The run the change is about, for the `ci.workflow_*` and approval kinds. */
   readonly run?: RunInfo;
+  /**
+   * For `ci.approval_waiting`: what it waits for. `deployment`: a job is held for an environment's required reviewers (the
+   * run's status is waiting). `maintainer`: a fork's or a first-time contributor's run waits for a maintainer to approve
+   * it (the run completed as action_required). One sentence for both told the user a deployment waited when none existed.
+   */
+  readonly approval?: "deployment" | "maintainer";
   /** Filled in by the poller for a failed run, from the run's jobs. */
   readonly failedJobs?: readonly string[];
   /** For `ci.run_all_done`: failure, cancelled or success, the worst of the runs. */
@@ -181,7 +187,7 @@ export function diff(prev: Snapshot | null, next: Snapshot): Change[] {
             : o === "needs_approval"
               ? "ci.approval_waiting"
               : "ci.workflow_cancelled";
-      changes.push({ kind, snapshot: next, run });
+      changes.push(kind === "ci.approval_waiting" ? { kind, snapshot: next, run, approval: "maintainer" } : { kind, snapshot: next, run });
       const failedAttempt = prev.headSha === next.headSha ? prev.failedAttempts?.[run.id] : undefined;
       if (o === "succeeded" && failedAttempt !== undefined && run.runAttempt > failedAttempt) {
         changes.push({ kind: "ci.flaky", snapshot: next, run });
@@ -191,7 +197,7 @@ export function diff(prev: Snapshot | null, next: Snapshot): Change[] {
     if (run.status === "waiting") {
       if (fresh || old?.status !== "waiting") {
         anyRunChanged = true;
-        changes.push({ kind: "ci.approval_waiting", snapshot: next, run });
+        changes.push({ kind: "ci.approval_waiting", snapshot: next, run, approval: "deployment" });
       }
       continue;
     }

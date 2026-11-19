@@ -17,10 +17,9 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { claudeGhForOffer } from "../skills/setup-github/claude-gh.mjs";
-import { channelFlags, findLaunch, shellWord } from "./launch.mjs";
+import { SESSION_ID, channelFlags, findLaunch, relaunchSentence, shellWord } from "./launch.mjs";
 
 const LAUNCHES = new Set(["startup", "resume", "fork"]);
-const SESSION_ID = /^[A-Za-z0-9-]{8,64}$/;
 
 export const OFFER_QUESTION =
   "Set up `claude-gh` so live CI events are on whenever you start Claude Code with it? It starts Claude Code with " +
@@ -40,8 +39,9 @@ export function noticeFor(input, launch, pluginRoot, { claudeGh = null } = {}) {
   let line = null;
   if (launch.state === "off" || launch.state === "unknown") {
     const plain = ["claude", resume, ...channelFlags(pluginRoot)].join(" ");
+    // The one relaunch sentence (launch.mjs relaunchSentence), then the plain command for a user with no claude-gh.
     const relaunch =
-      `relaunch with \`claude-gh ${resume}\` (/runners-io:setup-github sets up claude-gh and makes this permanent) ` +
+      `${relaunchSentence(id)} (/runners-io:setup-github sets up claude-gh and makes this permanent) ` +
       `or \`${plain}\`. CI checks on request (ci_status) still work.`;
     line =
       launch.state === "off"
@@ -54,7 +54,7 @@ export function noticeFor(input, launch, pluginRoot, { claudeGh = null } = {}) {
         "events on. Once in this session, early and at a natural moment (never in the middle of a task), ask the " +
         `user exactly: "${OFFER_QUESTION}" If they say yes, follow the /runners-io:setup-github skill's step 5 (show ` +
         "the lines, ask, add them, check with type)" +
-        (line ? `, then tell them to relaunch this session with \`claude-gh ${resume}\` for live CI events` : "") +
+        (line ? `, then tell them to ${relaunchSentence(id)} for live CI events` : "") +
         ". If they say no, " +
         (pluginRoot
           ? `run \`node ${shellWord(`${pluginRoot}/skills/setup-github/claude-gh.mjs`)} decline\`, which records it so the offer is not made again for 7 days, `

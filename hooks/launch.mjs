@@ -72,6 +72,24 @@ export function channelFlags(pluginRoot, shell = "posix") {
     : ["--plugin-dir", shellWord(root, shell), "--dangerously-load-development-channels", "plugin:runners-io@inline"];
 }
 
+/** A Claude Code session id as the SessionStart hook is given it; anything else is never put into a command. */
+export const SESSION_ID = /^[A-Za-z0-9-]{8,64}$/;
+
+/**
+ * THE relaunch instruction, said by the launch notice (hooks/session-start.mjs), the channel's tools (channel/src/
+ * tools.ts, EVENTS_OFF_NOTE) and the watch-this-pr skill, word for word (channel/test/relaunch.test.mjs holds
+ * all three to it). `claude-gh --resume <id>` reopens THIS session; `--continue` reopens the folder's most recent one,
+ * which with several sessions open can be another, so it is offered only when the id is not known. The hook knows the
+ * id; the channel and a skill do not, and say where it is: the launch notice gives it.
+ */
+export function relaunchSentence(sessionId) {
+  const id = typeof sessionId === "string" && SESSION_ID.test(sessionId) ? sessionId : null;
+  return id
+    ? `relaunch with \`claude-gh --resume ${id}\``
+    : "relaunch with `claude-gh --resume <this session's id>` (the launch notice gives the id; " +
+        "`claude-gh --continue` only when it is not known, since with several sessions open it can reopen another one)";
+}
+
 /** Whether the channel should poll: only where a pushed event can arrive, or where it cannot tell. */
 export function pollsIn(state) {
   return state === "on" || state === "unknown";

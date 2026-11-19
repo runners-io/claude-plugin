@@ -1026,30 +1026,74 @@ test("the hook adds at most its own share of PRs, and none once the session watc
   }
 });
 
-test("a PR that changes faster than the event budget is reported up to the budget, then once as throttled", async () => {
-  const hookRequests: { repo: string; pr: number; at: number }[] = [];
-  const t = await setup({ scope: HOOK_SCOPE, hookRequests, limits: { eventsPerPr: 2, eventWindowMs: 60 * 60_000 } });
+// One bad push on a repository with many workflows passed the per-PR budget, and the throttle dropped everything after
+// it alike: the all-done summary the user was waiting for included, with nothing replayed. Now the budget holds back
+// the routine kinds only, and the window reopening sends the PR's state once.
+test("past the per-PR budget: one throttled notice, the first failure and all done still sent, then one state summary", async () => {
+  let shift = 0;
+  const t = await setup({ autoSubscribe: "off", now: () => Date.now() + shift, limits: { eventsPerPr: 2, eventWindowMs: 10 * 60_000 } });
   try {
-    t.gh.setPull("acme/widgets", 9, { head: { ref: "busy", sha: SHA9 }, created_at: fresh() });
-    t.gh.setRuns("acme/widgets", SHA9, [{ id: 91, name: "A", status: "queued" }]);
-    hookRequests.push({ repo: "acme/widgets", pr: 9, at: Date.now() });
-    await until("baseline", () => t.subs.get("acme/widgets", 9)?.last != null);
-    const runs: { id: number; name: string; status: string; conclusion?: string }[] = [];
-    for (const [id, name] of [[91, "A"], [92, "B"], [93, "C"], [94, "D"]] as const) {
-      t.gh.setJobs(id, [{ name: "unit tests", conclusion: "failure" }]);
-      runs.push({ id, name, status: "completed", conclusion: "failure" });
-      t.gh.setRuns("acme/widgets", SHA9, [...runs]);
-      await settle();
-    }
-    await until("throttled", () => t.messages.some((m) => m.meta.kind === "channel_throttled" && m.meta.pr === "9"));
+    const names = ["A", "B", "C", "D", "E"];
+    const runs = names.map((name, i) => ({ id: 101 + i, name, status: "queued", conclusion: undefined as string | undefined }));
+    t.gh.setRuns("acme/widgets", SHA, runs.map((r) => ({ ...r })));
+    t.subs.add({ repo: "acme/widgets", pr: 7, source: "tool" });
+    await until("baseline", () => t.subs.get("acme/widgets", 7)?.last?.runs.length === 5);
+    const logged = (id: number) => t.records.some((r) => r.type === "event" && r.run_id === id);
+    const finish = async (i: number, conclusion: string) => {
+      runs[i] = { ...runs[i], status: "completed", conclusion };
+      t.gh.setJobs(runs[i].id, conclusion === "failure" ? [{ name: "unit tests", conclusion: "failure" }] : []);
+      t.gh.setRuns("acme/widgets", SHA, runs.map((r) => ({ ...r })));
+      await until(`run ${runs[i].id} seen`, () => logged(runs[i].id));
+    };
+    await finish(0, "success"); // 1 of 2
+    await finish(1, "success"); // 2 of 2
+    await finish(2, "success"); // held back: the notice
+    await finish(3, "failure"); // the first failure on the commit: sent
+    await finish(4, "failure"); // a second failure: held back
+    await until("all done", () => t.records.some((r) => r.type === "event" && r.kind === "ci.run_all_done"));
     await settle();
-    const forPr = t.messages.filter((m) => m.meta.pr === "9");
-    // The budget counts every event for the PR, the first one after it is watched included.
-    assert.equal(forPr.filter((m) => m.meta.kind !== "channel_throttled").length, 2, forPr.map((m) => m.meta.kind).join(" "));
-    assert.ok(forPr.some((m) => m.meta.kind === "ci.workflow_failed"), "a failure was among them");
-    assert.ok(forPr.filter((m) => m.meta.kind === "ci.workflow_failed").length < 4, "not every failure: the rest were held back");
-    assert.equal(forPr.filter((m) => m.meta.kind === "channel_throttled").length, 1);
-    assert.match(forPr.find((m) => m.meta.kind === "channel_throttled")?.content ?? "", /ci_status/);
+
+    const kinds = t.messages.filter((m) => m.meta.pr === "7").map((m) => m.meta.kind);
+    assert.deepEqual(kinds, ["ci.workflow_succeeded", "ci.workflow_succeeded", "channel_throttled", "ci.workflow_failed", "ci.run_all_done"]);
+    const failed = t.messages.find((m) => m.meta.kind === "ci.workflow_failed");
+    assert.match(failed?.content ?? "", /"D"/, "the first failure, not the second");
+    const notice = t.messages.find((m) => m.meta.kind === "channel_throttled")?.content ?? "";
+    assert.match(notice, /ci_status/);
+    assert.match(notice, /all-done summary, a merge or close, and the first failure on a commit are still sent/);
+    // A job's own failure (ci.job_failed) may be read while its run still goes, depending on timing: it is held back
+    // like any routine kind. The workflow-level events held back are the third success and the second failure.
+    const held = t.records
+      .filter((r) => r.type === "event" && r.outcome === "filtered" && r.reason === "throttled" && String(r.kind).startsWith("ci.workflow_"))
+      .map((r) => r.run_id);
+    assert.deepEqual(held, [103, 105]);
+    assert.equal(t.messages.filter((m) => m.meta.kind === "channel_resumed").length, 0, "no summary while the window is full");
+
+    // The window moves on: one summary of the state reached while held back, and only one.
+    shift = 11 * 60_000;
+    await until("resumed", () => t.messages.some((m) => m.meta.kind === "channel_resumed"));
+    await settle();
+    const resumed = t.messages.filter((m) => m.meta.kind === "channel_resumed");
+    assert.equal(resumed.length, 1);
+    assert.equal(resumed[0].meta.pr, "7");
+    assert.match(resumed[0].content, /no longer held back/);
+    assert.match(resumed[0].content, /"E"/, "the summary carries the held-back failure");
+  } finally {
+    await t.stop();
+  }
+});
+
+test("a merge is never held back by the per-PR budget", async () => {
+  const t = await setup({ autoSubscribe: "off", limits: { eventsPerPr: 1, eventWindowMs: 60 * 60_000 } });
+  try {
+    t.gh.setRuns("acme/widgets", SHA, [{ id: 41, name: "A", status: "queued" }, { id: 42, name: "B", status: "queued" }, { id: 43, name: "C", status: "queued" }]);
+    t.subs.add({ repo: "acme/widgets", pr: 7, source: "tool" });
+    await until("baseline", () => t.subs.get("acme/widgets", 7)?.last?.runs.length === 3);
+    t.gh.setRuns("acme/widgets", SHA, [{ id: 41, name: "A", status: "completed", conclusion: "success" }, { id: 42, name: "B", status: "queued" }, { id: 43, name: "C", status: "queued" }]);
+    await until("the budget's one event", () => t.messages.length >= 1);
+    t.gh.setRuns("acme/widgets", SHA, [{ id: 41, name: "A", status: "completed", conclusion: "success" }, { id: 42, name: "B", status: "completed", conclusion: "success" }, { id: 43, name: "C", status: "queued" }]);
+    await until("throttled", () => t.messages.some((m) => m.meta.kind === "channel_throttled"));
+    t.gh.setPull("acme/widgets", 7, { head: { ref: "feat", sha: SHA }, state: "closed", merged: true });
+    await until("merged", () => t.messages.some((m) => m.meta.kind === "pr.merged"));
   } finally {
     await t.stop();
   }

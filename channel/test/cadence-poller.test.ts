@@ -30,7 +30,7 @@ async function until(what: string, fn: () => boolean, ms = 10_000) {
 }
 
 /** One session on a simulated clock; `step(n, before)` runs n passes, calling `before(pass)` ahead of each. */
-async function session(gh: FakeGitHub) {
+async function session(gh: FakeGitHub, scope: { pushed?: string | null } = {}) {
   let t = 1_700_000_000_000;
   let asleep = false;
   let wake: () => void = () => {};
@@ -44,7 +44,7 @@ async function session(gh: FakeGitHub) {
     config,
     gh: client,
     subs,
-    readScope: async () => ({ repo: "octo-org/example", branch: "feat" }),
+    readScope: async () => ({ repo: "octo-org/example", branch: "feat", ...scope }),
     notify: async (m) => void inbox.push(m),
     signal: stop.signal,
     now: () => t,
@@ -131,6 +131,49 @@ test("a push to a finished PR is seen within five minutes, and its failure withi
   await s.stop();
   assert.ok(s.inbox.some((m) => m.meta.kind === "ci.workflow_failed"), "the failure was sent at the next pass, while the PR was running");
   assert.ok(failedAt > 0);
+});
+
+test("the session's own push to a settled PR is seen at once, and its failure within the next pass", async () => {
+  const gh = await quietPr();
+  // The clone's origin/feat, as git.ts reads it: what `git push` from the session's folder moves.
+  const scope: { pushed?: string | null } = { pushed: A };
+  const s = await session(gh, scope);
+  await s.step(90); // half an hour of quiet: the slowest cadence, a look every five minutes
+  const pulls = () => gh.requests.filter((r) => r.path === "/repos/octo-org/example/pulls/7").length;
+  let pushedAt = -1;
+  let seenAt = -1;
+  await s.step(1, (p) => {
+    pushedAt = p;
+    scope.pushed = B;
+    gh.setPull("octo-org/example", 7, { head: { ref: "feat", sha: B }, base: { ref: "main" }, updated_at: "2026-01-01T00:30:00Z" });
+    gh.setRuns("octo-org/example", B, []); // CI has not registered yet
+  });
+  if (s.subs.list()[0]?.last?.headSha === B) seenAt = s.passes;
+  assert.equal(seenAt - pushedAt, 1, `the push was seen ${(seenAt - pushedAt) * 20} s later, not at the pass it was made`);
+  // CI registers a minute later and fails: on the fast beat, it arrives at the next pass, not after a pending minute.
+  const before = pulls();
+  await s.step(3);
+  assert.equal(pulls() - before, 3, "looked at every pass after the push, before CI started");
+  await s.step(1, () => gh.setRuns("octo-org/example", B, [{ id: 42, name: "CI", status: "completed", conclusion: "failure" }]));
+  assert.ok(s.inbox.some((m) => m.meta.kind === "ci.workflow_failed"), "the failure was sent at the next pass");
+  // Five minutes after the push the fast beat ends, and a settled PR is looked at as before.
+  await s.step(15);
+  const quiet = pulls();
+  await s.step(5);
+  await s.stop();
+  assert.ok(pulls() - quiet <= 1, `${pulls() - quiet} looks in 100 s after the fast beat ended`);
+});
+
+test("a push the session did not make does not change the cadence; the first reading of origin/<branch> is a baseline", async () => {
+  const gh = await quietPr();
+  const scope: { pushed?: string | null } = { pushed: null }; // no origin/feat yet
+  const s = await session(gh, scope);
+  await s.step(90);
+  const pulls = () => gh.requests.filter((r) => r.path === "/repos/octo-org/example/pulls/7").length;
+  const before = pulls();
+  await s.step(10); // nothing moved: a settled PR is not looked at every pass
+  await s.stop();
+  assert.ok(pulls() - before <= 1, `${pulls() - before} looks in 200 s of quiet`);
 });
 
 test("while CI runs, the PR is looked at every pass", async () => {

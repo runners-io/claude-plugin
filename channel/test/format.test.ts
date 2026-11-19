@@ -169,6 +169,21 @@ test("every kind has a message, and every meta key is one Claude Code keeps", ()
   assert.doesNotMatch("dashboard-url", META_KEY);
 });
 
+// ci.approval_waiting had one sentence, "held for a deployment review", for a fork's run waiting for a maintainer too.
+test("an approval wait says what it waits for: a deployment review, or a maintainer to approve the run", () => {
+  const msg = (extra: Partial<Change>) => toMessage({ ...failed, kind: "ci.approval_waiting", ...extra }).content;
+  const deployment = msg({ approval: "deployment" });
+  assert.match(deployment, /held for a deployment review/);
+  assert.match(deployment, /environment's required reviewer/);
+  assert.doesNotMatch(deployment, /maintainer/);
+  const maintainer = msg({ approval: "maintainer" });
+  assert.match(maintainer, /waiting for a maintainer to approve the run/);
+  assert.doesNotMatch(maintainer, /deployment/);
+  assert.match(maintainer, /do not try to approve it yourself/);
+  // A change made without the cause recorded reads it from the run: action_required is a maintainer's approval.
+  assert.match(msg({ approval: undefined, run: { ...failed.run!, status: "completed", conclusion: "action_required" } }), /waiting for a maintainer to approve the run/);
+});
+
 test("each kind reads as what it is", () => {
   const c = (kind: Change["kind"], extra: Partial<Change> = {}) => toMessage({ ...failed, kind, ...extra }).content;
   assert.match(c("ci.workflow_started"), /^CI started on PR #123 at 0123456\. .*workflow "CI"/);

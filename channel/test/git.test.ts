@@ -33,12 +33,17 @@ test("readGitScope follows the checked-out branch, and a directory with no repos
   const dir = mkdtempSync(join(tmpdir(), "rio-git-"));
   try {
     const git = (...args: string[]) => execFileSync("git", ["-C", dir, ...args], { stdio: "ignore" });
-    assert.deepEqual(await readGitScope(dir), { repo: null, branch: null });
+    assert.deepEqual(await readGitScope(dir), { repo: null, branch: null, pushed: null });
     git("init", "-q", "-b", "main");
     git("remote", "add", "origin", "git@github.com:acme/widgets.git");
-    assert.deepEqual(await readGitScope(dir), { repo: "acme/widgets", branch: "main" });
+    assert.deepEqual(await readGitScope(dir), { repo: "acme/widgets", branch: "main", pushed: null });
     git("checkout", "-q", "-b", "fix-login");
-    assert.deepEqual(await readGitScope(dir), { repo: "acme/widgets", branch: "fix-login" });
+    assert.deepEqual(await readGitScope(dir), { repo: "acme/widgets", branch: "fix-login", pushed: null });
+    // A push moves refs/remotes/origin/<branch> in the clone; here it is set as git push would set it.
+    git("-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "one");
+    const head = execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    git("update-ref", "refs/remotes/origin/fix-login", head);
+    assert.deepEqual(await readGitScope(dir), { repo: "acme/widgets", branch: "fix-login", pushed: head });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

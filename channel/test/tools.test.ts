@@ -4,8 +4,11 @@ import { after, test } from "node:test";
 import type { GitScope } from "../src/git.ts";
 import { type GhAuth, GitHubClient } from "../src/github.ts";
 import { setQuiet } from "../src/log.ts";
+import { diff } from "../src/state.ts";
 import { Subscriptions } from "../src/subscriptions.ts";
-import { TOOL_NAMES, makeTools } from "../src/tools.ts";
+import { TOOL_NAMES, WATCH_COST, makeTools } from "../src/tools.ts";
+import { readFileSync } from "node:fs";
+import { MAX_SUBSCRIPTIONS } from "../src/subscriptions.ts";
 import { type FakeGitHub, startFakeGitHub } from "./fake-github.mjs";
 
 setQuiet(true);
@@ -50,6 +53,31 @@ test("subscribe with no arguments takes the current branch's PR, stores its stat
   assert.equal(entry.pr, 7);
   assert.equal(entry.source, "tool");
   assert.equal(entry.last?.headSha, SHA, "the answered state is the baseline, so only changes are pushed");
+});
+
+// A PR was marked ready for review, and the session that had watched it for an hour called subscribe again thirteen
+// seconds later, before its next poll. The repeat took the fresh state as the baseline, so the poller's diff saw no
+// change and pr.ready_for_review was never sent. A repeat subscribe keeps what was last seen.
+test("subscribing again to a watched PR keeps the baseline, so a change since the last look is still pushed", async () => {
+  const { gh, tools, subs } = await setup(undefined, { repo: null, branch: null });
+  gh.setPull("acme/widgets", 7, { head: { ref: "feat", sha: SHA }, mergeable_state: "draft", draft: true });
+  assert.ok(!(await tools.call("subscribe", { repo: "acme/widgets", pr: 7 })).isError);
+  assert.equal(subs.list()[0].last?.draft, true);
+
+  gh.setPull("acme/widgets", 7, { head: { ref: "feat", sha: SHA }, mergeable_state: "clean", draft: false });
+  const again = await tools.call("subscribe", { repo: "acme/widgets", pr: 7, events: ["pr.ready_for_review", "pr.merged"] });
+  assert.ok(!again.isError, again.text);
+
+  const [entry] = subs.list();
+  assert.equal(entry.last?.draft, true, "the baseline is still what the poller last saw");
+  const events = entry.events;
+  assert.ok(events !== "all" && events.has("pr.ready_for_review"), "the new event list still replaces the old one");
+  // The poller's next look reads the PR as it now is; against the kept baseline, that is the change to send.
+  const next = { ...entry.last!, draft: false, mergeableState: "clean" };
+  assert.deepEqual(
+    diff(entry.last, next).map((c) => c.kind).filter((k) => k === "pr.ready_for_review"),
+    ["pr.ready_for_review"],
+  );
 });
 
 test("subscribe takes an explicit repo, pr and event list, and refuses an unknown event kind", async () => {
@@ -104,13 +132,73 @@ test("a merged PR is described but not subscribed", async () => {
   assert.equal(subs.list().length, 0);
 });
 
+// No arguments meant "every PR of the repository" while the parameter said "the current branch's pull
+// request", so "stop watching this one" silenced every other PR in the repository too.
+// The subscribe text said nothing of cost or of the limit, so Claude learned the cap from the refusal at the next watch.
+test("subscribe says what a watch costs and the session's limit, from MAX_SUBSCRIPTIONS and the README's figures", async () => {
+  const { tools } = await setup();
+  const d = tools.list().find((t) => t.name === "subscribe")!.description;
+  assert.ok(d.endsWith(WATCH_COST));
+  assert.match(d, new RegExp(`A session watches at most ${MAX_SUBSCRIPTIONS} pull requests\\.`));
+  assert.match(d, /user's own GitHub login/);
+  assert.match(d, /a watch whose events name no review kind costs no review reads/);
+  const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8");
+  assert.match(readme, /A quiet pull request costs about 24 GitHub requests an hour\./, "the README's quiet figure");
+  assert.match(d, /about 24 GitHub requests an hour/);
+  assert.match(readme, /about 60 points an hour per\s+pull request/, "the README's GraphQL figure");
+  assert.match(d, /about 60 GraphQL points an hour/);
+  assert.match(readme, new RegExp(`a session watches at most ${MAX_SUBSCRIPTIONS} in all`), "the README's limit");
+});
+
+test("unsubscribe with no arguments stops only the current branch's PR; whole_repo stops the repository", async () => {
+  const { tools, gh, subs } = await setup();
+  gh.setPull("acme/widgets", 8, { head: { ref: "other", sha: SHA } });
+  gh.setPull("acme/widgets", 9, { head: { ref: "third", sha: SHA } });
+  gh.setPull("acme/gadgets", 3, { head: { ref: "feat", sha: SHA } });
+  for (const [repo, pr] of [["acme/widgets", 7], ["acme/widgets", 8], ["acme/widgets", 9], ["acme/gadgets", 3]] as const) {
+    assert.ok(!(await tools.call("subscribe", { repo, pr })).isError);
+  }
+  const none = await tools.call("unsubscribe", {});
+  assert.ok(!none.isError, none.text);
+  assert.match(none.text, /^Stopped watching acme\/widgets PR #7\./);
+  assert.deepEqual(subs.list().map((e) => `${e.repo}#${e.pr}`).sort(), ["acme/gadgets#3", "acme/widgets#8", "acme/widgets#9"]);
+
+  assert.match((await tools.call("unsubscribe", { pr: 8 })).text, /^Stopped watching acme\/widgets PR #8\./);
+  assert.deepEqual(subs.list().map((e) => `${e.repo}#${e.pr}`).sort(), ["acme/gadgets#3", "acme/widgets#9"]);
+
+  assert.equal((await tools.call("unsubscribe", { pr: 9, whole_repo: true })).isError, true, "pr and whole_repo together are refused");
+  assert.match((await tools.call("unsubscribe", { whole_repo: true })).text, /^Stopped watching 1 pull request\(s\) of acme\/widgets\./);
+  assert.deepEqual(subs.list().map((e) => `${e.repo}#${e.pr}`), ["acme/gadgets#3"]);
+
+  assert.match((await tools.call("unsubscribe", { all: true })).text, /^Stopped watching 1 pull request\(s\)\./);
+  assert.equal(subs.list().length, 0);
+});
+
+test("unsubscribe with no arguments and no PR for the branch names whole_repo and all, and removes nothing", async () => {
+  const { tools, gh, subs } = await setup(undefined, { repo: "acme/widgets", branch: "no-pr-here" });
+  gh.setPull("acme/widgets", 8, { head: { ref: "other", sha: SHA } });
+  await tools.call("subscribe", { repo: "acme/widgets", pr: 8 });
+  const r = await tools.call("unsubscribe", {});
+  assert.equal(r.isError, true);
+  assert.match(r.text, /no open pull request for branch no-pr-here.*whole_repo: true.*all: true/);
+  assert.equal(subs.list().length, 1);
+});
+
+test("the unsubscribe tool text says no arguments is the current branch's PR and names whole_repo", async () => {
+  const { tools } = await setup();
+  const t = tools.list().find((d) => d.name === "unsubscribe")!;
+  assert.match(t.description, /no arguments the current branch's pull request/);
+  assert.match(t.description, /whole_repo: true stops every pull request of a repository/);
+  assert.ok("whole_repo" in t.inputSchema.properties);
+});
+
 test("unsubscribe removes one PR, or all; list_subscriptions shows what is left", async () => {
   const { tools, gh } = await setup();
   gh.setPull("acme/widgets", 8, { head: { ref: "other", sha: SHA } });
   await tools.call("subscribe", { repo: "acme/widgets", pr: 7 });
   await tools.call("subscribe", { repo: "acme/widgets", pr: 8, events: ["ci.workflow_failed"] });
   assert.match((await tools.call("list_subscriptions", {})).text, /acme\/widgets PR #7: all events[\s\S]*acme\/widgets PR #8: ci\.workflow_failed/);
-  assert.match((await tools.call("unsubscribe", { repo: "acme/widgets", pr: 7 })).text, /Stopped watching 1/);
+  assert.match((await tools.call("unsubscribe", { repo: "acme/widgets", pr: 7 })).text, /Stopped watching acme\/widgets PR #7\./);
   // PR 7 is the current branch's ("feat"), so unsubscribing it also leaves a mute, listed as one: no longer watched.
   const left = (await tools.call("list_subscriptions", {})).text;
   assert.doesNotMatch(left, /PR #7:/);
@@ -136,6 +224,7 @@ test("in a session started without the channel flag, subscribe still records the
   const r = await tools.call("subscribe", { repo: "acme/widgets", pr: 7 });
   assert.equal(r.isError, undefined);
   assert.match(r.text, /live CI events are OFF in this session/);
+  assert.match(r.text, /claude-gh --resume <this session's id>/);
   assert.match(r.text, /claude-gh --continue/);
   assert.match(r.text, /ci_status/);
   assert.equal(subs.list().length, 1);

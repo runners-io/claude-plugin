@@ -12,6 +12,12 @@ export interface GitScope {
   readonly repo: string | null;
   /** The checked-out branch, or null when HEAD is detached or there is no repo. */
   readonly branch: string | null;
+  /**
+   * The commit `origin/<branch>` names in this clone (`refs/remotes/origin/<branch>`), or null when there is none. A
+   * `git push` from the session's folder moves it, so a change is the session's own push (cadence.ts OWN_PUSH_FAST_MS).
+   * Read from the clone, never from GitHub. Absent where a scope is not read from git.
+   */
+  readonly pushed?: string | null;
 }
 
 const OWNER = "[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})";
@@ -47,9 +53,12 @@ export async function readGitScope(dir: string): Promise<GitScope> {
     git(dir, ["remote", "get-url", "origin"]),
     git(dir, ["branch", "--show-current"]),
   ]);
+  // A branch name git itself gave, after `refs/remotes/origin/`, so it cannot be read as an option; no shell runs.
+  const pushed = branch ? await git(dir, ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`]) : null;
   return {
     repo: remote ? parseGitHubRemote(remote) : null,
     branch: branch ? branch : null,
+    pushed: pushed && /^[0-9a-f]{40}$/.test(pushed) ? pushed : null,
   };
 }
 
