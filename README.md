@@ -28,11 +28,11 @@ in to github.com. If you don't have `gh`, the plugin's `setup-github` skill walk
 your agreement, and you sign in with `! gh auth login --web --scopes repo`.
 
 ```bash
-claude plugin marketplace add runners-io/claude-plugin#v0.3.4
+claude plugin marketplace add runners-io/claude-plugin#v0.3.9
 claude plugin install runners-io@runners-io
 ```
 
-This installs exactly one release: every release has a new version and a tag of its own (`v0.3.4` is this one), and
+This installs exactly one release: every release has a new version and a tag of its own (`v0.3.9` is this one), and
 the `#` and tag pin the marketplace to it. We do not move a release tag once it is published, so updating that
 marketplace never takes you past the release you chose. To move to a newer release, run
 `claude plugin marketplace remove runners-io` (which uninstalls the plugin), then the two commands above with the newer
@@ -60,7 +60,7 @@ Or from inside a session: `/plugin marketplace add runners-io/claude-plugin`, th
 To install from a copy you have checked out and read yourself:
 
 ```bash
-git clone --branch v0.3.4 --depth 1 https://github.com/runners-io/claude-plugin.git
+git clone --branch v0.3.9 --depth 1 https://github.com/runners-io/claude-plugin.git
 claude plugin marketplace add ./claude-plugin
 claude plugin install runners-io@runners-io
 ```
@@ -255,8 +255,10 @@ How often the channel looks at a watched pull request depends on what it is doin
 A push from the session's own folder moves `origin/<branch>` in your clone, and the channel reads that from git at
 every pass: the pull request for that branch is then looked at at once and every 20 seconds for the next 5 minutes,
 whatever it was doing, so the push is seen at the next pass and its CI's first result within about half a minute of
-GitHub's. A push from anywhere else to a settled pull request is seen within 5 minutes, and from then on every 20
-seconds until its CI finishes.
+GitHub's. This follows only the branch checked out in the folder Claude Code was started in. A push of any other
+branch counts as a push from anywhere else, even from a git worktree of the same clone or by the same session. A push
+from anywhere else to a settled pull request is seen within 5 minutes, and from then on every 20 seconds until its CI
+finishes. To get the fast look for work in a worktree, start Claude Code in that worktree.
 A quiet pull request costs about 24 GitHub requests an hour. The channel sends GitHub the previous answer's ETag, and
 GitHub does not count an unchanged answer against your hourly API limit.
 
@@ -401,7 +403,9 @@ approval or request for changes, and any new review thread that no session was s
 and "ready to merge" are not checked, because GitHub keeps no history of them. A kind the subscription left out is
 not expected, a base-branch turn is told once per session on any one of its pull requests on that branch, and a
 change overtaken within one poll (a commit replaced seconds after it failed, a watch ended
-seconds after a merge) is counted as overtaken, not missed.
+seconds after a merge) is counted as overtaken, not missed. So is a label change undone, or followed by the merge or
+close, before the channel's next look at a finished pull request could see it (five minutes at most), when no event
+was logged for that pull request in between.
 
 The script exits 0 when it finds nothing, 1 on a miss, a gap or an error, and 2 when it could not evaluate.
 

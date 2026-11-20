@@ -14,6 +14,13 @@
 // inside a watched window but that no session was sent. A run that failed on a commit the PR had already
 // moved past is counted as superseded, not missed: the channel reports the head commit only. Merge
 // conflicts are not checked this way, because GitHub keeps no history of mergeability.
+// A change the channel could not have seen is counted as overtaken, not missed. The channel reports what changed
+// between two looks at a PR (state.ts diff), and once it sees a merge it reports only that. So a change is overtaken
+// when the watch ended within one poll of it; and a label change is overtaken when it is part of an even run of
+// changes to the same label, each undoing the last (an odd run still owes its last change), or the PR merged or closed, within FINISHED_MAX_MS (rules.mjs: the longest a finished PR goes between
+// looks), with no event logged for the PR by a session watching it in between (which would show a look happened).
+// Seen live: one day's event log had 10 false MISSes of that kind, `hold` added and taken off 14-24 s apart on four
+// PRs, and taken off 79 and 111 s before a merge on two more, when only a watch that ended within a minute counted.
 //
 // Exit 0: nothing found. Exit 1: a miss, a gap, an event that could not be sent, or a setup problem.
 // Exit 2: could not evaluate (no records in the window, or GitHub could not be read); never an all-clear.
@@ -21,7 +28,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 
-import { baseVerdict } from "../channel/src/rules.mjs";
+import { FINISHED_MAX_MS, baseVerdict } from "../channel/src/rules.mjs";
 
 const args = process.argv.slice(2);
 const opt = (name, fallback) => {
@@ -342,8 +349,34 @@ async function checkGitHub() {
   // least one poll after t: "in". One that wanted it but closed (or reached now) within one poll of t: "overtaken",
   // as when a session stops watching seconds after a merge, before its next look. Otherwise "out".
   const POLL_MS = 60_000;
+  // What each session had muted, and when. A mute names a PR or (repo null) every PR, and kinds or (null)
+  // every kind; one that names a workflow mutes that workflow only, which a kind-level check cannot tell apart, so it
+  // is left out (the change stays expected). An unmute ends the mute it repeats, or every mute (all: true).
+  const mutes = [];
+  for (const r of [...before, ...records]) {
+    if (r.type === "mute" && !r.workflow) {
+      mutes.push({ session: r.session, key: r.repo && r.pr ? `${r.repo}#${r.pr}` : null, kinds: Array.isArray(r.kinds) ? r.kinds : null, from: r.t, to: null });
+    } else if (r.type === "unmute") {
+      const key = r.repo && r.pr ? `${r.repo}#${r.pr}` : null;
+      const kinds = JSON.stringify(Array.isArray(r.kinds) ? [...r.kinds].sort() : null);
+      for (const m of mutes) {
+        if (m.session !== r.session || m.to) continue;
+        if (r.all || (m.key === key && JSON.stringify(m.kinds ? [...m.kinds].sort() : null) === kinds)) m.to = r.t;
+      }
+    }
+  }
+  const muted = (session, key, kind, t) =>
+    mutes.some((m) => m.session === session && (m.key === null || m.key === key) && (m.kinds === null || m.kinds.includes(kind)) && t >= m.from && (!m.to || t < m.to));
+  // When GitHub merged or closed the PR. The channel reports only pr.merged (or pr.closed) once a poll sees
+  // it, so any other change is the channel's only if a poll could see it while the PR was still open: for those
+  // kinds the window ends at GitHub's time, not at the unsubscribe the session logged when it noticed (a minute or
+  // two later, which made a label taken off 11 s before an auto-merge look like a MISS).
+  const prEnds = new Map();
   const where = (key, t, kind) => {
-    const wanting = (windows.get(key) ?? []).filter(([a, b, ev]) => t >= a && t <= b && (ev === "all" || ev.includes(kind)));
+    const end = kind === "pr.merged" || kind === "pr.closed" ? null : prEnds.get(key);
+    const wanting = (windows.get(key) ?? [])
+      .filter(([a, b, ev, session]) => t >= a && t <= b && (ev === "all" || ev.includes(kind)) && !muted(session, key, kind, t))
+      .map(([a, b, ev, session]) => [a, end && end < b ? end : b, ev, session]);
     if (wanting.some(([, b]) => Date.parse(b) - Date.parse(t) >= POLL_MS)) return "in";
     return wanting.length ? "overtaken" : "out";
   };
@@ -389,6 +422,7 @@ async function checkGitHub() {
       const pull = await gh(`/repos/${repo}/pulls/${pr}`, auth);
       const closedAt = pull.merged_at ?? pull.closed_at;
       const closeKind = pull.merged_at ? "pr.merged" : "pr.closed";
+      if (closedAt) prEnds.set(key, closedAt);
       if (closedAt && inside(key, closedAt, closeKind) && !sentKinds.has(`${key}|${closeKind}`)) {
         if (where(key, closedAt, closeKind) === "overtaken") overtaken++;
         else misses.push({ kind: closeKind, repo, pr: Number(pr), github_at: closedAt });
@@ -451,9 +485,53 @@ async function checkGitHub() {
 
       // Labels and draft: GitHub's issue events (the first 100).
       const ISSUE_KINDS = { labeled: "pr.labels_changed", unlabeled: "pr.labels_changed", ready_for_review: "pr.ready_for_review", convert_to_draft: "pr.converted_to_draft" };
-      for (const ev of await gh(`/repos/${repo}/issues/${pr}/events?per_page=100`, auth)) {
+      const issueEvents = await gh(`/repos/${repo}/issues/${pr}/events?per_page=100`, auth);
+      // A look at the PR between two times: an event a session watching it logged for it, sent or filtered.
+      const lookedBetween = (a, b) => {
+        const [from, to] = [Date.parse(a), Date.parse(b)];
+        const watchers = new Set(
+          (windows.get(key) ?? []).filter(([wa, wb]) => Date.parse(wa) <= to && Date.parse(wb) >= from).map(([, , , who]) => who),
+        );
+        return records.some((r) => seen(r) && `${r.repo}#${r.pr}` === key && watchers.has(r.session) && Date.parse(r.t) > from && Date.parse(r.t) < to);
+      };
+      // One label's changes, oldest first: a change undone before the next look changed nothing the channel could see.
+      const labelChanges = issueEvents
+        .filter((ev) => (ev.event === "labeled" || ev.event === "unlabeled") && ev.created_at && ev.label?.name)
+        .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+      // A run of one label's changes, each the opposite of the one before, within FINISHED_MAX_MS of it, with no look
+      // between: an even run leaves the label as it was, so none of it was visible; an odd run leaves it changed, so
+      // the channel still owes the last change (add, take off, add again went from without the label to with it).
+      const cancelled = new Set();
+      const byLabel = new Map();
+      for (const ev of labelChanges) byLabel.set(ev.label.name, [...(byLabel.get(ev.label.name) ?? []), ev]);
+      for (const same of byLabel.values()) {
+        let run = [];
+        const end = () => {
+          for (const ev of run.slice(0, run.length - (run.length % 2))) cancelled.add(ev);
+          run = [];
+        };
+        for (const ev of same) {
+          const prev = run.at(-1);
+          const continues = prev && prev.event !== ev.event && Date.parse(ev.created_at) - Date.parse(prev.created_at) <= FINISHED_MAX_MS && !lookedBetween(prev.created_at, ev.created_at);
+          if (!continues) end();
+          run.push(ev);
+        }
+        end();
+      }
+      const unseenLabelChange = (ev) => {
+        if (cancelled.has(ev)) return true;
+        // The merge (or close) came before the next look: the channel reports only that.
+        const t = Date.parse(ev.created_at);
+        return Boolean(closedAt) && Date.parse(closedAt) >= t && Date.parse(closedAt) - t <= FINISHED_MAX_MS && !lookedBetween(ev.created_at, closedAt);
+      };
+      for (const ev of issueEvents) {
         const kind = ISSUE_KINDS[ev.event];
-        if (kind && ev.created_at) expect(kind, ev.created_at);
+        if (!kind || !ev.created_at) continue;
+        if (kind === "pr.labels_changed" && unseenLabelChange(ev)) {
+          if (where(key, ev.created_at, kind) !== "out" && !accounted(kind, ev.created_at)) overtaken++;
+          continue;
+        }
+        expect(kind, ev.created_at);
       }
 
       // Reviews: every review that approved or requested changes (REST keeps them all, the first 100).
@@ -546,7 +624,7 @@ function text(s) {
   for (const e of s.ended_without_stop) out.push(`  ${e.session} ${e.project}: last record ${e.last}`);
   for (const g of s.gaps) out.push(`  ${g.session} ${g.project}: ${g.from} .. ${g.to} (${g.minutes} min)`);
   if (s.github) {
-    out.push(`GitHub check: ${s.github.checked_prs} PR(s), ${s.github.misses.length} miss(es), ${s.github.superseded} superseded failure(s) rightly not sent, ${s.github.overtaken ?? 0} overtaken within one poll, ${s.github.requests ?? "?"} GitHub request(s); not checked: ${s.github.not_checked}`);
+    out.push(`GitHub check: ${s.github.checked_prs} PR(s), ${s.github.misses.length} miss(es), ${s.github.superseded} superseded failure(s) rightly not sent, ${s.github.overtaken ?? 0} overtaken before a look could see them, ${s.github.requests ?? "?"} GitHub request(s); not checked: ${s.github.not_checked}`);
     for (const m of s.github.misses) {
       out.push(`  MISS ${m.kind} ${m.repo}#${m.pr}${m.run_id ? ` run ${m.run_id} "${m.workflow}"` : ""}${m.state ? ` ${m.state}` : ""} at ${m.github_at}`);
     }

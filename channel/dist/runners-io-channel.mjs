@@ -1713,10 +1713,26 @@ function startMcp(opts) {
   };
 }
 
+// src/rules.mjs
+var FINISHED_MAX_MS = 3e5;
+var FAILED3 = /* @__PURE__ */ new Set(["failure", "timed_out", "startup_failure"]);
+var COUNTED = /* @__PURE__ */ new Set(["success", "neutral", "failure", "timed_out", "startup_failure"]);
+function latestPerWorkflow(runs) {
+  const latest = /* @__PURE__ */ new Map();
+  const sorted = [...runs ?? []].filter((r) => r && r.status === "completed" && COUNTED.has(r.conclusion)).sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")));
+  for (const r of sorted) if (!latest.has(r.name)) latest.set(r.name, r);
+  return [...latest.values()];
+}
+function baseVerdict(runs) {
+  const latest = new Map(latestPerWorkflow(runs).map((r) => [r.name, r]));
+  const failing = [...latest.values()].filter((r) => FAILED3.has(r.conclusion)).map((r) => String(r.name)).sort();
+  const times = [...latest.values()].map((r) => String(r.updated_at ?? r.created_at ?? "")).filter(Boolean).sort();
+  return { red: failing.length > 0, failing, at: times.at(-1) ?? null };
+}
+
 // src/cadence.ts
 var PENDING_MS = 6e4;
 var FINISHED_MS = 12e4;
-var FINISHED_MAX_MS = 3e5;
 var PENDING_WINDOW_MS = 5 * 6e4;
 var OWN_PUSH_FAST_MS = 5 * 6e4;
 var RUNS_EVERY_MS = 10 * 6e4;
@@ -1812,22 +1828,6 @@ function openEventLog(dir, options) {
       }
     }
   };
-}
-
-// src/rules.mjs
-var FAILED3 = /* @__PURE__ */ new Set(["failure", "timed_out", "startup_failure"]);
-var COUNTED = /* @__PURE__ */ new Set(["success", "neutral", "failure", "timed_out", "startup_failure"]);
-function latestPerWorkflow(runs) {
-  const latest = /* @__PURE__ */ new Map();
-  const sorted = [...runs ?? []].filter((r) => r && r.status === "completed" && COUNTED.has(r.conclusion)).sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")));
-  for (const r of sorted) if (!latest.has(r.name)) latest.set(r.name, r);
-  return [...latest.values()];
-}
-function baseVerdict(runs) {
-  const latest = new Map(latestPerWorkflow(runs).map((r) => [r.name, r]));
-  const failing = [...latest.values()].filter((r) => FAILED3.has(r.conclusion)).map((r) => String(r.name)).sort();
-  const times = [...latest.values()].map((r) => String(r.updated_at ?? r.created_at ?? "")).filter(Boolean).sort();
-  return { red: failing.length > 0, failing, at: times.at(-1) ?? null };
 }
 
 // src/subscriptions.ts
@@ -2936,7 +2936,7 @@ ${note}` };
 }
 
 // src/main.ts
-var VERSION = "0.3.4";
+var VERSION = "0.3.9";
 function serve() {
   const config = loadConfig();
   const gh = new GitHubClient(config.githubApi, () => readGhAuth(process.env, void 0, config.githubApi), fetch, {

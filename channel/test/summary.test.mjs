@@ -325,6 +325,174 @@ test("with --github, no MISS for an unsubscribe-all, a kind the subscription exc
   assert.equal(out.github.overtaken, 2, "the replaced commit's failure and the merge watched 20 s longer");
 });
 
+test("with --github, a change a merge overtook, or a kind the session muted, is not a MISS; a change the session should have seen is", async () => {
+  // Seen live: a `hold` label came off four PRs 11-37 s before auto-merge landed them. The channel's
+  // diff() reports only pr.merged once a poll sees the PR merged, so the label change was overtaken. But the window
+  // ran to the unsubscribe, logged when the session NOTICED the merge (one to two minutes later), so the checker
+  // called each one "in" and a MISS. One session had also muted pr.labels_changed before it.
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  const sha = (c) => c.repeat(40);
+  // M: hold removed 11 s before the merge; the session logged the merge and unsubscribed 70 s after GitHub merged it.
+  gh.setPull("acme/widgets", 11, { head: { sha: sha("a"), ref: "m" }, state: "closed", merged: true, merged_at: ago(50), closed_at: ago(50) });
+  gh.setIssueEvents("acme/widgets", 11, [{ event: "unlabeled", label: { name: "hold" }, created_at: ago(50 + 11 / 60) }]);
+  // U: the session muted pr.labels_changed, then the label came off ten minutes before the merge.
+  gh.setPull("acme/widgets", 12, { head: { sha: sha("b"), ref: "u" }, state: "closed", merged: true, merged_at: ago(40), closed_at: ago(40) });
+  gh.setIssueEvents("acme/widgets", 12, [{ event: "unlabeled", label: { name: "hold" }, created_at: ago(50) }]);
+  // The control: the label came off ten minutes before the merge, watched for every kind, nothing sent.
+  gh.setPull("acme/widgets", 13, { head: { sha: sha("c"), ref: "c" }, state: "closed", merged: true, merged_at: ago(40), closed_at: ago(40) });
+  gh.setIssueEvents("acme/widgets", 13, [{ event: "unlabeled", label: { name: "hold" }, created_at: ago(50) }]);
+  const dir = writeLog([
+    { ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 11, source: "tool", events: "all" },
+    { ...base, t: ago(50 - 70 / 60), type: "event", kind: "pr.merged", repo: "acme/widgets", pr: 11, outcome: "sent" },
+    { ...base, t: ago(50 - 70 / 60), type: "unsubscribe", repo: "acme/widgets", pr: 11, source: "tool", reason: "merged" },
+    { ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 12, source: "tool", events: "all" },
+    { ...base, t: ago(60), type: "mute", repo: "acme/widgets", pr: 12, kinds: ["pr.labels_changed"], workflow: null },
+    { ...base, t: ago(39), type: "event", kind: "pr.merged", repo: "acme/widgets", pr: 12, outcome: "sent" },
+    { ...base, t: ago(39), type: "unsubscribe", repo: "acme/widgets", pr: 12, source: "tool", reason: "merged" },
+    { ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 13, source: "tool", events: "all" },
+    { ...base, t: ago(39), type: "event", kind: "pr.merged", repo: "acme/widgets", pr: 13, outcome: "sent" },
+    { ...base, t: ago(39), type: "unsubscribe", repo: "acme/widgets", pr: 13, source: "tool", reason: "merged" },
+    beat(105),
+    beat(75),
+    beat(45),
+    beat(15),
+    beat(1),
+  ]);
+  const r = await run(["--dir", dir, "--since", "24h", "--json", "--github", "--github-api", gh.base]);
+  assert.equal(r.code, 1, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.deepEqual(
+    out.github.misses.map((m) => `${m.kind}#${m.pr}`),
+    ["pr.labels_changed#13"],
+    "only the control is a MISS",
+  );
+  assert.equal(out.github.overtaken, 1, "the label change the merge overtook");
+});
+
+// Seen live: one day's event log still had 10 label changes counted as MISSes that the channel could never have seen. A finished PR is looked at only every FINISHED_MS..FINISHED_MAX_MS (cadence.ts), and each look reports what
+// changed since the last (state.ts diff): a label added and taken off between two looks changed nothing, and a label
+// change followed by the merge before the next look is reported as pr.merged alone. The test above covered the second
+// only when the watch ended within a minute of the change.
+test("with --github, a label flipped back, or overtaken by the merge, before the next look is not a MISS; a look in between, a change long before the merge, or one never undone is", async () => {
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  const sha = (c) => c.repeat(40);
+  const hold = { name: "hold" };
+  // F: hold added and taken off 14 s later on an open PR, with nothing logged for the PR in between.
+  gh.setPull("acme/widgets", 21, { head: { sha: sha("1"), ref: "f" } });
+  gh.setIssueEvents("acme/widgets", 21, [
+    { event: "labeled", label: hold, created_at: ago(50) },
+    { event: "unlabeled", label: hold, created_at: ago(50 - 14 / 60) },
+  ]);
+  // M: hold taken off 111 s before the merge; the session noticed the merge 80 s after GitHub made it.
+  gh.setPull("acme/widgets", 22, { head: { sha: sha("2"), ref: "m" }, state: "closed", merged: true, merged_at: ago(40), closed_at: ago(40) });
+  gh.setIssueEvents("acme/widgets", 22, [{ event: "unlabeled", label: hold, created_at: ago(40 + 111 / 60) }]);
+  // Control (a): the same flip, but the watching session logged an event for the PR between the two: it looked, so it
+  // saw the label on. Both changes stay MISSes.
+  gh.setPull("acme/widgets", 23, { head: { sha: sha("3"), ref: "a" } });
+  gh.setIssueEvents("acme/widgets", 23, [
+    { event: "labeled", label: hold, created_at: ago(50) },
+    { event: "unlabeled", label: hold, created_at: ago(50 - 20 / 60) },
+  ]);
+  // Control (b): hold taken off six minutes before the merge: several looks happened in between.
+  gh.setPull("acme/widgets", 24, { head: { sha: sha("4"), ref: "b" }, state: "closed", merged: true, merged_at: ago(40), closed_at: ago(40) });
+  gh.setIssueEvents("acme/widgets", 24, [{ event: "unlabeled", label: hold, created_at: ago(46) }]);
+  // Control (c): hold added to a PR that stays open, never undone.
+  gh.setPull("acme/widgets", 25, { head: { sha: sha("5"), ref: "c" } });
+  gh.setIssueEvents("acme/widgets", 25, [{ event: "labeled", label: hold, created_at: ago(50) }]);
+  // Control (d): hold added and taken off six minutes apart: a look lay between them whatever the cadence.
+  gh.setPull("acme/widgets", 26, { head: { sha: sha("6"), ref: "d" } });
+  gh.setIssueEvents("acme/widgets", 26, [
+    { event: "labeled", label: hold, created_at: ago(50) },
+    { event: "unlabeled", label: hold, created_at: ago(44) },
+  ]);
+  // Control (e): two DIFFERENT labels 14 s apart are not a flip of either.
+  gh.setPull("acme/widgets", 27, { head: { sha: sha("7"), ref: "e" } });
+  gh.setIssueEvents("acme/widgets", 27, [
+    { event: "labeled", label: hold, created_at: ago(50) },
+    { event: "unlabeled", label: { name: "wip" }, created_at: ago(50 - 14 / 60) },
+  ]);
+  const sub = (pr) => ({ ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr, source: "tool", events: "all" });
+  const dir = writeLog([
+    ...[21, 22, 23, 24, 25, 26, 27].map(sub),
+    { ...base, t: ago(50 - 10 / 60), type: "event", kind: "ci.workflow_succeeded", repo: "acme/widgets", pr: 23, run_id: 231, outcome: "filtered" },
+    { ...base, t: ago(40 - 80 / 60), type: "event", kind: "pr.merged", repo: "acme/widgets", pr: 22, outcome: "sent" },
+    { ...base, t: ago(40 - 80 / 60), type: "unsubscribe", repo: "acme/widgets", pr: 22, source: "tool", reason: "merged" },
+    { ...base, t: ago(39), type: "event", kind: "pr.merged", repo: "acme/widgets", pr: 24, outcome: "sent" },
+    { ...base, t: ago(39), type: "unsubscribe", repo: "acme/widgets", pr: 24, source: "tool", reason: "merged" },
+    beat(105),
+    beat(75),
+    beat(45),
+    beat(15),
+    beat(1),
+  ]);
+  const r = await run(["--dir", dir, "--since", "24h", "--json", "--github", "--github-api", gh.base]);
+  assert.equal(r.code, 1, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.deepEqual(
+    out.github.misses.map((m) => `${m.kind}#${m.pr}`).sort(),
+    ["pr.labels_changed#23", "pr.labels_changed#23", "pr.labels_changed#24", "pr.labels_changed#25", "pr.labels_changed#26", "pr.labels_changed#26", "pr.labels_changed#27", "pr.labels_changed#27"],
+    "only the controls are MISSes",
+  );
+  assert.equal(out.github.overtaken, 3, "both halves of the flip, and the label change the merge overtook");
+});
+
+// Three changes of one label between two looks (added, taken off, added again) are not a flip: the PR went from
+// without the label to with it, so the channel owes one pr.labels_changed. Pairing each change with either neighbour
+// would count all three as overtaken and hide a real MISS; only an even run of changes cancels out.
+test("with --github, a label changed an odd number of times between two looks still owes one pr.labels_changed", async () => {
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  const hold = { name: "hold" };
+  gh.setPull("acme/widgets", 31, { head: { sha: "3".repeat(40), ref: "odd" } });
+  gh.setIssueEvents("acme/widgets", 31, [
+    { event: "labeled", label: hold, created_at: ago(50) },
+    { event: "unlabeled", label: hold, created_at: ago(50 - 10 / 60) },
+    { event: "labeled", label: hold, created_at: ago(50 - 20 / 60) },
+  ]);
+  const dir = writeLog([
+    { ...base, t: ago(110), type: "subscribe", repo: "acme/widgets", pr: 31, source: "tool", events: "all" },
+    beat(105),
+    beat(75),
+    beat(45),
+    beat(15),
+    beat(1),
+  ]);
+  const r = await run(["--dir", dir, "--since", "24h", "--json", "--github", "--github-api", gh.base]);
+  assert.equal(r.code, 1, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.deepEqual(out.github.misses.map((m) => `${m.kind}#${m.pr}`), ["pr.labels_changed#31"], "the net change is owed once");
+  assert.equal(out.github.overtaken, 2, "the add and remove that cancelled out");
+});
+
+test("with --github, a real log's flip (#6660) and late merge (#6737) are overtaken, at their real times", async () => {
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  const repo = "acme/widgets";
+  const hold = { name: "hold" };
+  gh.setPull(repo, 6660, { head: { sha: "6".repeat(40), ref: "flip" } });
+  gh.setIssueEvents(repo, 6660, [
+    { event: "labeled", label: hold, created_at: "2026-11-19T22:08:13Z" },
+    { event: "unlabeled", label: hold, created_at: "2026-11-19T22:08:27Z" },
+  ]);
+  gh.setPull(repo, 6737, { head: { sha: "7".repeat(40), ref: "late" }, state: "closed", merged: true, merged_at: "2026-11-20T01:17:21Z", closed_at: "2026-11-20T01:17:21Z" });
+  gh.setIssueEvents(repo, 6737, [{ event: "unlabeled", label: hold, created_at: "2026-11-20T01:15:30Z" }]);
+  const at = (t, r) => ({ ...base, t, ...r });
+  const dir = writeLog([
+    at("2026-11-19T21:30:00.000Z", { type: "subscribe", repo, pr: 6660, source: "auto" }),
+    at("2026-11-19T21:30:00.000Z", { type: "subscribe", repo, pr: 6737, source: "auto" }),
+    at("2026-11-19T22:05:00.000Z", { type: "heartbeat", subscriptions: 2, rate_remaining: 4000, requests: { ok: 1, not_modified: 1, other: 0 } }),
+    at("2026-11-20T01:19:02.000Z", { type: "event", kind: "pr.merged", repo, pr: 6737, outcome: "sent" }),
+    at("2026-11-20T01:19:02.000Z", { type: "unsubscribe", repo, pr: 6737, source: "tool", reason: "merged" }),
+    beat(1),
+  ]);
+  const r = await run(["--dir", dir, "--since", "2026-11-19T21:00:00Z", "--json", "--github", "--github-api", gh.base]);
+  const out = JSON.parse(r.stdout);
+  assert.deepEqual(out.github.misses, [], r.stderr);
+  assert.equal(out.github.overtaken, 3, "the flip's two halves and the label change 111 s before the merge");
+});
+
 test("with --github, the base replay reads far enough back to know a workflow's last verdict: a red that never cleared is not a new red", async () => {
   // Once, main's dependency audit failed, then more than 100 push runs finished. The newest 100 no longer
   // held it, so the check saw main green, then expected a base.red that the channel rightly never sent.

@@ -2,6 +2,10 @@
 // says happened, to find an event the channel should have sent and did not.
 // Plain JavaScript, so a script can run it on Node 20 without a build; types are in rules.d.mts.
 
+// ---- How long a finished pull request can go between two looks (cadence.ts lookEveryMs), before rate pressure
+// stretches it. The summary script uses it to tell a change no look could have seen.
+export const FINISHED_MAX_MS = 300_000;
+
 // ---- The base branch: red when the latest completed run of any workflow on it failed.
 
 const FAILED = new Set(["failure", "timed_out", "startup_failure"]);

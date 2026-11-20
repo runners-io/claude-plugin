@@ -1,3 +1,5 @@
+export const FINISHED_MAX_MS: number;
+
 export interface BaseRun {
   readonly name: string;
   readonly status: string;

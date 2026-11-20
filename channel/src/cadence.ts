@@ -15,13 +15,16 @@
  *
  * The session's own push (OWN_PUSH_FAST_MS) puts its pull request on every pass at once, for five minutes.
  */
+import { FINISHED_MAX_MS } from "./rules.mjs";
 import type { Snapshot } from "./state.ts";
 
 export type Phase = "running" | "pending" | "finished";
 
 export const PENDING_MS = 60_000;
 export const FINISHED_MS = 120_000;
-export const FINISHED_MAX_MS = 300_000;
+// The longest a finished PR goes unlooked at (before rate pressure stretches it) lives in rules.mjs, because the
+// event-log check (scripts/event-log-summary.mjs) reads it too, on Node 20, which cannot import this file.
+export { FINISHED_MAX_MS };
 /** A head with no runs is pending this long after it was first seen, then finished (a PR with no CI). */
 export const PENDING_WINDOW_MS = 5 * 60_000;
 /**
