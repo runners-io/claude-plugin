@@ -1,5 +1,5 @@
 {
-  "description": "When a tool's output names a pull request just opened by you in this session's own repository, hand it to the runners-io CI channel to watch (unless auto_subscribe is off or the channel is not on); otherwise, after Claude opens a pull request, ask it to subscribe. At launch, tell the user when live CI events are off in the session.",
+  "description": "When a tool's output names a pull request just opened by you in this session's own repository, hand it to the runners-io CI channel to watch (unless auto_subscribe is off or the channel is not on); otherwise, after Claude opens a pull request, ask it to subscribe. At launch, tell the user when live CI events are off in the session, and when the machine is missing something the plugin needs (the GitHub CLI, its login, git, Node.js), with the fix for Claude to offer. Both hooks run through hooks/node.sh, which says so when Node.js is missing or older than 20.",
   "hooks": {
     "PostToolUse": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/pr-created.mjs\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/node.sh\" quiet \"${CLAUDE_PLUGIN_ROOT}/hooks/pr-created.mjs\"",
             "timeout": 10
           }
         ]
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.mjs\"",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/node.sh\" session-start \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.mjs\"",
             "timeout": 10
           }
         ]

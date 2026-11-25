@@ -26,6 +26,7 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
     involved: new Map(), // "o/r" -> PR numbers the involves:@me search answers
     reviewPulls: new Map(), // "o/r#n" -> the GraphQL pullRequest node the review query answers with
     graphqlRate: { remaining: 4990, limit: 5000 }, // GraphQL's own budget, separate from REST's
+    repos: new Map(), // "o/r" -> the repository's own fields (fork, private); one not listed is a plain public one
   };
   const requests = [];
 
@@ -93,7 +94,9 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
       });
     }
     if (url.pathname === "/user") return send(req, res, 200, { login: state.reviewRequests.viewer });
-    let m = /^\/repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)$/.exec(url.pathname);
+    let m = /^\/repos\/([^/]+)\/([^/]+)$/.exec(url.pathname);
+    if (m) return send(req, res, 200, { full_name: `${m[1]}/${m[2]}`, fork: false, private: false, ...(state.repos.get(`${m[1]}/${m[2]}`) ?? {}) });
+    m = /^\/repos\/([^/]+)\/([^/]+)\/pulls\/(\d+)$/.exec(url.pathname);
     if (m) {
       const pull = state.pulls.get(`${m[1]}/${m[2]}#${m[3]}`);
       return pull ? send(req, res, 200, pull) : send(req, res, 404, { message: "Not Found" });

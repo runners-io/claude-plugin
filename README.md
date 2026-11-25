@@ -14,10 +14,13 @@ The plugin bundles four things:
 - **Tools to choose what to watch**, per session: `subscribe`, `unsubscribe`, `list_subscriptions`, `ci_status`, `mute` and `unmute`.
 - **A hook** that watches a pull request just opened in your session's own repository, by your GitHub login, whether
   Claude or a script opened it. A pull request anywhere else is never watched without Claude subscribing to it.
+- **Setup checks at launch**: when your machine is missing something the plugin needs (the GitHub CLI, its login,
+  git, Node.js), it says so in one line and Claude offers the fix, asking first. A machine that is ready hears nothing.
+  See [Setup checks](#setup-checks).
 - **The runners.io MCP server** (`https://mcp.runners.io/mcp`), for runners.io customers: tools to read your jobs, logs,
   test results, cache and spend.
 
-And the skills `watch-this-pr`, `fix-failing-ci`, `setup-github` and `sign-in`.
+And the skills `watch-this-pr`, `fix-failing-ci`, `setup-github`, `doctor` and `sign-in`.
 
 The channel works in the Claude Code terminal app, while the session is open.
 
@@ -28,11 +31,11 @@ in to github.com. If you don't have `gh`, the plugin's `setup-github` skill walk
 your agreement, and you sign in with `! gh auth login --web --scopes repo`.
 
 ```bash
-claude plugin marketplace add runners-io/claude-plugin#v0.3.13
+claude plugin marketplace add runners-io/claude-plugin#v0.3.14
 claude plugin install runners-io@runners-io
 ```
 
-This installs exactly one release: every release has a new version and a tag of its own (`v0.3.13` is this one), and
+This installs exactly one release: every release has a new version and a tag of its own (`v0.3.14` is this one), and
 the `#` and tag pin the marketplace to it. We do not move a release tag once it is published, so updating that
 marketplace never takes you past the release you chose. To move to a newer release, run
 `claude plugin marketplace remove runners-io` (which uninstalls the plugin), then the two commands above with the newer
@@ -60,7 +63,7 @@ Or from inside a session: `/plugin marketplace add runners-io/claude-plugin`, th
 To install from a copy you have checked out and read yourself:
 
 ```bash
-git clone --branch v0.3.13 --depth 1 https://github.com/runners-io/claude-plugin.git
+git clone --branch v0.3.14 --depth 1 https://github.com/runners-io/claude-plugin.git
 claude plugin marketplace add ./claude-plugin
 claude plugin install runners-io@runners-io
 ```
@@ -123,6 +126,54 @@ development flag:
 
 `allowedChannelPlugins` replaces Anthropic's list for your organisation, so include any other channel plugins you
 use. Pro, Max and Ultra accounts outside an organisation skip both settings.
+
+## Setup checks
+
+At every launch the plugin checks whether your machine is ready for it. **A machine that is ready adds nothing to the
+session.** When something is missing, you see one short line naming the most serious problem, and Claude is given the
+whole list with the fix for each, to offer once, asking first. Nothing is installed or changed without your yes. A
+command that needs `sudo`, a browser or a one-time code is handed to you to type as `! <command>`, and no token is
+ever asked for.
+
+The launch checks are local: no network call, and well under a second.
+
+| check | effect | what Claude offers |
+|---|---|---|
+| Node.js missing or older than 20 | blocks | how to install it for your system (said by a small shell wrapper, since nothing else can run) |
+| the GitHub CLI (`gh`) is not installed | blocks | to install it (the `setup-github` skill) |
+| `gh` is not signed in, and no `GH_TOKEN` / `GITHUB_TOKEN` is set | blocks | `! gh auth login --hostname github.com --web --scopes repo`, for you to run |
+| git is not installed | blocks | to install it |
+| the repository is on GitHub Enterprise | degrades | `RUNNERS_IO_GITHUB_API` and `gh auth login --hostname <host>`; the branch's pull request is still not found by itself there |
+| the plugin's data folder cannot be written | degrades | which folder, and what is off without it |
+| `GH_TOKEN` / `GITHUB_TOKEN` is set over `gh`'s own login | degrades, said once per project | which variable is in use, and what to do if reads are refused |
+| `gh` holds several accounts | degrades, said once per project | `gh auth switch`, if the active one is the wrong one |
+| `HTTPS_PROXY` is set | degrades, said once per project | the channel does not use the proxy yet; with Node.js 24 or later, `NODE_USE_ENV_PROXY=1` makes Node use it |
+| Windows | degrades, said once per project | the plugin cannot read the launch there, or set up `claude-gh` |
+| the folder is not a git repository; origin is not on GitHub; there are no workflow files; the clone has an `upstream` remote (a fork) | info, said once per project | nothing to fix: what the plugin will not do here |
+
+Some problems show only in GitHub's answers, so the channel notes them and **the next launch** reports them: a login
+GitHub refuses (blocks), a certificate that does not verify, as on a network that inspects HTTPS (blocks; the fix is
+`NODE_EXTRA_CA_CERTS`), a login with no `repo` scope, and an organisation whose single sign-on the login is not
+authorised for. A good answer from GitHub takes the note off again. The note is a small file,
+`first-call.json` in `~/.local/state/runners-io` (or `$XDG_STATE_HOME/runners-io`): kinds, counts and times only, with
+no token, no repository or organisation name and no response.
+
+**No nagging.**
+
+- An `info` line, and the ones marked "said once per project", are said once in a project and never again.
+- Say no to a fix and it is not offered again for 7 days. Its line is not shown either, unless it blocks.
+- `RUNNERS_IO_NO_SETUP_CHECKS=1` turns every offer off. A problem that blocks still shows its one line.
+- Nothing is said in `claude -p`, or after `/clear` or `/compact`: no check is even run.
+
+**`/runners-io:doctor`** runs every check when you ask, with one live call to GitHub, and shows each as `ready` or
+`NOT READY` with its fix. After a fix, Claude runs it again and confirms that the line now reads ready. It runs the
+channel's `status` command, which you can run yourself:
+
+```bash
+node <the plugin's folder>/channel/dist/runners-io-channel.mjs status
+```
+
+On Windows the Node.js check relies on Claude Code running hook commands through Git Bash.
 
 ## Choosing what to watch
 
@@ -322,7 +373,8 @@ requests, the workflow runs on each one's head commit, the
 jobs of each run that has not finished and of a failed run, a failed job's annotations (file, line and level only),
 the latest push runs on each watched pull request's base branch, and, through GraphQL, each watched pull request's
 reviews, review threads and merge state; with review requests on (`RUNNERS_IO_REVIEW_REQUESTS=on`), also a GraphQL
-search for the review requests made of your login. Nothing is written to GitHub.
+search for the review requests made of your login; and, only when the doctor (the `status` command) is run, the
+repository itself, to see that GitHub shows it to your login and whether it is a fork. Nothing is written to GitHub.
 
 **To runners.io, by the channel:** nothing.
 
@@ -378,6 +430,14 @@ label names, head commits, links to GitHub and CI results, plus each answer's ET
 
 Delete the folder whenever you like: the next look at GitHub rebuilds what it needs.
 
+The plugin's state folder, `~/.local/state/runners-io` (or `$XDG_STATE_HOME/runners-io`), holds what is not a cache:
+your no to `claude-gh`, and two small files for the [setup checks](#setup-checks).
+`first-call.json` is what GitHub last answered about your login (kinds, counts and times; an organisation only as a
+hash, never its name). `setup-checks.json` is which fixes you said no to and which once-only lines were already said,
+with each project folder as a hash. Neither holds a token. Both are `0600` in a `0700` folder, are never written
+through a symlink, and are believed only when the folder and the file are yours. Delete them whenever you like: the
+checks are then made, and said, afresh.
+
 **What the development-channels flag allows.** The risk, plainly: Anthropic has not reviewed this channel, so the
 flag lets code that no one but us has checked put text into your session; and it applies to every later update of
 the plugin too, not only the version you read. To review each change before it runs, use a
@@ -389,7 +449,8 @@ Enterprise plans, an admin can instead approve this plugin in `allowedChannelPlu
 before you choose either.
 
 **What the plugin runs on your machine.** `gh auth token`, `git` (to read the folder's remote, branch and commits),
-`ps` (to see whether the session was started with the channel flag), `node`, and, at the start of a session (not
+`ps` (to see whether the session was started with the channel flag), `node`, `sh` (a small wrapper, `hooks/node.sh`,
+that starts each hook and says so when Node.js is missing), and, at the start of a session (not
 again for a day once it has found one), your own shell as a login shell to ask whether `claude-gh` exists
 (`$SHELL -lic 'command -v claude-gh'`; fish: `type -q claude-gh`). bash is asked a second time, as `bash -ic`, when
 the first answer is no, because a login bash reads `.bashrc` only when told to. Each start is stopped after 4 seconds,
@@ -397,7 +458,10 @@ and the shell's own process group is stopped with it, so what it started in the 
 left that group (a daemon such as `ssh-agent` or a `tmux` server) is left running, as it would be after you closed a
 terminal. Each is started with a fixed list of
 arguments, never through a shell with text from GitHub, and nothing from an event is ever run or evaluated. The
-setup-github skill edits your shell's rc file only after asking you, and shows the lines first.
+setup-github skill edits your shell's rc file only after asking you, and shows the lines first. The setup checks at
+launch run `gh auth token` (to see that gh has a login; the token is not kept) and `git` in the session's folder,
+read the account names in gh's own `hosts.yml`, and write a file into each of the plugin's own folders to see that
+they can. They make no network call.
 
 **Reporting a vulnerability.** See [SECURITY.md](SECURITY.md).
 
@@ -408,6 +472,7 @@ These are read from the environment you start Claude Code from. None is needed.
 | variable | default | what it does |
 |---|---|---|
 | `RUNNERS_IO_NO_CLAUDE_GH_OFFER` | unset | `1`: Claude never offers to set up `claude-gh` at the start of a session |
+| `RUNNERS_IO_NO_SETUP_CHECKS` | unset | `1`: Claude never offers a fix from the [setup checks](#setup-checks); a problem that blocks the plugin still shows its one line at launch |
 | `RUNNERS_IO_POLL_SECONDS` | `20` | seconds between looks at a pull request whose CI is running, 5 to 300; the slower looks are never shorter than this |
 | `RUNNERS_IO_RATE_FLOOR` | `200` | below this many GitHub requests left in the hour, look four times less often (on top of the backoff at 30% and 15% left). Raise it when the same `gh` login also drives other tools |
 | `RUNNERS_IO_EVENT_LOG_DIR` | off | an absolute directory for the event log (below) |
@@ -454,6 +519,8 @@ The script exits 0 when it finds nothing, 1 on a miss, a gap or an error, and 2 
 
 ## Troubleshooting
 
+- **Start with `/runners-io:doctor`.** It runs every [setup check](#setup-checks), shows what is not ready and offers
+  the fix.
 - **No events arrive.** Check that the session was started with the channel flag (above): if it was not, the plugin
   said so in a line at launch. Run `/mcp`: the
   `runners-io` server should be connected. Run `node …/channel/dist/runners-io-channel.mjs status` in the repository to
@@ -473,7 +540,8 @@ The script exits 0 when it finds nothing, 1 on a miss, a gap or an error, and 2 
 
 The channel is TypeScript in `channel/src`, bundled to one file, `channel/dist/runners-io-channel.mjs`, so the plugin
 installs nothing when it runs. The bundle is committed, and CI fails when it is missing or differs from a fresh build.
-The hook is plain JavaScript in `hooks/`.
+The hooks are plain JavaScript in `hooks/`, started through `hooks/node.sh`; the setup checks are
+`hooks/readiness.mjs`, which the channel bundles too.
 
 ```bash
 cd channel

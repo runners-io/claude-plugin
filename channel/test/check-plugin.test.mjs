@@ -224,3 +224,31 @@ test("--against with no ref after it is refused", () => {
     assert.equal(r.status, 1, `--against with no ref passed:\n${r.out}`);
   });
 });
+
+// Both hooks go through hooks/node.sh, which is what tells a machine with no Node.js so; and the doctor skill and the
+// setup checks' module are part of the plugin.
+test("the check refuses a hook that does not run through the Node.js wrapper, a missing wrapper, and a missing doctor skill", () => {
+  withTemp((root) => {
+    const plugin = join(root, "plugin");
+    cpSync(PLUGIN, plugin, { recursive: true, filter: (src) => basename(src) !== "node_modules" });
+    assert.equal(spawnSync(process.execPath, [CHECK, plugin], { encoding: "utf8" }).status, 0, "the copy passes as it is");
+
+    const hooks = readJson(plugin, "hooks/hooks.json");
+    const bare = structuredClone(hooks);
+    bare.hooks.SessionStart[0].hooks[0].command = 'node "${CLAUDE_PLUGIN_ROOT}/hooks/session-start.mjs"';
+    bare.hooks.PostToolUse[0].hooks[0].command = 'node "${CLAUDE_PLUGIN_ROOT}/hooks/pr-created.mjs"';
+    writeJson(plugin, "hooks/hooks.json", bare);
+    let r = spawnSync(process.execPath, [CHECK, plugin], { encoding: "utf8" });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /no SessionStart hook runs hooks\/session-start\.mjs through hooks\/node\.sh/);
+    assert.match(r.stderr, /the PR hook does not run through hooks\/node\.sh as quiet/);
+
+    writeJson(plugin, "hooks/hooks.json", hooks);
+    rmSync(join(plugin, "hooks", "node.sh"));
+    rmSync(join(plugin, "skills", "doctor"), { recursive: true });
+    r = spawnSync(process.execPath, [CHECK, plugin], { encoding: "utf8" });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /hooks\/node\.sh does not exist/);
+    assert.match(r.stderr, /the doctor skill is missing/);
+  });
+});

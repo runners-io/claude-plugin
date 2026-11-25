@@ -2,7 +2,8 @@
  * runners-io-channel: the runners.io CI channel for Claude Code.
  *
  *   runners-io-channel            the stdio MCP channel server Claude Code starts
- *   runners-io-channel status     the GitHub login, repository, branch and pull request it would watch
+ *   runners-io-channel status     the GitHub login, repository, branch and pull request it would watch, and every
+ *                                 setup check as ready or NOT READY, with one live GitHub call (the doctor skill)
  *   runners-io-channel version
  *
  * It reads GitHub directly with the user's own `gh` login, so it needs no runners.io account and sends nothing to
@@ -11,7 +12,9 @@
  */
 import { removeRequests, resetRequests, takeRequests } from "./hookrequests.ts";
 import { SharedStore, defaultSharedRoot } from "./shared.ts";
-import { loadConfig } from "./config.ts";
+import { fakeGitHubAllowed, loadConfig } from "./config.ts";
+import { channelRow, liveRow } from "./doctor.ts";
+import { FirstCallRecorder } from "./firstcall.ts";
 import { inOwnHistory, readGitScope, readPushed } from "./git.ts";
 import { GitHubClient, readGhAuth } from "./github.ts";
 import { log } from "./log.ts";
@@ -23,13 +26,25 @@ import { INSTRUCTIONS } from "./instructions.ts";
 import { makeTools } from "./tools.ts";
 import { NO_EVENT_LOG, openEventLog } from "./eventlog.ts";
 import { findLaunch, pollsIn } from "../../hooks/launch.mjs";
+import { firstCallRows, launchChecks, mergeRows, readFirstCall, renderTable } from "../../hooks/readiness.mjs";
 
-export const VERSION = "0.3.13";
+export const VERSION = "0.3.14";
+
+/**
+ * Notes what GitHub answers, for the next launch's setup checks (firstcall.ts). Not under the tests' fake GitHub
+ * unless the test names a state folder of its own: a fake's refusals must never be filed as this user's.
+ */
+function firstCallRecorder(projectDir: string): FirstCallRecorder | null {
+  if (fakeGitHubAllowed(process.env) && !process.env.XDG_STATE_HOME) return null;
+  return new FirstCallRecorder(process.env, projectDir);
+}
 
 function serve(): void {
   const config = loadConfig();
+  const firstCall = firstCallRecorder(config.projectDir);
   const gh = new GitHubClient(config.githubApi, () => readGhAuth(process.env, undefined, config.githubApi), fetch, {
     shared: new SharedStore(defaultSharedRoot()),
+    observe: (o) => firstCall?.observe(o),
   });
   const subs = new Subscriptions();
   // This project's repository scopes (scopes.ts): the one choice kept beyond the session, in the plugin's own data
@@ -111,14 +126,21 @@ async function status(): Promise<void> {
       : auth.kind === "not_installed"
         ? "the GitHub CLI (gh) is not installed"
         : "gh is not signed in to github.com";
+  const firstCall = firstCallRecorder(config.projectDir);
+  const client = new GitHubClient(config.githubApi, async () => auth, fetch, { observe: (o) => firstCall?.observe(o) });
   let pr = "none";
   if (auth.kind === "ok" && scope.repo && scope.branch) {
-    const found = await new GitHubClient(config.githubApi, async () => auth).findOpenPull(scope.repo, scope.branch);
+    const found = await client.findOpenPull(scope.repo, scope.branch);
     pr = found.kind === "ok" ? (found.value === null ? "no open pull request" : `#${found.value}`) : `could not ask GitHub (${found.kind})`;
   }
+  const checks = { env: process.env, projectDir: config.projectDir };
+  const local = await launchChecks(checks);
+  const live = auth.kind === "ok" ? [await liveRow(client, scope.repo, firstCall)] : [];
+  const rows = mergeRows(local, live, firstCallRows(readFirstCall(process.env), checks), [channelRow(findLaunch(process.ppid).state)]);
   process.stdout.write(
     `runners-io-channel ${VERSION}\n${login}\nrepository: ${scope.repo ?? "none"}, branch: ${scope.branch ?? "none"}, pull request: ${pr}\n` +
-      `automatic subscription: ${config.autoSubscribe}, every ${config.pollSeconds} s; event log: ${config.eventLogDir ?? "off"}\n`,
+      `automatic subscription: ${config.autoSubscribe}, every ${config.pollSeconds} s; event log: ${config.eventLogDir ?? "off"}\n` +
+      `setup checks (/runners-io:doctor):\n${renderTable(rows)}\n`,
   );
 }
 

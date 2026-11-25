@@ -3,8 +3,8 @@
 // the names a user types (`plugin:runners-io@runners-io`), the channel bound to
 // a server that exists, the remote MCP address, a bundle that is really there,
 // a bundle that never declares the permission relay and offers only the four
-// subscription tools, a channel that reads GitHub and not runners.io, and the
-// PR hook pointing at a script that exists. And one version: every field that names the plugin's version names the
+// subscription tools, a channel that reads GitHub and not runners.io, and both
+// hooks pointing at scripts that exist and run through the wrapper that says so when there is no Node.js. And one version: every field that names the plugin's version names the
 // same one, and, with --against, a plugin that changed since <git ref> carries a newer version than it had there,
 // because an installed copy is cached by its version and a release that keeps the old one is a release nobody can
 // tell apart from the last.
@@ -134,6 +134,8 @@ if (existsSync(bundlePath)) {
   check(!bundle.includes('"reply"'), "the bundle mentions a reply tool: the channel is one way");
   // The channel reads GitHub with the user's own login, and calls no runners.io API.
   check(bundle.includes("api.github.com") && !bundle.includes("authorization_code") && !/runners\.io\/api\//.test(bundle), "the bundle does not read GitHub directly, or calls a runners.io API");
+  // The doctor skill runs the bundle's `status`, which must print the setup checks.
+  check(bundle.includes("setup checks (/runners-io:doctor):"), "the bundle's status command does not print the setup checks");
 }
 
 const hooksFile = join(root, "hooks", "hooks.json");
@@ -145,6 +147,13 @@ if (existsSync(hooksFile)) {
   check(pr, "no PostToolUse hook runs ${CLAUDE_PLUGIN_ROOT}/hooks/pr-created.mjs");
   check(pr && /Bash/.test(pr.matcher), "the PR hook does not match Bash, where gh pr create runs");
   check(existsSync(join(root, "hooks", "pr-created.mjs")), "hooks/pr-created.mjs does not exist");
+  // The launch hook: it says what the machine is missing (hooks/readiness.mjs), which the channel cannot do in a
+  // session started without its flag. Both hooks go through hooks/node.sh, or a machine with no Node.js hears nothing.
+  const starts = (JSON.parse(readFileSync(hooksFile, "utf8")).hooks?.SessionStart ?? []).flatMap((h) => (h.hooks ?? []).map((x) => x.command ?? ""));
+  const wrapper = 'sh "${CLAUDE_PLUGIN_ROOT}/hooks/node.sh" ';
+  check(starts.some((c) => c === `${wrapper}session-start "\${CLAUDE_PLUGIN_ROOT}/hooks/session-start.mjs"`), "no SessionStart hook runs hooks/session-start.mjs through hooks/node.sh as session-start");
+  check(pr && pr.command === `${wrapper}quiet "\${CLAUDE_PLUGIN_ROOT}/hooks/pr-created.mjs"`, "the PR hook does not run through hooks/node.sh as quiet");
+  for (const name of ["node.sh", "session-start.mjs", "readiness.mjs", "launch.mjs"]) check(existsSync(join(root, "hooks", name)), `hooks/${name} does not exist`);
 }
 
 const skills = join(root, "skills");
@@ -153,7 +162,7 @@ for (const name of readdirSync(skills)) {
   check(existsSync(file), `skills/${name} has no SKILL.md`);
   if (existsSync(file)) check(/^---\n(?:.*\n)*?description: .{20,}\n(?:.*\n)*?---\n/.test(readFileSync(file, "utf8")), `skills/${name}/SKILL.md has no description`);
 }
-for (const name of ["fix-failing-ci", "watch-this-pr", "sign-in", "setup-github"]) check(existsSync(join(skills, name, "SKILL.md")), `the ${name} skill is missing`);
+for (const name of ["fix-failing-ci", "watch-this-pr", "sign-in", "setup-github", "doctor"]) check(existsSync(join(skills, name, "SKILL.md")), `the ${name} skill is missing`);
 
 /** True when x.y.z version `now` is greater than `was`, comparing each part as a number (1.10.0 > 1.2.3). */
 function newer(now, was) {

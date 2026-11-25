@@ -305,8 +305,833 @@ function parseFloor(raw) {
   return Math.max(0, Math.min(5e3, Math.floor(n)));
 }
 
-// src/git.ts
+// ../hooks/launch.mjs
+import { execFileSync } from "node:child_process";
+var CHANNEL_FLAGS = /* @__PURE__ */ new Set(["--channels", "--dangerously-load-development-channels"]);
+var OURS = /^(plugin:runners-io@[A-Za-z0-9._-]+|server:runners-io)$/;
+var HEADLESS = /* @__PURE__ */ new Set(["-p", "--print"]);
+function parseLaunch(args) {
+  const tokens = String(args ?? "").trim().split(/\s+/).filter(Boolean);
+  const script = tokens.slice(0, 3).findIndex((t) => /@anthropic-ai\/claude-code\/cli\.(m?js)$/.test(t));
+  let on = false;
+  let headless = false;
+  for (let i = script >= 0 ? script + 1 : 1; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === "--" || !t.startsWith("-")) break;
+    if (HEADLESS.has(t)) headless = true;
+    const eq = t.indexOf("=");
+    const flag = eq > 0 ? t.slice(0, eq) : t;
+    if (CHANNEL_FLAGS.has(flag)) {
+      const entries = eq > 0 ? [t.slice(eq + 1)] : [];
+      if (eq < 0) while (i + 1 < tokens.length && !tokens[i + 1].startsWith("-")) entries.push(tokens[++i]);
+      if (entries.some((e) => OURS.test(e))) on = true;
+    } else if (eq < 0 && i + 1 < tokens.length && !tokens[i + 1].startsWith("-")) {
+      i++;
+    }
+  }
+  return { state: headless ? "headless" : on ? "on" : "off" };
+}
+var SESSION_ID = /^[A-Za-z0-9-]{8,64}$/;
+function relaunchSentence(sessionId) {
+  const id = typeof sessionId === "string" && SESSION_ID.test(sessionId) ? sessionId : null;
+  return id ? `relaunch with \`claude-gh --resume ${id}\`` : "relaunch with `claude-gh --resume <this session's id>` (the launch notice gives the id; `claude-gh --continue` only when it is not known, since with several sessions open it can reopen another one)";
+}
+function pollsIn(state) {
+  return state === "on" || state === "unknown";
+}
+function isClaude(args) {
+  const tokens = String(args ?? "").trim().split(/\s+/);
+  const first = tokens[0] ?? "";
+  if (first === "claude" || first.endsWith("/claude") || /\/claude\/versions\/[^/]+$/.test(first)) return true;
+  return tokens.slice(0, 2).some((t) => /@anthropic-ai\/claude-code\/cli\.(m?js)$/.test(t));
+}
+var SHELLS = /* @__PURE__ */ new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"]);
+function isShell(args) {
+  const first = String(args ?? "").trim().split(/\s+/)[0] ?? "";
+  return SHELLS.has(first.replace(/^-/, "").split("/").at(-1));
+}
+function psRow(pid) {
+  const out = execFileSync("ps", ["-o", "ppid=,args=", "-p", String(pid)], { encoding: "utf8", timeout: 3e3, stdio: ["ignore", "pipe", "ignore"] });
+  const m = /^\s*(\d+)\s+(.*)$/.exec(out.trim());
+  return m ? { ppid: Number(m[1]), args: m[2] } : null;
+}
+function findLaunch(pid = process.ppid, ps = psRow) {
+  try {
+    let current = pid;
+    for (let hops = 0; hops < 8 && current > 1; hops++) {
+      const row = ps(current);
+      if (!row) break;
+      if (isClaude(row.args)) return { ...parseLaunch(row.args), claudePid: current };
+      if (!isShell(row.args)) break;
+      current = row.ppid;
+    }
+  } catch {
+  }
+  return { state: "unknown" };
+}
+
+// src/doctor.ts
+async function liveRow(client, repo, firstCall) {
+  const id = "github_answers";
+  const label2 = repo ? "GitHub answers for this repository" : "GitHub answers for this login";
+  const r = repo ? await client.repoInfo(repo) : await client.viewerLogin();
+  if (r.kind === "ok") {
+    if (repo && typeof r.value === "object") firstCall?.fork(r.value.fork);
+    return { id, label: label2, state: "ready", why: "asked just now" };
+  }
+  if (r.kind === "auth") return { id, label: label2, state: "skipped", why: "there is no login GitHub accepts: see the lines about gh and the login" };
+  if (r.kind === "retry") return { id, label: label2, state: "unknown", why: `could not ask GitHub: ${r.reason}` };
+  return {
+    id,
+    label: label2,
+    state: "not_ready",
+    effect: "blocks",
+    line: "GitHub doesn't show this repository to the signed-in login, so its CI can't be read.",
+    fix: "Usually one of three things: a private repository and a login with no repo scope (the user types `! gh auth refresh --scopes repo` in the prompt), an organisation whose single sign-on the login is not authorised for (run a gh read in the repository, such as `gh pr list`, and give the user the link it prints), or the wrong GitHub account (`gh auth status` shows which is active). Check with `gh repo view`, then offer the fix that fits, asking first."
+  };
+}
+function channelRow(state) {
+  const id = "channel_off";
+  const label2 = "live CI events are on in this session";
+  if (state === "on") return { id, label: label2, state: "ready" };
+  if (state === "headless") return { id, label: label2, state: "skipped", why: "a headless run (claude -p) takes no channel" };
+  if (state === "unknown") return { id, label: label2, state: "unknown", why: "not run from inside a Claude Code session, or its flags cannot be read" };
+  return {
+    id,
+    label: label2,
+    state: "not_ready",
+    effect: "degrades",
+    line: "this session was started without the channel flag, so CI results are not pushed into it; CI on request (ci_status) still works.",
+    fix: `Tell the user to ${relaunchSentence(null)}. If they have no claude-gh command, offer to set it up by the /runners-io:setup-github skill's step 5, asking first.`
+  };
+}
+
+// ../hooks/readiness.mjs
 import { execFile } from "node:child_process";
+import { createHash as createHash2 } from "node:crypto";
+import { accessSync, constants, lstatSync as lstatSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync3, readdirSync as readdirSync3, realpathSync, renameSync as renameSync2, rmSync as rmSync3, statSync as statSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { homedir as homedir2 } from "node:os";
+import { basename, isAbsolute as isAbsolute2, join as join3, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+var OPT_OUT = "RUNNERS_IO_NO_SETUP_CHECKS";
+var DECLINE_FOR_MS = 7 * 24 * 60 * 6e4;
+var FIRST_CALL_MAX_AGE_MS = 7 * 24 * 60 * 6e4;
+var TOKEN_VARS = ["GH_TOKEN", "GITHUB_TOKEN"];
+var ENTERPRISE_TOKEN_VARS = ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
+function home(env) {
+  return env.HOME && isAbsolute2(env.HOME) ? env.HOME : homedir2();
+}
+function stateRoot(env = process.env) {
+  if (env.XDG_STATE_HOME && isAbsolute2(env.XDG_STATE_HOME)) return join3(env.XDG_STATE_HOME, "runners-io");
+  const h = home(env);
+  return h && isAbsolute2(h) ? join3(h, ".local", "state", "runners-io") : null;
+}
+function cacheRoot(env) {
+  return join3(env.XDG_CACHE_HOME && isAbsolute2(env.XDG_CACHE_HOME) ? env.XDG_CACHE_HOME : join3(home(env), ".cache"), "runners-io");
+}
+function projectKey(dir) {
+  return createHash2("sha256").update(resolve(String(dir))).digest("hex").slice(0, 16);
+}
+function loginHost(env = process.env) {
+  try {
+    const host = new URL(env.RUNNERS_IO_GITHUB_API || "https://api.github.com").host;
+    return host === "api.github.com" ? "github.com" : host;
+  } catch {
+    return "github.com";
+  }
+}
+function sayable(host) {
+  return /^[A-Za-z0-9.-]{1,253}(:\d{1,5})?$/.test(host) ? host : "github.com";
+}
+function onOneLine(path) {
+  return String(path).replace(/[\u0000-\u001f\u007f]/g, "?").slice(0, 200);
+}
+function tokenVariable(env = process.env, host = loginHost(env)) {
+  const names = host === "github.com" ? TOKEN_VARS : (env.GH_HOST ?? "").trim().toLowerCase() === host.toLowerCase() ? ENTERPRISE_TOKEN_VARS : [];
+  return names.find((n) => (env[n] ?? "").trim()) ?? null;
+}
+function which(command, env = process.env, platform = process.platform) {
+  const win = platform === "win32";
+  const exts = win ? (env.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean) : [""];
+  for (const dir of (env.PATH ?? env.Path ?? "").split(win ? ";" : ":")) {
+    if (!dir || !isAbsolute2(dir)) continue;
+    for (const ext of exts) {
+      const file = join3(dir, command + ext);
+      try {
+        if (!statSync2(file).isFile()) continue;
+        accessSync(file, win ? constants.F_OK : constants.X_OK);
+        return file;
+      } catch {
+      }
+    }
+  }
+  return null;
+}
+function run(file, args, { env, timeoutMs = 2500, keep = true } = {}) {
+  return new Promise((done2) => {
+    execFile(file, args, { env, timeout: timeoutMs, windowsHide: true, maxBuffer: 256 * 1024 }, (error, stdout) => {
+      const text = String(stdout ?? "").trim();
+      done2({ ok: !error, timedOut: Boolean(error && error.killed), said: text !== "", stdout: keep ? text : "" });
+    });
+  });
+}
+var GITHUB_REMOTE = /^(?:https:\/\/(?:[^@/]+@)?github\.com\/|git@github\.com:|ssh:\/\/git@github\.com(?::22)?\/)([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100}?)(?:\.git)?\/?$/;
+function githubRepo(url) {
+  const m = GITHUB_REMOTE.exec(String(url ?? "").trim());
+  return m && m[2] !== "." && m[2] !== ".." ? `${m[1]}/${m[2]}` : null;
+}
+function remoteHost(url) {
+  const text = String(url ?? "").trim();
+  const m = /^(?!file:)[a-z][a-z0-9+.-]*:\/\/(?:[^@/\s]+@)?([A-Za-z0-9.-]{2,253})(?::\d+)?(?:\/|$)/i.exec(text) ?? /^(?:[^@/\s:]+@)?([A-Za-z0-9.-]{2,253}):(?!\/\/|\\)/.exec(text);
+  return m ? m[1].toLowerCase() : null;
+}
+var NOT_GITHUB = /gitlab|bitbucket|gitea|codeberg|azure|visualstudio\.com|sourceforge|(^|\.)sr\.ht$/;
+function looksEnterprise(host, env, ghHosts) {
+  if (NOT_GITHUB.test(host)) return false;
+  return ghHosts.includes(host) || (env.GH_HOST ?? "").trim().toLowerCase() === host || loginHost(env).toLowerCase() === host || /(^|[.-])(github|ghe)([.-]|$)/.test(host);
+}
+function ghConfigDir(env = process.env, platform = process.platform) {
+  if (env.GH_CONFIG_DIR) return env.GH_CONFIG_DIR;
+  if (env.XDG_CONFIG_HOME) return join3(env.XDG_CONFIG_HOME, "gh");
+  const appData = env.APPDATA ?? env.AppData;
+  if (platform === "win32" && appData) return join3(appData, "GitHub CLI");
+  return join3(home(env), ".config", "gh");
+}
+function ghAccounts(text) {
+  const hosts = {};
+  let host = null;
+  let inUsers = false;
+  let usersIndent = 0;
+  let childIndent = -1;
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    if (!line.trim() || line.trim().startsWith("#")) continue;
+    const indent = line.length - line.trimStart().length;
+    const m = /^\s*([A-Za-z0-9._:-]+?):\s*(.*)$/.exec(line);
+    if (!m) continue;
+    if (indent === 0) {
+      host = { users: [], active: null };
+      hosts[m[1].toLowerCase()] = host;
+      inUsers = false;
+      continue;
+    }
+    if (!host) continue;
+    if (inUsers && indent > usersIndent) {
+      if (childIndent < 0) childIndent = indent;
+      if (indent === childIndent && /^[A-Za-z0-9_-]{1,60}$/.test(m[1])) host.users.push(m[1]);
+      continue;
+    }
+    inUsers = false;
+    if (m[1] === "users" && m[2] === "") {
+      inUsers = true;
+      usersIndent = indent;
+      childIndent = -1;
+    } else if (m[1] === "user") {
+      const name = m[2].replace(/^["']|["']$/g, "");
+      if (/^[A-Za-z0-9_-]{1,60}$/.test(name)) host.active = name;
+    }
+  }
+  return hosts;
+}
+function readGhHosts(env, platform) {
+  const file = join3(ghConfigDir(env, platform), "hosts.yml");
+  try {
+    const st = statSync2(file);
+    if (!st.isFile() || st.size > 256 * 1024) return { hosts: {}, changedAt: null };
+    return { hosts: ghAccounts(readFileSync3(file, "utf8")), changedAt: st.mtimeMs };
+  } catch {
+    return { hosts: {}, changedAt: null };
+  }
+}
+function ownFolder(dir) {
+  const st = lstatSync3(dir);
+  return st.isDirectory() && !st.isSymbolicLink() && (process.getuid === void 0 || st.uid === process.getuid());
+}
+function writable(dir) {
+  const probe = join3(dir, `.writable-${process.pid}`);
+  try {
+    mkdirSync2(dir, { recursive: true, mode: 448 });
+    writeFileSync2(probe, "", { mode: 384 });
+    rmSync3(probe, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+function readJson(root, name) {
+  try {
+    if (!root || !ownFolder(root)) return null;
+    const st = lstatSync3(join3(root, name));
+    if (!st.isFile() || st.size > 256 * 1024 || process.getuid !== void 0 && st.uid !== process.getuid()) return null;
+    const value = JSON.parse(readFileSync3(join3(root, name), "utf8"));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+function writeJson(root, name, value) {
+  if (!root) return false;
+  const tmp = join3(root, `.${name}.${process.pid}`);
+  try {
+    mkdirSync2(root, { recursive: true, mode: 448 });
+    if (!ownFolder(root)) return false;
+    const file = join3(root, name);
+    try {
+      if (lstatSync3(file).isSymbolicLink()) rmSync3(file);
+    } catch {
+    }
+    writeFileSync2(tmp, JSON.stringify(value), { mode: 384 });
+    renameSync2(tmp, file);
+    return true;
+  } catch {
+    rmSync3(tmp, { force: true });
+    return false;
+  }
+}
+var FIRST_CALL_FILE = "first-call.json";
+var FIRST_CALL_KINDS = ["ok", "token_rejected", "cert_error", "no_repo_scope", "sso", "forbidden", "fork"];
+var PER_PROJECT = /* @__PURE__ */ new Set(["fork"]);
+var KEY = /^[0-9a-f]{16}$/;
+var MAX_PROJECTS = 100;
+var MAX_OWNERS = 20;
+function entryOf(raw, now) {
+  if (!raw || typeof raw !== "object") return null;
+  const { n, first, last, source, owners } = raw;
+  if (![n, first, last].every((x) => typeof x === "number" && Number.isFinite(x))) return null;
+  if (last - now > 6e4 || now - last > FIRST_CALL_MAX_AGE_MS) return null;
+  return {
+    n: Math.max(1, Math.floor(n)),
+    first,
+    last,
+    ...source === "env" || source === "gh" ? { source } : {},
+    ...Array.isArray(owners) ? { owners: owners.filter((o) => typeof o === "string" && KEY.test(o)).slice(0, MAX_OWNERS) } : {}
+  };
+}
+function kindsOf(raw, now, allowed) {
+  const out = {};
+  for (const kind of FIRST_CALL_KINDS) {
+    if (!allowed(kind)) continue;
+    const e = entryOf(raw?.[kind], now);
+    if (e) out[kind] = e;
+  }
+  return out;
+}
+function readFirstCall(env = process.env, now = Date.now()) {
+  const raw = readJson(stateRoot(env), FIRST_CALL_FILE);
+  const projects = {};
+  for (const [key, value] of Object.entries(raw?.projects && typeof raw.projects === "object" ? raw.projects : {})) {
+    if (!KEY.test(key)) continue;
+    const kinds = kindsOf(value, now, (k) => PER_PROJECT.has(k));
+    if (Object.keys(kinds).length) projects[key] = kinds;
+  }
+  return { kinds: kindsOf(raw?.kinds, now, (k) => !PER_PROJECT.has(k)), projects };
+}
+function writeFirstCall(env, record) {
+  const keep = Object.entries(record.projects).sort((a, b) => Math.max(...Object.values(b[1]).map((e) => e.last)) - Math.max(...Object.values(a[1]).map((e) => e.last))).slice(0, MAX_PROJECTS);
+  return writeJson(stateRoot(env), FIRST_CALL_FILE, { v: 1, kinds: record.kinds, projects: Object.fromEntries(keep) });
+}
+function ownerKey(owner) {
+  return createHash2("sha256").update(String(owner).toLowerCase()).digest("hex").slice(0, 16);
+}
+function recordFirstCall(env, kind, { source, owner, project, now = Date.now() } = {}) {
+  if (!FIRST_CALL_KINDS.includes(kind)) return false;
+  const record = readFirstCall(env, now);
+  let slot = record.kinds;
+  if (PER_PROJECT.has(kind)) {
+    if (!project || !KEY.test(project)) return false;
+    record.projects[project] ??= {};
+    slot = record.projects[project];
+  }
+  const was = slot[kind];
+  const owners = [.../* @__PURE__ */ new Set([...was?.owners ?? [], ...owner && KEY.test(owner) ? [owner] : []])].slice(-MAX_OWNERS);
+  slot[kind] = {
+    n: (was?.n ?? 0) + 1,
+    first: was?.first ?? now,
+    last: now,
+    ...source === "env" || source === "gh" ? { source } : {},
+    ...owners.length ? { owners } : {}
+  };
+  return writeFirstCall(env, record);
+}
+function clearFirstCall(env, kinds, { owner, project, now = Date.now() } = {}) {
+  const record = readFirstCall(env, now);
+  let changed = false;
+  for (const kind of kinds) {
+    const slot = PER_PROJECT.has(kind) ? record.projects[project ?? ""] : record.kinds;
+    const was = slot?.[kind];
+    if (!was) continue;
+    if (owner && was.owners?.length) {
+      if (!was.owners.includes(owner)) continue;
+      const left = was.owners.filter((o) => o !== owner);
+      if (left.length) slot[kind] = { ...was, owners: left };
+      else delete slot[kind];
+    } else {
+      delete slot[kind];
+    }
+    changed = true;
+  }
+  for (const [key, value] of Object.entries(record.projects)) if (!Object.keys(value).length) delete record.projects[key];
+  return changed ? writeFirstCall(env, record) : false;
+}
+var ready = (id, label2) => ({ id, label: label2, state: "ready" });
+var skipped = (id, label2, why) => ({ id, label: label2, state: "skipped", why });
+var unknown = (id, label2, why) => ({ id, label: label2, state: "unknown", why });
+var found = (id, label2, effect, line, fix, more = {}) => ({ id, label: label2, state: "not_ready", effect, line, fix, ...more });
+var USERS_COMMAND = "is the user's own command: ask them to type it in the prompt with a leading `!`, so it runs in this session";
+function installHint(what, platform) {
+  const gh = what === "gh";
+  if (platform === "darwin") {
+    return gh ? "on macOS `brew install gh` when Homebrew is there (`brew --version`), else the installer at https://cli.github.com" : "on macOS `xcode-select --install` (it opens a dialog, so it is the user's to run as `! xcode-select --install`), or `brew install git`";
+  }
+  if (platform === "win32") return gh ? "on Windows `winget install --id GitHub.cli`" : "on Windows `winget install --id Git.Git`";
+  return gh ? "on Debian or Ubuntu the apt steps at https://github.com/cli/cli/blob/trunk/docs/install_linux.md, on Fedora or RHEL `sudo dnf install gh`; both need sudo, so they are the user's to run as `! <command>`" : "on Debian or Ubuntu `sudo apt-get install git`, on Fedora or RHEL `sudo dnf install git`; both need sudo, so they are the user's to run as `! <command>`";
+}
+function signInFix(host) {
+  return `Signing in opens a browser and asks for a one-time code, so it ${USERS_COMMAND}: \`! gh auth login --hostname ${host} --web --scopes repo\`. Never ask for a token, and never put one on a command line.`;
+}
+async function launchChecks({ env = process.env, projectDir = env.CLAUDE_PROJECT_DIR || process.cwd(), platform = process.platform } = {}) {
+  const rows = [];
+  const host = loginHost(env);
+  const hostOk = sayable(host) === host;
+  const gh = which("gh", env, platform);
+  const git2 = which("git", env, platform);
+  const tokenVar = tokenVariable(env, host);
+  const bare = Object.fromEntries(Object.entries(env).filter(([k]) => !TOKEN_VARS.includes(k) && !ENTERPRISE_TOKEN_VARS.includes(k)));
+  const inFolder = (args) => git2 ? run(git2, ["-C", projectDir, ...args], { env }) : Promise.resolve(null);
+  const [stored, top, origin, upstream] = await Promise.all([
+    gh && hostOk ? run(gh, ["auth", "token", "--hostname", host], { env: bare, keep: false }) : Promise.resolve(null),
+    inFolder(["rev-parse", "--show-toplevel"]),
+    inFolder(["remote", "get-url", "origin"]),
+    inFolder(["remote", "get-url", "upstream"])
+  ]);
+  const signedIn = stored ? stored.ok && stored.said : false;
+  const gho = gh ? readGhHosts(env, platform) : { hosts: {}, changedAt: null };
+  const ghLabel = "the GitHub CLI (gh) is installed";
+  if (gh) rows.push(ready("gh_missing", ghLabel));
+  else if (tokenVar) {
+    rows.push(
+      found(
+        "gh_missing",
+        ghLabel,
+        "degrades",
+        `the GitHub CLI (gh) isn't installed: CI is read with the token in ${tokenVar}, but Claude reads a failed job's log with gh.`,
+        `Offer to install the GitHub CLI, asking first, by the /runners-io:setup-github skill's step 2 (${installHint("gh", platform)}).`
+      )
+    );
+  } else {
+    rows.push(
+      found(
+        "gh_missing",
+        ghLabel,
+        "blocks",
+        "the GitHub CLI isn't installed, so CI can't be read. Ask me to set it up.",
+        `Offer to install the GitHub CLI, asking first, by the /runners-io:setup-github skill's step 2 (${installHint("gh", platform)}). Then the user signs in (the skill's step 3).`
+      )
+    );
+  }
+  const loginLabel = `gh is signed in to ${sayable(host)}`;
+  if (!gh) rows.push(skipped("gh_signed_out", loginLabel, "gh is not installed"));
+  else if (stored?.timedOut) rows.push(unknown("gh_signed_out", loginLabel, "gh did not answer in time"));
+  else if (signedIn) rows.push(ready("gh_signed_out", loginLabel));
+  else if (tokenVar) rows.push(skipped("gh_signed_out", loginLabel, `the token in ${tokenVar} is used`));
+  else {
+    rows.push(
+      found("gh_signed_out", loginLabel, "blocks", `the GitHub CLI isn't signed in to ${sayable(host)}, so CI can't be read. Ask me to help you sign in.`, signInFix(sayable(host)))
+    );
+  }
+  const tokenLabel = "no token variable takes the place of gh's login";
+  if (tokenVar && signedIn) {
+    rows.push(
+      found(
+        "token_env",
+        tokenLabel,
+        "degrades",
+        `${tokenVar} is set, so GitHub is read with that token and not with gh's own login.`,
+        `Say which variable is in use (${tokenVar}; never print its value). Nothing needs doing while CI is read without trouble. If a private repository is not found or CI reads are refused, the token lacks access: the user either starts Claude Code without the variable (\`env -u ${tokenVar} claude\`), or gives the token read access to the repository's Actions and pull requests.`,
+        { once: true, tokenVar }
+      )
+    );
+  } else rows.push(ready("token_env", tokenLabel));
+  const accountsLabel = "gh holds one account for the host";
+  const accounts = gho.hosts[host.toLowerCase()] ?? { users: [], active: null };
+  if (!gh) rows.push(skipped("several_accounts", accountsLabel, "gh is not installed"));
+  else if (accounts.users.length > 1) {
+    rows.push(
+      found(
+        "several_accounts",
+        accountsLabel,
+        "degrades",
+        `gh holds ${accounts.users.length} accounts for ${sayable(host)}, and the plugin reads CI as the active one${accounts.active ? ` (${accounts.active})` : ""}, which may not be the one your pull requests belong to.`,
+        `Nothing needs doing when the active account is the right one. To change it, after a yes run \`gh auth switch --hostname ${sayable(host)}\` (with \`--user <login>\` when there are more than two), then check with \`gh auth status\`.`,
+        { once: true }
+      )
+    );
+  } else rows.push(ready("several_accounts", accountsLabel));
+  const gitLabel = "git is installed";
+  const repoLabel = "the session's folder is a git repository";
+  const remoteLabel = "the repository's origin is on github.com";
+  const workflowsLabel = "the repository has GitHub Actions workflows";
+  const forkLabel = "the clone is not a fork with its pull requests elsewhere";
+  if (!git2) {
+    rows.push(
+      found(
+        "git_missing",
+        gitLabel,
+        "blocks",
+        "git isn't installed, so the plugin can't tell which repository and branch you are on. Ask me to set it up.",
+        `Offer to install git, asking first: ${installHint("git", platform)}. Confirm with \`git --version\`.`
+      )
+    );
+    for (const [id, label2] of [["not_a_repo", repoLabel], ["no_github_remote", remoteLabel], ["no_workflows", workflowsLabel], ["fork", forkLabel]]) {
+      rows.push(skipped(id, label2, "git is not installed"));
+    }
+  } else {
+    rows.push(ready("git_missing", gitLabel));
+    const repo = origin?.ok ? githubRepo(origin.stdout) : null;
+    if (!top?.ok) {
+      rows.push(
+        top?.timedOut ? unknown("not_a_repo", repoLabel, "git did not answer in time") : found(
+          "not_a_repo",
+          repoLabel,
+          "info",
+          "this folder isn't a git repository, so there is no pull request to watch here; CI on request still works for a repository you name.",
+          "Nothing to fix. The runners-io ci_status and subscribe tools take a repository and a pull request by name."
+        )
+      );
+      for (const [id, label2] of [["no_github_remote", remoteLabel], ["no_workflows", workflowsLabel], ["fork", forkLabel]]) rows.push(skipped(id, label2, "not a git repository"));
+    } else {
+      rows.push(ready("not_a_repo", repoLabel));
+      const originHost = origin?.ok ? remoteHost(origin.stdout) : null;
+      if (repo) rows.push(ready("no_github_remote", remoteLabel));
+      else if (originHost && looksEnterprise(originHost, env, Object.keys(gho.hosts))) {
+        rows.push(
+          found(
+            "enterprise_host",
+            remoteLabel,
+            "degrades",
+            `this repository is on GitHub Enterprise (${originHost}), where the plugin doesn't find your branch's pull request by itself.`,
+            `Offer to set it up, asking first: the user sets \`RUNNERS_IO_GITHUB_API\` to the server's https API address (usually https://${originHost}/api/v3) in the environment Claude Code starts from, and signs gh in to it, which ${USERS_COMMAND}: \`! gh auth login --hostname ${originHost} --web\`. Say plainly that the branch's pull request is still not found automatically there: name the repository and pull request to the runners-io subscribe and ci_status tools.`
+          )
+        );
+      } else {
+        rows.push(
+          found(
+            "no_github_remote",
+            remoteLabel,
+            "info",
+            origin?.ok ? "this repository's origin isn't on GitHub, and the plugin reads GitHub Actions only." : "this repository has no origin remote, so there is no GitHub repository to watch here yet.",
+            "Nothing to fix. The plugin reads CI from GitHub Actions and from nowhere else; once the repository has a github.com origin it is watched without a restart."
+          )
+        );
+      }
+      if (!repo) {
+        rows.push(skipped("no_workflows", workflowsLabel, "no github.com origin"), skipped("fork", forkLabel, "no github.com origin"));
+      } else {
+        let workflows = 0;
+        try {
+          workflows = readdirSync3(join3(top.stdout, ".github", "workflows")).filter((f) => /\.ya?ml$/i.test(f)).length;
+        } catch {
+        }
+        rows.push(
+          workflows ? ready("no_workflows", workflowsLabel) : found(
+            "no_workflows",
+            workflowsLabel,
+            "info",
+            "this repository has no GitHub Actions workflows (.github/workflows), so there is no CI to watch here yet.",
+            "Nothing to fix. Once a workflow file is pushed, its runs on a pull request are reported as they finish."
+          )
+        );
+        const parent = upstream?.ok ? githubRepo(upstream.stdout) : null;
+        rows.push(
+          parent && parent.toLowerCase() !== repo.toLowerCase() ? found(
+            "fork",
+            forkLabel,
+            "info",
+            "this clone has an upstream remote, so it looks like a fork: a pull request opened on the upstream repository isn't watched by itself yet.",
+            "Nothing to install. After a pull request is opened on the upstream repository, call the runners-io subscribe tool with that repository and the pull request's number."
+          ) : ready("fork", forkLabel)
+        );
+      }
+    }
+  }
+  const proxyLabel = "no proxy stands between the channel and GitHub";
+  const proxyVar = ["HTTPS_PROXY", "https_proxy"].find((n) => (env[n] ?? "").trim());
+  if (proxyVar && env.NODE_USE_ENV_PROXY !== "1") {
+    rows.push(
+      found(
+        "proxy",
+        proxyLabel,
+        "degrades",
+        `${proxyVar} is set, and the plugin's channel doesn't use the proxy yet, so behind it CI may not arrive.`,
+        "Nothing to install. If CI results do not arrive or ci_status cannot reach GitHub, the proxy is why. With Node.js 24 or later, setting `NODE_USE_ENV_PROXY=1` in the environment Claude Code starts from makes Node send the channel's requests through the proxy; the user sets it, then restarts Claude Code.",
+        { once: true }
+      )
+    );
+  } else rows.push(ready("proxy", proxyLabel));
+  const dataLabel = "the plugin's data folders can be written";
+  const pluginData = env.CLAUDE_PLUGIN_DATA && isAbsolute2(env.CLAUDE_PLUGIN_DATA) ? [env.CLAUDE_PLUGIN_DATA] : [];
+  const folders = [stateRoot(env), cacheRoot(env), ...pluginData].filter(Boolean);
+  const refused = folders.filter((dir) => !writable(dir));
+  if (refused.length) {
+    rows.push(
+      found(
+        "data_dir",
+        dataLabel,
+        "degrades",
+        `the plugin can't write its data folder (${onOneLine(refused[0])}), so what it remembers between sessions is off; reading CI still works.`,
+        `Say which folder it is (${refused.map(onOneLine).join(", ")}) and what is off without it: repository scopes, GitHub reads shared between sessions, and remembered answers such as a no to an offer. Making the folder writable is the user's to do. While it is not, a no cannot be remembered: \`${OPT_OUT}=1\` in the environment turns these offers off.`,
+        { folders: refused }
+      )
+    );
+  } else rows.push(ready("data_dir", dataLabel));
+  if (platform === "win32") {
+    rows.push(
+      found(
+        "windows",
+        "the launch can be read, and claude-gh can be set up",
+        "degrades",
+        "on Windows the plugin can't tell whether live CI events are on, and can't set up the claude-gh command.",
+        "Nothing to install. Give the user the plain relaunch command from the launch notice (the one that starts `claude` with the channel flag); do not offer claude-gh here.",
+        { once: true }
+      )
+    );
+  }
+  return rows;
+}
+function firstCallRows(record, { env = process.env, projectDir = env.CLAUDE_PROJECT_DIR || process.cwd(), platform = process.platform } = {}) {
+  const host = sayable(loginHost(env));
+  const kinds = record?.kinds ?? {};
+  const mine = record?.projects?.[projectKey(projectDir)] ?? {};
+  const answered = Boolean(kinds.ok);
+  const rest = (id, label2) => answered ? ready(id, label2) : unknown(id, label2, "GitHub has not been asked yet");
+  const rows = [];
+  const rejected = kinds.token_rejected;
+  const signedInSince = rejected?.source === "gh" && (readGhHosts(env, platform).changedAt ?? 0) > rejected.last;
+  const tokenVar = tokenVariable(env, host);
+  if (rejected && !signedInSince) {
+    const fromEnv = rejected.source === "env" && tokenVar;
+    rows.push(
+      found(
+        "token_rejected",
+        "GitHub accepts the login",
+        "blocks",
+        fromEnv ? `GitHub refused the token in ${tokenVar} (expired or revoked), so CI can't be read.` : "GitHub refused gh's login (expired or revoked), so CI can't be read. Ask me to help you sign in again.",
+        fromEnv ? `The token in ${tokenVar} was refused (never print it). The user replaces it, or starts Claude Code without the variable (\`env -u ${tokenVar} claude\`) so gh's own login is used.` : signInFix(host)
+      )
+    );
+  } else rows.push(rest("token_rejected", "GitHub accepts the login"));
+  rows.push(
+    kinds.cert_error ? found(
+      "cert_error",
+      "GitHub's certificate verifies",
+      "blocks",
+      "GitHub's certificate couldn't be verified (a network that inspects HTTPS, most likely), so CI can't be read.",
+      "A company network that inspects HTTPS signs with its own root certificate, which Node does not know. The user sets `NODE_EXTRA_CA_CERTS` to that certificate's file (PEM; their IT team has it) in the environment Claude Code starts from, then restarts Claude Code. Never suggest turning certificate checks off."
+    ) : rest("cert_error", "GitHub's certificate verifies")
+  );
+  rows.push(
+    kinds.no_repo_scope ? found(
+      "no_repo_scope",
+      "gh's login can see private repositories (the repo scope)",
+      "degrades",
+      "gh's login has no repo scope, so pull requests in private repositories can't be seen; public ones work.",
+      `Adding the scope opens a browser, so it ${USERS_COMMAND}: \`! gh auth refresh --hostname ${host} --scopes repo\`.`
+    ) : rest("no_repo_scope", "gh's login can see private repositories (the repo scope)")
+  );
+  rows.push(
+    kinds.sso ? found(
+      "sso",
+      "the login is authorised for the organisation's single sign-on",
+      "degrades",
+      "GitHub refused a read because the login isn't authorised for an organisation's single sign-on (SSO).",
+      "The user authorises the login for that organisation in a browser. gh prints the organisation's authorisation link when a read is refused: run a gh read in that repository (for example `gh pr list`) and give the user the link it prints to open. Never ask for a token."
+    ) : rest("sso", "the login is authorised for the organisation's single sign-on")
+  );
+  if (kinds.forbidden && kinds.forbidden.source === "env" && tokenVar) {
+    rows.push(
+      found(
+        "token_env",
+        "the token variable's token can read CI",
+        "degrades",
+        `GitHub refused some CI reads made with the token in ${tokenVar}; gh's own login is not being used.`,
+        `The token in ${tokenVar} lacks access (never print it). The user either starts Claude Code without the variable (\`env -u ${tokenVar} claude\`), so gh's own login is used, or gives the token read access to the repository's Actions and pull requests.`
+      )
+    );
+  }
+  if (mine.fork) {
+    rows.push(
+      found(
+        "fork",
+        "the clone is not a fork with its pull requests elsewhere",
+        "info",
+        "this repository is a fork on GitHub: a pull request opened on the upstream repository isn't watched by itself yet.",
+        "Nothing to install. After a pull request is opened on the upstream repository, call the runners-io subscribe tool with that repository and the pull request's number."
+      )
+    );
+  }
+  return rows;
+}
+function mergeRows(...lists) {
+  const out = /* @__PURE__ */ new Map();
+  for (const row of lists.flat()) {
+    const was = out.get(row.id);
+    const stronger = was && row.state === "not_ready" && (was.state !== "not_ready" || was.once === true && row.once !== true);
+    if (!was || stronger) out.set(row.id, row);
+  }
+  return [...out.values()];
+}
+function renderTable(rows) {
+  const word = { ready: "ready    ", not_ready: "NOT READY", unknown: "unknown  ", skipped: "skipped  " };
+  return rows.map((r) => {
+    if (r.state === "not_ready") return `  ${word.not_ready}  ${r.label} [${r.effect}; ${r.id}]: ${r.line} Fix: ${r.fix}`;
+    return `  ${word[r.state]}  ${r.label}${r.why ? ` (${r.why})` : ""}`;
+  }).join("\n");
+}
+var SETUP_FILE = "setup-checks.json";
+var CHECK_ID = /^[a-z][a-z_]{1,40}$/;
+var MAX_SAID_PROJECTS = 200;
+function times(raw) {
+  const out = {};
+  for (const [id, at] of Object.entries(raw && typeof raw === "object" ? raw : {})) if (CHECK_ID.test(id) && typeof at === "number" && Number.isFinite(at)) out[id] = at;
+  return out;
+}
+function readSetupState(env = process.env) {
+  const raw = readJson(stateRoot(env), SETUP_FILE);
+  const said = {};
+  for (const [key, value] of Object.entries(raw?.said && typeof raw.said === "object" ? raw.said : {})) if (KEY.test(key)) said[key] = times(value);
+  return { declined: times(raw?.declined), said };
+}
+function writeSetupState(env, state) {
+  const said = Object.entries(state.said).sort((a, b) => Math.max(0, ...Object.values(b[1])) - Math.max(0, ...Object.values(a[1]))).slice(0, MAX_SAID_PROJECTS);
+  return writeJson(stateRoot(env), SETUP_FILE, { v: 1, declined: state.declined, said: Object.fromEntries(said) });
+}
+function recordDecline(env = process.env, ids = [], now = Date.now()) {
+  const valid = ids.filter((id) => CHECK_ID.test(id));
+  if (!valid.length) return false;
+  const state = readSetupState(env);
+  for (const id of valid) state.declined[id] = now;
+  return writeSetupState(env, state);
+}
+async function main(argv) {
+  const command = argv[0];
+  if (command === "decline") {
+    const ids = argv.slice(1);
+    if (!recordDecline(process.env, ids)) {
+      process.stderr.write("could not record the no (no check id given, or the state folder cannot be written); the offer will come again\n");
+      return 3;
+    }
+    process.stdout.write(`recorded: ${ids.join(", ")} will not be offered again for 7 days
+`);
+    return 0;
+  }
+  if (command === "check") {
+    const rows = mergeRows(await launchChecks(), firstCallRows(readFirstCall()));
+    process.stdout.write(`${renderTable(rows)}
+`);
+    return 0;
+  }
+  process.stderr.write("usage: readiness.mjs check | decline <check id>...\n");
+  return 64;
+}
+var invoked = "";
+try {
+  invoked = process.argv[1] ? realpathSync(process.argv[1]) : "";
+} catch {
+}
+if (basename(invoked) === "readiness.mjs" && invoked === realpathSync(fileURLToPath(import.meta.url))) {
+  main(process.argv.slice(2)).then(
+    (code) => process.exit(code),
+    () => process.exit(1)
+  );
+}
+
+// src/firstcall.ts
+var WRITE_EVERY_MS = 10 * 6e4;
+var CLEARED_BY_OK = ["token_rejected", "cert_error"];
+var CLEARED_BY_OWNER = ["sso", "forbidden"];
+function ownerOf(path) {
+  const m = /^\/repos\/([^/]+)\//.exec(path) ?? /^\/repos\/([^/]+)$/.exec(path);
+  return m ? ownerKey(m[1]) : null;
+}
+var FirstCallRecorder = class {
+  env;
+  project;
+  now;
+  /** When each kind (and, for an organisation's refusal, each organisation) was last written by this process. */
+  wrote = /* @__PURE__ */ new Map();
+  /** The record's kinds as last read, each with its organisations: what a good answer could clear. */
+  present = /* @__PURE__ */ new Map();
+  presentAt = Number.NEGATIVE_INFINITY;
+  constructor(env, projectDir, now = Date.now) {
+    this.env = env;
+    this.project = projectKey(projectDir);
+    this.now = now;
+  }
+  observe(o) {
+    try {
+      const owner = ownerOf(o.path);
+      switch (o.what) {
+        case "ok": {
+          const present = this.read();
+          const clear = CLEARED_BY_OK.filter((k) => present.has(k));
+          if (clear.length) this.clear(clear);
+          if (owner) {
+            const theirs = CLEARED_BY_OWNER.filter((k) => present.get(k)?.has(owner));
+            if (theirs.length) this.clear(theirs, owner);
+          }
+          if (!this.read().has("ok")) this.record("ok", o);
+          return;
+        }
+        case "repo_scope":
+          if (this.read().has("no_repo_scope")) this.clear(["no_repo_scope"]);
+          return;
+        case "forbidden":
+          if (o.source === "env") this.record("forbidden", o, owner);
+          return;
+        case "sso":
+          this.record("sso", o, owner);
+          return;
+        default:
+          this.record(o.what, o);
+      }
+    } catch {
+    }
+  }
+  /** What GitHub says of this project's repository: a fork is noted under the project, and taken off when it is not one. */
+  fork(isFork) {
+    try {
+      const now = this.now();
+      if (isFork) recordFirstCall(this.env, "fork", { project: this.project, now });
+      else clearFirstCall(this.env, ["fork"], { project: this.project, now });
+    } catch {
+    }
+  }
+  record(kind, o, owner = null) {
+    const now = this.now();
+    const key = owner ? `${kind} ${owner}` : kind;
+    const last = this.wrote.get(key);
+    if (last !== void 0 && now - last < WRITE_EVERY_MS) return;
+    this.wrote.set(key, now);
+    recordFirstCall(this.env, kind, { source: o.source, ...owner ? { owner } : {}, now });
+    this.presentAt = Number.NEGATIVE_INFINITY;
+  }
+  clear(kinds, owner) {
+    clearFirstCall(this.env, [...kinds], { ...owner ? { owner } : {}, now: this.now() });
+    for (const k of kinds) this.wrote.delete(owner ? `${k} ${owner}` : k);
+    this.presentAt = Number.NEGATIVE_INFINITY;
+  }
+  /** The record's kinds, read again when this process changed it or the reading is older than WRITE_EVERY_MS. */
+  read() {
+    const now = this.now();
+    if (now - this.presentAt < WRITE_EVERY_MS) return this.present;
+    const record = readFirstCall(this.env, now);
+    this.present = new Map(Object.entries(record.kinds).map(([kind, entry]) => [kind, new Set(entry.owners ?? [])]));
+    this.presentAt = now;
+    return this.present;
+  }
+};
+
+// src/git.ts
+import { execFile as execFile2 } from "node:child_process";
 var OWNER = "[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})";
 var NAME = "[A-Za-z0-9._-]{1,100}?";
 var REMOTES = [
@@ -326,9 +1151,9 @@ function parseGitHubRemote(url) {
   return null;
 }
 function git(dir, args) {
-  return new Promise((resolve2) => {
-    execFile("git", ["-C", dir, ...args], { timeout: 5e3, windowsHide: true }, (error, stdout) => {
-      resolve2(error ? null : stdout.trim());
+  return new Promise((resolve3) => {
+    execFile2("git", ["-C", dir, ...args], { timeout: 5e3, windowsHide: true }, (error, stdout) => {
+      resolve3(error ? null : stdout.trim());
     });
   });
 }
@@ -372,8 +1197,8 @@ async function inOwnHistory(dir, sha) {
 }
 
 // src/github.ts
-import { execFile as execFile2 } from "node:child_process";
-import { createHash as createHash3 } from "node:crypto";
+import { execFile as execFile3 } from "node:child_process";
+import { createHash as createHash4 } from "node:crypto";
 
 // src/state.ts
 var EVENT_KINDS = [
@@ -431,32 +1256,32 @@ function diff(prev, next) {
   const changes = [];
   const before = new Map(prev.headSha === next.headSha ? prev.runs.map((r) => [r.id, r]) : []);
   let anyRunChanged = false;
-  for (const run of next.runs) {
-    const old = before.get(run.id);
-    const fresh = !old || restarted(old, run);
-    if (done(run)) {
+  for (const run2 of next.runs) {
+    const old = before.get(run2.id);
+    const fresh = !old || restarted(old, run2);
+    if (done(run2)) {
       if (!fresh && old && done(old)) continue;
       anyRunChanged = true;
-      const o = outcome(run.conclusion);
+      const o = outcome(run2.conclusion);
       if (o === "ignored") continue;
       const kind = o === "failed" ? "ci.workflow_failed" : o === "succeeded" ? "ci.workflow_succeeded" : o === "needs_approval" ? "ci.approval_waiting" : "ci.workflow_cancelled";
-      changes.push(kind === "ci.approval_waiting" ? { kind, snapshot: next, run, approval: "maintainer" } : { kind, snapshot: next, run });
-      const failedAttempt = prev.headSha === next.headSha ? prev.failedAttempts?.[run.id] : void 0;
-      if (o === "succeeded" && failedAttempt !== void 0 && run.runAttempt > failedAttempt) {
-        changes.push({ kind: "ci.flaky", snapshot: next, run });
+      changes.push(kind === "ci.approval_waiting" ? { kind, snapshot: next, run: run2, approval: "maintainer" } : { kind, snapshot: next, run: run2 });
+      const failedAttempt = prev.headSha === next.headSha ? prev.failedAttempts?.[run2.id] : void 0;
+      if (o === "succeeded" && failedAttempt !== void 0 && run2.runAttempt > failedAttempt) {
+        changes.push({ kind: "ci.flaky", snapshot: next, run: run2 });
       }
       continue;
     }
-    if (run.status === "waiting") {
+    if (run2.status === "waiting") {
       if (fresh || old?.status !== "waiting") {
         anyRunChanged = true;
-        changes.push({ kind: "ci.approval_waiting", snapshot: next, run, approval: "deployment" });
+        changes.push({ kind: "ci.approval_waiting", snapshot: next, run: run2, approval: "deployment" });
       }
       continue;
     }
     if (fresh) {
       anyRunChanged = true;
-      changes.push({ kind: "ci.workflow_started", snapshot: next, run });
+      changes.push({ kind: "ci.workflow_started", snapshot: next, run: run2 });
     }
   }
   if (anyRunChanged) {
@@ -560,9 +1385,9 @@ function graphqlRate(body) {
   return typeof r.remaining === "number" && typeof r.limit === "number" && Number.isFinite(reset) ? { remaining: r.remaining, limit: r.limit, reset } : null;
 }
 function reviewChanges(prev, next, snapshot, settled = true) {
-  const ready = READY.has(next.mergeState);
+  const ready2 = READY.has(next.mergeState);
   const runsDone = snapshot.runs.every((r) => r.status === "completed" && outcome(r.conclusion) !== "failed");
-  const fire = ready && settled && runsDone;
+  const fire = ready2 && settled && runsDone;
   if (!prev) return { changes: [], keep: fire ? { ...next, readySha: next.headSha } : { ...next } };
   const readySha = fire ? next.headSha : prev.headSha === next.headSha ? prev.readySha : void 0;
   const keep = { ...next, ...readySha ? { readySha } : {} };
@@ -623,7 +1448,7 @@ function queuedFor(j, now) {
   const at = Date.parse(j.createdAt ?? "");
   return Number.isFinite(at) ? now - at : null;
 }
-function jobChanges(prev, run, jobs2, snapshot, now) {
+function jobChanges(prev, run2, jobs2, snapshot, now) {
   const failed = new Set(prev?.failed ?? []);
   const stuck = new Set(prev?.stuck ?? []);
   const changes = [];
@@ -631,12 +1456,12 @@ function jobChanges(prev, run, jobs2, snapshot, now) {
     const job = { id: j.id, name: j.name, labels: j.labels, url: j.url };
     if (j.conclusion && FAILED2.has(j.conclusion) && !failed.has(j.id)) {
       failed.add(j.id);
-      if (prev) changes.push({ kind: "ci.job_failed", snapshot, run, job, conclusion: j.conclusion });
+      if (prev) changes.push({ kind: "ci.job_failed", snapshot, run: run2, job, conclusion: j.conclusion });
     }
     const waited = queuedFor(j, now);
     if (waited !== null && waited >= STUCK_AFTER_MS && !stuck.has(j.id)) {
       stuck.add(j.id);
-      if (prev) changes.push({ kind: "ci.job_stuck_queued", snapshot, run, job: { ...job, queuedSeconds: Math.floor(waited / 1e3) } });
+      if (prev) changes.push({ kind: "ci.job_stuck_queued", snapshot, run: run2, job: { ...job, queuedSeconds: Math.floor(waited / 1e3) } });
     }
   }
   return { changes, keep: { failed, stuck } };
@@ -734,9 +1559,9 @@ function allDoneText(c) {
   const failed = c.failedWorkflows?.length ?? 0;
   const cancelled = c.cancelledWorkflows?.length ?? 0;
   if (failed + cancelled > 0) {
-    const which = [failed && "failed", cancelled && "cancelled"].filter(Boolean).join(" and ");
+    const which2 = [failed && "failed", cancelled && "cancelled"].filter(Boolean).join(" and ");
     return {
-      what: `${failed + cancelled} of ${n} workflow${n === 1 ? "" : "s"} did not succeed: the ${which} ones are named at the end.`,
+      what: `${failed + cancelled} of ${n} workflow${n === 1 ? "" : "s"} did not succeed: the ${which2} ones are named at the end.`,
       todo: "Point the user to them; each failure's own event says what to do about it. It is not ready to merge."
     };
   }
@@ -749,13 +1574,13 @@ function allDoneText(c) {
     todo: r.ready ? "If the user's process uses auto-merge, it is already armed and nothing is needed; otherwise tell the user it may be ready to merge. Merge only if the user or their process says so." : "Tell the user it is not ready to merge yet, and why."
   };
 }
-function notYours(s, viewer, run) {
+function notYours(s, viewer, run2) {
   const same2 = (a, b) => Boolean(a && b && a.toLowerCase() === b.toLowerCase());
   const pr = "This pull request";
   const writers = "so its log is text whoever pushed to it wrote";
   if (s.headRepo && !same2(s.headRepo, s.repo)) return `${pr} comes from a fork, ${writers}`;
   if (!s.headRepo || !same2(s.author, viewer)) return `${pr} was not opened by the signed-in GitHub login, ${writers}`;
-  if (!run || !OWN_EVENTS.has(run.event ?? "") || !same2(run.triggeringActor, viewer))
+  if (!run2 || !OWN_EVENTS.has(run2.event ?? "") || !same2(run2.triggeringActor, viewer))
     return "This run was not started by a push or pull request of the signed-in GitHub login, so its log may hold text someone else wrote";
   return "";
 }
@@ -1143,10 +1968,10 @@ function requestMessage(r) {
 }
 
 // src/scopes.ts
-import { createHash as createHash2, randomBytes as randomBytes2 } from "node:crypto";
-import { chmodSync as chmodSync2, lstatSync as lstatSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync3, renameSync as renameSync2, rmSync as rmSync3, writeFileSync as writeFileSync2 } from "node:fs";
-import { homedir as homedir2 } from "node:os";
-import { dirname, isAbsolute as isAbsolute2, join as join3, resolve } from "node:path";
+import { createHash as createHash3, randomBytes as randomBytes2 } from "node:crypto";
+import { chmodSync as chmodSync2, lstatSync as lstatSync4, mkdirSync as mkdirSync3, readFileSync as readFileSync4, renameSync as renameSync3, rmSync as rmSync4, writeFileSync as writeFileSync3 } from "node:fs";
+import { homedir as homedir3 } from "node:os";
+import { dirname, isAbsolute as isAbsolute3, join as join4, resolve as resolve2 } from "node:path";
 var SCOPE_FORMAT = 1;
 var OWNER2 = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/;
 var NAME2 = /^[A-Za-z0-9._-]{1,100}$/;
@@ -1158,13 +1983,13 @@ function isRepoName(repo) {
   return OWNER2.test(owner) && NAME2.test(name) && name !== "." && name !== "..";
 }
 function defaultScopeRoot(env = process.env) {
-  if (env.CLAUDE_PLUGIN_DATA && isAbsolute2(env.CLAUDE_PLUGIN_DATA)) return env.CLAUDE_PLUGIN_DATA;
-  if (env.XDG_STATE_HOME && isAbsolute2(env.XDG_STATE_HOME)) return join3(env.XDG_STATE_HOME, "runners-io");
-  return join3(homedir2(), ".local", "state", "runners-io");
+  if (env.CLAUDE_PLUGIN_DATA && isAbsolute3(env.CLAUDE_PLUGIN_DATA)) return env.CLAUDE_PLUGIN_DATA;
+  if (env.XDG_STATE_HOME && isAbsolute3(env.XDG_STATE_HOME)) return join4(env.XDG_STATE_HOME, "runners-io");
+  return join4(homedir3(), ".local", "state", "runners-io");
 }
 function scopeFile(root, projectDir) {
-  const id = createHash2("sha256").update(resolve(projectDir)).digest("hex").slice(0, 32);
-  return join3(root, "scopes", `${id}.json`);
+  const id = createHash3("sha256").update(resolve2(projectDir)).digest("hex").slice(0, 32);
+  return join4(root, "scopes", `${id}.json`);
 }
 function isScope(value) {
   if (typeof value !== "object" || value === null) return false;
@@ -1237,11 +2062,11 @@ var ScopeStore = class {
       text: `The scope file ${file} could not be read (${why}), so it was left as it is and scopes hold for this session only: fix or remove it.`
     });
     try {
-      const folder = lstatSync3(dirname(file), { throwIfNoEntry: false });
+      const folder = lstatSync4(dirname(file), { throwIfNoEntry: false });
       if (!folder) return { kind: "ok", scopes: [] };
       const why = this.distrust(folder, "its folder");
       if (why) return untrusted(why);
-      const s = lstatSync3(file, { throwIfNoEntry: false });
+      const s = lstatSync4(file, { throwIfNoEntry: false });
       if (!s) return { kind: "ok", scopes: [] };
       if (s.isSymbolicLink()) return untrusted("it is a symlink");
       if (!s.isFile()) return untrusted("it is not a plain file");
@@ -1249,7 +2074,7 @@ var ScopeStore = class {
       if (fileWhy) return untrusted(fileWhy);
       let json;
       try {
-        json = JSON.parse(readFileSync3(file, "utf8"));
+        json = JSON.parse(readFileSync4(file, "utf8"));
       } catch {
         return unreadable("it is not JSON");
       }
@@ -1272,21 +2097,21 @@ var ScopeStore = class {
   }
   write(file) {
     const folder = dirname(file);
-    mkdirSync2(folder, { recursive: true, mode: 448 });
-    const before = lstatSync3(folder);
+    mkdirSync3(folder, { recursive: true, mode: 448 });
+    const before = lstatSync4(folder);
     const foreign = this.distrust({ uid: before.uid, mode: 0, isSymbolicLink: () => before.isSymbolicLink() }, "its folder");
     if (foreign) throw new Error(foreign);
     chmodSync2(folder, 448);
-    const why = this.distrust(lstatSync3(folder), "its folder");
+    const why = this.distrust(lstatSync4(folder), "its folder");
     if (why) throw new Error(why);
     const doc = `${JSON.stringify({ version: SCOPE_FORMAT, scopes: this.scopes }, null, 2)}
 `;
     const tmp = `${file}.${process.pid}.${randomBytes2(4).toString("hex")}.tmp`;
     try {
-      writeFileSync2(tmp, doc, { mode: 384, flag: "wx" });
-      renameSync2(tmp, file);
+      writeFileSync3(tmp, doc, { mode: 384, flag: "wx" });
+      renameSync3(tmp, file);
     } catch (error) {
-      rmSync3(tmp, { force: true });
+      rmSync4(tmp, { force: true });
       throw error;
     }
   }
@@ -1329,30 +2154,30 @@ function isOpenPulls(value) {
 }
 
 // src/github.ts
-var runCommand = (command, args) => new Promise((resolve2) => {
-  execFile2(command, [...args], { timeout: 1e4, windowsHide: true }, (error, stdout) => {
-    if (!error) return resolve2({ code: 0, stdout });
+var runCommand = (command, args) => new Promise((resolve3) => {
+  execFile3(command, [...args], { timeout: 1e4, windowsHide: true }, (error, stdout) => {
+    if (!error) return resolve3({ code: 0, stdout });
     const e = error;
-    resolve2({ code: typeof e.code === "number" ? e.code : null, stdout: stdout ?? "", errorCode: typeof e.code === "string" ? e.code : void 0 });
+    resolve3({ code: typeof e.code === "number" ? e.code : null, stdout: stdout ?? "", errorCode: typeof e.code === "string" ? e.code : void 0 });
   });
 });
-function loginHost(apiBase) {
+function loginHost2(apiBase) {
   const host = new URL(apiBase).host;
   return host === "api.github.com" ? "github.com" : host;
 }
-async function readGhAuth(env = process.env, run = runCommand, apiBase = "https://api.github.com") {
+async function readGhAuth(env = process.env, run2 = runCommand, apiBase = "https://api.github.com") {
   if (isLoopback(new URL(apiBase).hostname) && fakeGitHubAllowed(env)) {
     const value = env.RUNNERS_IO_TEST_GITHUB_TOKEN?.trim();
     return value ? { kind: "ok", token: value, source: "env" } : { kind: "signed_out" };
   }
-  const host = loginHost(apiBase);
+  const host = loginHost2(apiBase);
   const enterpriseHost = (env.GH_HOST ?? "").trim().toLowerCase();
   const names = host === "github.com" ? ["GH_TOKEN", "GITHUB_TOKEN"] : enterpriseHost === host.toLowerCase() ? ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"] : [];
   for (const name of names) {
     const value = env[name]?.trim();
     if (value) return { kind: "ok", token: value, source: "env" };
   }
-  const result = await run("gh", ["auth", "token", "--hostname", host]);
+  const result = await run2("gh", ["auth", "token", "--hostname", host]);
   if (result.errorCode === "ENOENT") return { kind: "not_installed" };
   const token = result.stdout.trim();
   if (result.code !== 0 || !token) return { kind: "signed_out" };
@@ -1387,6 +2212,17 @@ var STORED = {
 var TOKEN_TTL_MS = 5 * 6e4;
 var ETAG_CACHE_MAX = 500;
 var LEASE_WAIT_MS = 3e3;
+var CERT_ERRORS = /* @__PURE__ */ new Set([
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "UNABLE_TO_GET_ISSUER_CERT",
+  "CERT_HAS_EXPIRED",
+  "CERT_UNTRUSTED",
+  "ERR_TLS_CERT_ALTNAME_INVALID"
+]);
+var REPO_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}$/;
 var GitHubClient = class {
   /**
    * How old a stored answer may be and still be used instead of asking GitHub, when a shared store is set. The
@@ -1411,12 +2247,14 @@ var GitHubClient = class {
   base;
   readAuth;
   fetchImpl;
+  observe;
   constructor(base, readAuth, fetchImpl = fetch, options = {}) {
     this.base = base.replace(/\/+$/, "");
     this.readAuth = readAuth;
     this.fetchImpl = fetchImpl;
     this.shared = options.shared ?? null;
     this.now = options.now ?? Date.now;
+    this.observe = options.observe ?? (() => void 0);
   }
   /** How many paths' ETags and answers this client keeps (tests hold it under a bound). */
   get etagEntries() {
@@ -1472,6 +2310,17 @@ var GitHubClient = class {
     }
     return this.auth.value;
   }
+  /**
+   * The repository itself, for the setup checks' one live call (`status`): whether GitHub shows it to this login, and
+   * whether it is a fork. A name GitHub would not allow is not_found, without a request.
+   */
+  async repoInfo(repo) {
+    if (!REPO_NAME.test(repo)) return { kind: "not_found" };
+    return this.get(`/repos/${repo}`, 0, (j) => {
+      const r = j ?? {};
+      return { fork: r.fork === true, private: r.private === true };
+    });
+  }
   getPull(repo, pr) {
     return this.get(`/repos/${repo}/pulls/${pr}`, this.freshMs, (j) => {
       const p = j ?? {};
@@ -1492,7 +2341,7 @@ var GitHubClient = class {
         ...typeof p.base?.ref === "string" ? { baseRef: p.base.ref } : {},
         ...typeof p.draft === "boolean" ? { draft: p.draft } : {},
         ...Array.isArray(p.labels) ? { labels: labelNames(p.labels) } : {},
-        bodyHash: createHash3("sha256").update(typeof p.body === "string" ? p.body : "").digest("hex").slice(0, 16)
+        bodyHash: createHash4("sha256").update(typeof p.body === "string" ? p.body : "").digest("hex").slice(0, 16)
       };
     });
   }
@@ -1547,7 +2396,7 @@ var GitHubClient = class {
     const own = head.repo?.toLowerCase();
     return {
       kind: "ok",
-      value: all.value.filter((r) => own !== void 0 && r.headRepo?.toLowerCase() === own && r.headBranch === head.ref).map(({ headBranch: _b, headRepo: _r, ...run }) => run)
+      value: all.value.filter((r) => own !== void 0 && r.headRepo?.toLowerCase() === own && r.headBranch === head.ref).map(({ headBranch: _b, headRepo: _r, ...run2 }) => run2)
     };
   }
   /** The latest push runs on a branch: the base branch's health (rules.mjs `baseVerdict`). */
@@ -1701,13 +2550,16 @@ var GitHubClient = class {
     let auth = first;
     const own = this.cached(path);
     const known = stored ? { etag: stored.etag, value: stored.value } : own;
-    let res = await this.request(path, auth.token, known?.etag);
+    let res = await this.request(path, auth.token, known?.etag, auth.source);
     if ("kind" in res) return res;
     if (res.status === 401) {
       await res.body?.cancel();
       const fresh = await this.login(true);
       if (fresh.kind !== "ok") return { kind: "auth", auth: fresh };
-      if (fresh.token === auth.token) return { kind: "auth", auth: { kind: "signed_out" } };
+      if (fresh.token === auth.token) {
+        this.observe({ what: "token_rejected", path, source: auth.source });
+        return { kind: "auth", auth: { kind: "signed_out" } };
+      }
       auth = fresh;
       return this.ask(path, auth, map, this.store, null);
     }
@@ -1717,6 +2569,8 @@ var GitHubClient = class {
     else this.requests.other++;
     const scopeHeader = res.headers.get("x-oauth-scopes");
     this.scopes = scopeHeader === null ? null : scopeHeader.split(",").map((x) => x.trim()).filter(Boolean);
+    if (this.scopes !== null) this.observe({ what: this.scopes.includes("repo") ? "repo_scope" : "no_repo_scope", path, source: auth.source });
+    if (res.status === 200 || res.status === 304) this.observe({ what: "ok", path, source: auth.source });
     const remaining = Number(res.headers.get("x-ratelimit-remaining"));
     const resource = res.headers.get("x-ratelimit-resource");
     if (res.headers.has("x-ratelimit-remaining") && Number.isFinite(remaining) && (resource === null || resource === "core")) {
@@ -1739,6 +2593,7 @@ var GitHubClient = class {
       const wait = rateLimitWait(res.headers) ?? await secondaryLimitWait(res);
       await res.body?.cancel().catch(() => void 0);
       if (wait !== void 0) return { kind: "retry", reason: `GitHub rate limit (HTTP ${res.status})`, afterMs: wait };
+      if (res.status === 403) this.observe({ what: res.headers.has("x-github-sso") ? "sso" : "forbidden", path, source: auth.source });
       return { kind: "not_found" };
     }
     if (res.status === 404 || res.status === 410) {
@@ -1784,7 +2639,7 @@ var GitHubClient = class {
       this.cache.delete(oldest);
     }
   }
-  async request(path, token, etag) {
+  async request(path, token, etag, source) {
     const headers = {
       authorization: `Bearer ${token}`,
       accept: "application/vnd.github+json",
@@ -1797,6 +2652,8 @@ var GitHubClient = class {
     } catch (error) {
       const e = error;
       log(`GitHub request failed: ${e.name === "TimeoutError" ? "timed out" : e.message}`);
+      const code = e.cause?.code;
+      if (typeof code === "string" && CERT_ERRORS.has(code)) this.observe({ what: "cert_error", path, source });
       return { kind: "retry", reason: e.name === "TimeoutError" ? "GitHub timed out" : e.message };
     }
   }
@@ -1839,10 +2696,10 @@ function capabilities(withTools) {
   return withTools ? { tools: {}, ...CAPABILITIES } : CAPABILITIES;
 }
 function startMcp(opts) {
-  let ready = false;
-  const write = (payload) => new Promise((resolve2, reject) => {
+  let ready2 = false;
+  const write = (payload) => new Promise((resolve3, reject) => {
     opts.output.write(`${JSON.stringify({ jsonrpc: "2.0", ...payload })}
-`, (error) => error ? reject(error) : resolve2());
+`, (error) => error ? reject(error) : resolve3());
   });
   const reply = (id, result) => write({ id, result });
   const fail = (id, code, message) => write({ id, error: { code, message } });
@@ -1852,8 +2709,8 @@ function startMcp(opts) {
     const isRequest = id !== void 0 && id !== null;
     if (!method) return;
     if (!isRequest) {
-      if (method === "notifications/initialized" && !ready) {
-        ready = true;
+      if (method === "notifications/initialized" && !ready2) {
+        ready2 = true;
         opts.onReady();
       }
       return;
@@ -1925,7 +2782,7 @@ function startMcp(opts) {
   lines.on("close", () => opts.onClose());
   return {
     async notify(message) {
-      if (!ready) throw new Error("the client has not finished initializing");
+      if (!ready2) throw new Error("the client has not finished initializing");
       await write({ method: "notifications/claude/channel", params: { content: message.content, meta: message.meta } });
     }
   };
@@ -1946,8 +2803,8 @@ function latestPerWorkflow(runs) {
 function baseVerdict(runs) {
   const latest = new Map(latestPerWorkflow(runs).map((r) => [r.name, r]));
   const failing = [...latest.values()].filter((r) => FAILED3.has(r.conclusion)).map((r) => String(r.name)).sort();
-  const times = [...latest.values()].map((r) => String(r.updated_at ?? r.created_at ?? "")).filter(Boolean).sort();
-  return { red: failing.length > 0, failing, at: times.at(-1) ?? null };
+  const times2 = [...latest.values()].map((r) => String(r.updated_at ?? r.created_at ?? "")).filter(Boolean).sort();
+  return { red: failing.length > 0, failing, at: times2.at(-1) ?? null };
 }
 
 // src/cadence.ts
@@ -1992,16 +2849,16 @@ function passSleepMs(p) {
 }
 
 // src/eventlog.ts
-import { chmodSync as chmodSync3, closeSync, constants, lstatSync as lstatSync4, mkdirSync as mkdirSync3, openSync, readdirSync as readdirSync3, unlinkSync as unlinkSync3, writeSync } from "node:fs";
-import { join as join4 } from "node:path";
+import { chmodSync as chmodSync3, closeSync, constants as constants2, lstatSync as lstatSync5, mkdirSync as mkdirSync4, openSync, readdirSync as readdirSync4, unlinkSync as unlinkSync3, writeSync } from "node:fs";
+import { join as join5 } from "node:path";
 var NO_EVENT_LOG = { write() {
 } };
 var EVENT_LOG_SUBDIR = "runners-io-events";
 var DAY_FILE = /^(\d{4}-\d{2}-\d{2})\.jsonl$/;
 var DAY_MS = 864e5;
-var APPEND = constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0);
+var APPEND = constants2.O_WRONLY | constants2.O_APPEND | constants2.O_CREAT | (constants2.O_NOFOLLOW ?? 0);
 function mustBeMine(dir, uid) {
-  const s = lstatSync4(dir);
+  const s = lstatSync5(dir);
   if (s.isSymbolicLink() || !s.isDirectory()) throw new Error(`${dir} is not a plain folder`);
   if (uid !== void 0 && s.uid !== uid) throw new Error(`${dir} belongs to another user`);
 }
@@ -2009,36 +2866,36 @@ function openEventLog(dir, options) {
   const now = options.now ?? (() => /* @__PURE__ */ new Date());
   const keepDays = options.keepDays ?? 14;
   const uid = options.uid ?? process.getuid?.();
-  const own = join4(dir, EVENT_LOG_SUBDIR);
-  let ready = false;
+  const own = join5(dir, EVENT_LOG_SUBDIR);
+  let ready2 = false;
   let failed = false;
   try {
-    mkdirSync3(dir, { recursive: true, mode: 448 });
+    mkdirSync4(dir, { recursive: true, mode: 448 });
     mustBeMine(dir, uid);
     try {
-      mkdirSync3(own, { mode: 448 });
+      mkdirSync4(own, { mode: 448 });
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
     }
     mustBeMine(own, uid);
     chmodSync3(own, 448);
     const oldest = Date.parse(now().toISOString().slice(0, 10)) - (keepDays - 1) * DAY_MS;
-    for (const name of readdirSync3(own)) {
+    for (const name of readdirSync4(own)) {
       const m = DAY_FILE.exec(name);
-      if (m && Date.parse(m[1]) < oldest) unlinkSync3(join4(own, name));
+      if (m && Date.parse(m[1]) < oldest) unlinkSync3(join5(own, name));
     }
-    ready = true;
+    ready2 = true;
   } catch (error) {
     log(`the event log in ${dir} cannot be used, so none is written: ${error.message}`);
   }
   return {
     write(type, fields = {}) {
-      if (!ready) return;
+      if (!ready2) return;
       const at = now();
       const line = redact(JSON.stringify({ t: at.toISOString(), session: options.session, project: options.project, type, ...fields }));
       let fd = null;
       try {
-        fd = openSync(join4(own, `${at.toISOString().slice(0, 10)}.jsonl`), APPEND, 384);
+        fd = openSync(join5(own, `${at.toISOString().slice(0, 10)}.jsonl`), APPEND, 384);
         writeSync(fd, `${line}
 `);
         failed = false;
@@ -2206,13 +3063,13 @@ async function fetchSnapshot(gh, repo, pr, reuseRunsOf = null) {
   };
 }
 function realSleep(ms, signal) {
-  return new Promise((resolve2) => {
-    if (signal.aborted) return resolve2();
+  return new Promise((resolve3) => {
+    if (signal.aborted) return resolve3();
     const timer = setTimeout(done2, ms);
     function done2() {
       clearTimeout(timer);
       signal.removeEventListener("abort", done2);
-      resolve2();
+      resolve3();
     }
     signal.addEventListener("abort", done2, { once: true });
   });
@@ -2509,12 +3366,12 @@ async function runPoller(deps) {
   const checkJobs = async (entry, snap) => {
     if (!JOB_KINDS.some((k) => wants(entry, k)) || atJobFloor()) return;
     let seen = jobsSeen.get(entry.key) ?? null;
-    for (const run of snap.runs) {
-      if (run.status === "completed" || signal.aborted) continue;
-      const r = await gh.runJobs(entry.repo, run.id);
+    for (const run2 of snap.runs) {
+      if (run2.status === "completed" || signal.aborted) continue;
+      const r = await gh.runJobs(entry.repo, run2.id);
       if (r.kind === "auth") return problem(r.auth);
       if (r.kind !== "ok") continue;
-      const { changes, keep } = jobChanges(seen, run, r.value, snap, now());
+      const { changes, keep } = jobChanges(seen, run2, r.value, snap, now());
       seen = keep;
       jobsSeen.set(entry.key, keep);
       for (const change of changes) {
@@ -2658,19 +3515,19 @@ async function runPoller(deps) {
         current = "keep";
       } else if (scope.repo && scope.branch) {
         foundAt = now();
-        const found = await gh.findOpenPull(scope.repo, scope.branch);
-        if (found.kind === "auth") {
-          await problem(found.auth);
+        const found2 = await gh.findOpenPull(scope.repo, scope.branch);
+        if (found2.kind === "auth") {
+          await problem(found2.auth);
           await sleep(waitMs, signal);
           continue;
         }
-        if (found.kind === "ok" && found.value !== null && subs.mutes.mutesPr(scope.repo, found.value)) {
+        if (found2.kind === "ok" && found2.value !== null && subs.mutes.mutesPr(scope.repo, found2.value)) {
           current = null;
-        } else if (found.kind === "ok" && found.value !== null) {
-          const isNew = !subs.get(scope.repo, found.value);
-          current = subs.add({ repo: scope.repo, pr: found.value, source: "auto" }).key;
-          if (isNew) events.write("subscribe", { repo: scope.repo, pr: found.value, source: "auto", events: [...AUTO_EVENTS] });
-        } else if (found.kind !== "ok") {
+        } else if (found2.kind === "ok" && found2.value !== null) {
+          const isNew = !subs.get(scope.repo, found2.value);
+          current = subs.add({ repo: scope.repo, pr: found2.value, source: "auto" }).key;
+          if (isNew) events.write("subscribe", { repo: scope.repo, pr: found2.value, source: "auto", events: [...AUTO_EVENTS] });
+        } else if (found2.kind !== "ok") {
           current = "keep";
         }
       }
@@ -2964,71 +3821,6 @@ var INSTRUCTIONS = [
   "On channel_github_setup_needed, use the setup-github skill."
 ].join(" ");
 
-// ../hooks/launch.mjs
-import { execFileSync } from "node:child_process";
-var CHANNEL_FLAGS = /* @__PURE__ */ new Set(["--channels", "--dangerously-load-development-channels"]);
-var OURS = /^(plugin:runners-io@[A-Za-z0-9._-]+|server:runners-io)$/;
-var HEADLESS = /* @__PURE__ */ new Set(["-p", "--print"]);
-function parseLaunch(args) {
-  const tokens = String(args ?? "").trim().split(/\s+/).filter(Boolean);
-  const script = tokens.slice(0, 3).findIndex((t) => /@anthropic-ai\/claude-code\/cli\.(m?js)$/.test(t));
-  let on = false;
-  let headless = false;
-  for (let i = script >= 0 ? script + 1 : 1; i < tokens.length; i++) {
-    const t = tokens[i];
-    if (t === "--" || !t.startsWith("-")) break;
-    if (HEADLESS.has(t)) headless = true;
-    const eq = t.indexOf("=");
-    const flag = eq > 0 ? t.slice(0, eq) : t;
-    if (CHANNEL_FLAGS.has(flag)) {
-      const entries = eq > 0 ? [t.slice(eq + 1)] : [];
-      if (eq < 0) while (i + 1 < tokens.length && !tokens[i + 1].startsWith("-")) entries.push(tokens[++i]);
-      if (entries.some((e) => OURS.test(e))) on = true;
-    } else if (eq < 0 && i + 1 < tokens.length && !tokens[i + 1].startsWith("-")) {
-      i++;
-    }
-  }
-  return { state: headless ? "headless" : on ? "on" : "off" };
-}
-var SESSION_ID = /^[A-Za-z0-9-]{8,64}$/;
-function relaunchSentence(sessionId) {
-  const id = typeof sessionId === "string" && SESSION_ID.test(sessionId) ? sessionId : null;
-  return id ? `relaunch with \`claude-gh --resume ${id}\`` : "relaunch with `claude-gh --resume <this session's id>` (the launch notice gives the id; `claude-gh --continue` only when it is not known, since with several sessions open it can reopen another one)";
-}
-function pollsIn(state) {
-  return state === "on" || state === "unknown";
-}
-function isClaude(args) {
-  const tokens = String(args ?? "").trim().split(/\s+/);
-  const first = tokens[0] ?? "";
-  if (first === "claude" || first.endsWith("/claude") || /\/claude\/versions\/[^/]+$/.test(first)) return true;
-  return tokens.slice(0, 2).some((t) => /@anthropic-ai\/claude-code\/cli\.(m?js)$/.test(t));
-}
-var SHELLS = /* @__PURE__ */ new Set(["sh", "bash", "zsh", "dash", "ksh", "fish"]);
-function isShell(args) {
-  const first = String(args ?? "").trim().split(/\s+/)[0] ?? "";
-  return SHELLS.has(first.replace(/^-/, "").split("/").at(-1));
-}
-function psRow(pid) {
-  const out = execFileSync("ps", ["-o", "ppid=,args=", "-p", String(pid)], { encoding: "utf8", timeout: 3e3, stdio: ["ignore", "pipe", "ignore"] });
-  const m = /^\s*(\d+)\s+(.*)$/.exec(out.trim());
-  return m ? { ppid: Number(m[1]), args: m[2] } : null;
-}
-function findLaunch(pid = process.ppid, ps = psRow) {
-  try {
-    let current = pid;
-    for (let hops = 0; hops < 8 && current > 1; hops++) {
-      const row = ps(current);
-      if (!row) break;
-      if (isClaude(row.args)) return { ...parseLaunch(row.args), claudePid: current };
-      if (!isShell(row.args)) break;
-      current = row.ppid;
-    }
-  } catch {
-  }
-  return { state: "unknown" };
-}
-
 // src/tools.ts
 var CHANNEL_NOTE = 'Results arrive as <channel source="runners-io"> events if this session was started with the runners-io channel; if none arrive, call ci_status to check.';
 var WATCH_COST = `Each watch reads GitHub on the user's own GitHub login and its hourly limit, shared with gh: about 24 GitHub requests an hour while the pull request is quiet, more while its CI runs, and about 60 GraphQL points an hour for the review kinds (a watch whose events name no review kind costs no review reads). A session watches at most ${MAX_SUBSCRIPTIONS} pull requests.`;
@@ -3127,11 +3919,11 @@ async function resolveTarget(deps, args) {
   if (!scope.branch || scope.repo?.toLowerCase() !== repo.toLowerCase()) {
     return { ok: false, text: `Pass pr: there is no current branch of ${repo} in this session's folder to find it from.` };
   }
-  const found = await deps.gh.findOpenPull(repo, scope.branch);
-  if (found.kind === "auth") return { ok: false, text: setupText(found.auth) };
-  if (found.kind !== "ok") return { ok: false, text: `Could not ask GitHub for the branch's pull request (${found.kind}); pass pr.` };
-  if (found.value === null) return { ok: false, text: `There is no open pull request for branch ${clean(scope.branch, 100)} in ${repo}: pass pr.` };
-  return { ok: true, repo, pr: found.value };
+  const found2 = await deps.gh.findOpenPull(repo, scope.branch);
+  if (found2.kind === "auth") return { ok: false, text: setupText(found2.auth) };
+  if (found2.kind !== "ok") return { ok: false, text: `Could not ask GitHub for the branch's pull request (${found2.kind}); pass pr.` };
+  if (found2.value === null) return { ok: false, text: `There is no open pull request for branch ${clean(scope.branch, 100)} in ${repo}: pass pr.` };
+  return { ok: true, repo, pr: found2.value };
 }
 function parseEvents(raw) {
   if (raw === void 0 || raw === "all") return { ok: true, events: "all" };
@@ -3434,11 +4226,17 @@ ${note}` };
 }
 
 // src/main.ts
-var VERSION = "0.3.13";
+var VERSION = "0.3.14";
+function firstCallRecorder(projectDir) {
+  if (fakeGitHubAllowed(process.env) && !process.env.XDG_STATE_HOME) return null;
+  return new FirstCallRecorder(process.env, projectDir);
+}
 function serve() {
   const config = loadConfig();
+  const firstCall = firstCallRecorder(config.projectDir);
   const gh = new GitHubClient(config.githubApi, () => readGhAuth(process.env, void 0, config.githubApi), fetch, {
-    shared: new SharedStore(defaultSharedRoot())
+    shared: new SharedStore(defaultSharedRoot()),
+    observe: (o) => firstCall?.observe(o)
   });
   const subs = new Subscriptions();
   const scopes = new ScopeStore(scopeFile(defaultScopeRoot(), config.projectDir));
@@ -3504,20 +4302,28 @@ async function status() {
   const auth = await readGhAuth(process.env, void 0, config.githubApi);
   const scope = await readGitScope(config.projectDir);
   const login = auth.kind === "ok" ? `signed in to GitHub (token from ${auth.source === "gh" ? "gh auth token" : "GH_TOKEN/GITHUB_TOKEN"})` : auth.kind === "not_installed" ? "the GitHub CLI (gh) is not installed" : "gh is not signed in to github.com";
+  const firstCall = firstCallRecorder(config.projectDir);
+  const client = new GitHubClient(config.githubApi, async () => auth, fetch, { observe: (o) => firstCall?.observe(o) });
   let pr = "none";
   if (auth.kind === "ok" && scope.repo && scope.branch) {
-    const found = await new GitHubClient(config.githubApi, async () => auth).findOpenPull(scope.repo, scope.branch);
-    pr = found.kind === "ok" ? found.value === null ? "no open pull request" : `#${found.value}` : `could not ask GitHub (${found.kind})`;
+    const found2 = await client.findOpenPull(scope.repo, scope.branch);
+    pr = found2.kind === "ok" ? found2.value === null ? "no open pull request" : `#${found2.value}` : `could not ask GitHub (${found2.kind})`;
   }
+  const checks = { env: process.env, projectDir: config.projectDir };
+  const local = await launchChecks(checks);
+  const live = auth.kind === "ok" ? [await liveRow(client, scope.repo, firstCall)] : [];
+  const rows = mergeRows(local, live, firstCallRows(readFirstCall(process.env), checks), [channelRow(findLaunch(process.ppid).state)]);
   process.stdout.write(
     `runners-io-channel ${VERSION}
 ${login}
 repository: ${scope.repo ?? "none"}, branch: ${scope.branch ?? "none"}, pull request: ${pr}
 automatic subscription: ${config.autoSubscribe}, every ${config.pollSeconds} s; event log: ${config.eventLogDir ?? "off"}
+setup checks (/runners-io:doctor):
+${renderTable(rows)}
 `
   );
 }
-async function main(argv) {
+async function main2(argv) {
   const command = argv[0] ?? "serve";
   switch (command) {
     case "serve":
@@ -3537,7 +4343,7 @@ async function main(argv) {
       process.exit(64);
   }
 }
-main(process.argv.slice(2)).catch((error) => {
+main2(process.argv.slice(2)).catch((error) => {
   log(error.message);
   process.exit(1);
 });

@@ -2,11 +2,14 @@
 // with the flag on.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { OFFER_QUESTION, noticeFor } from "../../hooks/session-start.mjs";
+import { OFFER_QUESTION, hookOutput, noticeFor } from "../../hooks/session-start.mjs";
+import { fakeMachine, project } from "./fake-machine.mjs";
 
 const HOOK = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "hooks", "session-start.mjs");
 const SID = "3f2a9c1e-0b7d-4c55-9a51-6c8e2f0d4b11";
@@ -53,8 +56,12 @@ test("when the launch cannot be read (no ps), the tip is conditional, never a cl
 });
 
 test("run as Claude Code runs it, it exits 0 and prints JSON or nothing, whatever stdin holds", () => {
+  // State and cache folders of its own: the hook runs the setup checks, which keep what they said in the state folder.
+  const home = mkdtempSync(join(tmpdir(), "rio-hook-home-"));
+  after(() => rmSync(home, { recursive: true, force: true }));
+  const env = { ...process.env, XDG_STATE_HOME: join(home, "state"), XDG_CACHE_HOME: join(home, "cache") };
   for (const stdin of [JSON.stringify(input()), "not json", ""]) {
-    const r = spawnSync(process.execPath, [HOOK], { input: stdin, encoding: "utf8", timeout: 10_000 });
+    const r = spawnSync(process.execPath, [HOOK], { input: stdin, env, encoding: "utf8", timeout: 10_000 });
     assert.equal(r.status, 0, stdin);
     if (r.stdout.trim()) assert.doesNotThrow(() => JSON.parse(r.stdout));
   }
@@ -113,4 +120,93 @@ test("channel off and no claude-gh: the user sees the relaunch line, and Claude 
 test("the offer's question says claude-gh uses Claude Code's development flag, and what that shows at each launch", () => {
   assert.match(OFFER_QUESTION, /development flag/);
   assert.match(OFFER_QUESTION, /every launch|each launch/);
+});
+
+// ---- the setup checks at launch (hooks/readiness.mjs): what the machine is missing, said in the same hook --------
+
+const SETUP = { line: "runners.io: the GitHub CLI isn't installed, so CI can't be read. Ask me to set it up.", context: "runners.io plugin setup checks: one thing…" };
+
+test("a setup problem is the first line the user sees, and the first thing Claude is given; the channel line follows unchanged", () => {
+  const alone = noticeFor(input(), { state: "off" }, ROOT);
+  const out = noticeFor(input(), { state: "off" }, ROOT, { setup: SETUP });
+  assert.equal(out.systemMessage, `${SETUP.line}\n${alone.systemMessage}`);
+  assert.equal(out.hookSpecificOutput.additionalContext, `${SETUP.context}\n\n${alone.hookSpecificOutput.additionalContext}`);
+});
+
+test("a setup problem with the channel on and claude-gh there: its line and context, and nothing else", () => {
+  const out = noticeFor(input(), { state: "on" }, ROOT, { claudeGh: true, setup: SETUP });
+  assert.deepEqual(out, { systemMessage: SETUP.line, hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: SETUP.context } });
+});
+
+test("a setup problem is never said in a headless run, or after /clear or /compact", () => {
+  assert.equal(noticeFor(input(), { state: "headless" }, ROOT, { setup: SETUP }), null);
+  assert.equal(noticeFor(input("clear"), { state: "on" }, ROOT, { setup: SETUP }), null);
+  assert.equal(noticeFor(input("compact"), { state: "on" }, ROOT, { setup: SETUP }), null);
+});
+
+const machines = [];
+after(() => {
+  for (const m of machines) rmSync(m.root, { recursive: true, force: true });
+});
+function machine(options) {
+  const m = fakeMachine(options);
+  machines.push(m);
+  return m;
+}
+const hasClaudeGh = async () => true;
+
+test("a machine that is ready, with the channel on: the hook adds nothing to the session", async () => {
+  const m = machine();
+  const dir = project(m);
+  assert.equal(await hookOutput({ ...input(), cwd: dir }, { env: m.env, launch: { state: "on" }, platform: "linux", claudeGhFor: hasClaudeGh }), null);
+});
+
+test("gh missing: the hook's one line names it and Claude is given the offer, whether or not the channel is on", async () => {
+  const m = machine({ gh: null });
+  const dir = project(m);
+  const on = await hookOutput({ ...input(), cwd: dir }, { env: m.env, launch: { state: "on" }, platform: "linux", claudeGhFor: hasClaudeGh });
+  assert.equal(on.systemMessage, "runners.io: the GitHub CLI isn't installed, so CI can't be read. Ask me to set it up.");
+  assert.match(on.hookSpecificOutput.additionalContext, /Fix to offer: Offer to install the GitHub CLI, asking first/);
+  const off = await hookOutput({ ...input(), cwd: dir }, { env: m.env, launch: { state: "off" }, platform: "linux", claudeGhFor: hasClaudeGh });
+  const [first, second] = off.systemMessage.split("\n");
+  assert.equal(first, on.systemMessage);
+  assert.match(second, /live CI events are OFF/);
+});
+
+test("headless, /clear and /compact: no check is run at all, so nothing is said and nothing is marked as said", async () => {
+  const m = machine({ gh: "signed-out" });
+  const dir = project(m, { workflows: false });
+  const ran = () => existsSync(m.ghLog);
+  assert.equal(await hookOutput({ ...input(), cwd: dir }, { env: m.env, launch: { state: "headless" }, platform: "linux", claudeGhFor: hasClaudeGh }), null);
+  assert.equal(await hookOutput({ ...input("clear"), cwd: dir }, { env: m.env, launch: { state: "on" }, platform: "linux", claudeGhFor: hasClaudeGh }), null);
+  assert.equal(await hookOutput({ ...input("compact"), cwd: dir }, { env: m.env, launch: { state: "on" }, platform: "linux", claudeGhFor: hasClaudeGh }), null);
+  assert.equal(ran(), false, "gh was never asked");
+  assert.equal(existsSync(join(m.env.XDG_STATE_HOME, "runners-io", "setup-checks.json")), false);
+});
+
+test("RUNNERS_IO_NO_SETUP_CHECKS=1 through the hook: a blocker's line and no offer; without a blocker, nothing", async () => {
+  const blocked = machine({ gh: null, env: { RUNNERS_IO_NO_SETUP_CHECKS: "1" } });
+  const out = await hookOutput({ ...input(), cwd: project(blocked) }, { env: blocked.env, launch: { state: "on" }, platform: "linux", claudeGhFor: hasClaudeGh });
+  assert.match(out.systemMessage, /^runners\.io: the GitHub CLI isn't installed/);
+  assert.equal(out.hookSpecificOutput.additionalContext.includes("Fix to offer"), false);
+  const fine = machine({ env: { RUNNERS_IO_NO_SETUP_CHECKS: "1", HTTPS_PROXY: "http://p:1" } });
+  assert.equal(await hookOutput({ ...input(), cwd: project(fine, { workflows: false }) }, { env: fine.env, launch: { state: "on" }, platform: "linux", claudeGhFor: hasClaudeGh }), null);
+});
+
+test("checks that take too long are given up on: the hook still answers, with whatever else it had to say", async () => {
+  const never = () => new Promise(() => {});
+  const begin = Date.now();
+  const out = await hookOutput(input(), { env: {}, launch: { state: "off" }, claudeGhFor: hasClaudeGh, setup: never, setupLimitMs: 200 });
+  assert.ok(Date.now() - begin < 3000);
+  assert.match(out.systemMessage, /^runners\.io: live CI events are OFF/);
+});
+
+test("run as Claude Code runs it on a machine with no gh: the JSON it prints carries the line and the offer", () => {
+  const m = machine({ gh: null });
+  const dir = project(m);
+  const r = spawnSync(process.execPath, [HOOK], { input: JSON.stringify({ ...input(), cwd: dir }), env: { ...m.env, CLAUDE_PLUGIN_ROOT: ROOT }, encoding: "utf8", timeout: 10_000 });
+  assert.equal(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.match(out.systemMessage, /^runners\.io: the GitHub CLI isn't installed, so CI can't be read\. Ask me to set it up\./);
+  assert.match(out.hookSpecificOutput.additionalContext, /hooks\/readiness\.mjs decline/);
 });

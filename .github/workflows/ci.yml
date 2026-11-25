@@ -78,11 +78,12 @@ jobs:
           node-version: 20
           package-manager-cache: false
 
-      - name: The bundle end to end, and the manifest's promises (Node 20)
+      - name: The bundle end to end, the hooks and the setup checks, and the manifest's promises (Node 20)
+        # The hooks are plain JavaScript run by whatever Node.js the user has, so their tests run on the oldest one too.
         run: |
           set -euo pipefail
           node scripts/check-plugin.mjs
-          node --test channel/test/bundle.test.mjs
+          node --test channel/test/bundle.test.mjs channel/test/doctor.test.mjs channel/test/readiness.test.mjs channel/test/node-wrapper.test.mjs channel/test/session-start.test.mjs
 
       - name: claude plugin validate --strict
         run: |

@@ -256,12 +256,45 @@ export const ETAG_CACHE_MAX = 500;
 /** How long a session waits for another session's request to the same path before asking GitHub itself. */
 const LEASE_WAIT_MS = 3000;
 
+/**
+ * What one answer from GitHub says about the login, for the setup checks (firstcall.ts): `ok` is a 200 or a 304;
+ * `token_rejected` a 401 with the same login still in place; `sso` a 403 naming single sign-on; `forbidden` any other
+ * 403 that is not a rate limit; `cert_error` a certificate that did not verify; `no_repo_scope` and `repo_scope` what a
+ * classic token's scopes say.
+ */
+export type Observed = "ok" | "token_rejected" | "sso" | "forbidden" | "cert_error" | "no_repo_scope" | "repo_scope";
+
+export interface Observation {
+  readonly what: Observed;
+  /** The request path: only its owner is ever used, to tell one organisation's refusal from another's. */
+  readonly path: string;
+  /** Where the token came from: a variable in the environment, or gh's own login. */
+  readonly source: "env" | "gh";
+}
+
 export interface ClientOptions {
   /** The machine-wide store several sessions share their reads through (shared.ts); none: ask GitHub every time. */
   readonly shared?: SharedStore | null;
   /** Test seam for the store's clock. */
   readonly now?: () => number;
+  /** Told what each REST answer says about the login. It must not throw; nothing waits on it. */
+  readonly observe?: (o: Observation) => void;
 }
+
+/** A TLS failure that is about the certificate GitHub's address presented, as Node names them. */
+const CERT_ERRORS = new Set([
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "UNABLE_TO_GET_ISSUER_CERT",
+  "CERT_HAS_EXPIRED",
+  "CERT_UNTRUSTED",
+  "ERR_TLS_CERT_ALTNAME_INVALID",
+]);
+
+/** A repository as `owner/name`, in the characters GitHub allows: nothing else is ever put into a request path. */
+const REPO_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}$/;
 
 /** One `x-ratelimit-*` reading: when it was taken, and the reset as epoch milliseconds. */
 type RateReading = { remaining: number; at: number; limit?: number; reset?: number };
@@ -290,6 +323,7 @@ export class GitHubClient {
   private readonly base: string;
   private readonly readAuth: () => Promise<GhAuth>;
   private readonly fetchImpl: Fetch;
+  private readonly observe: (o: Observation) => void;
 
   constructor(base: string, readAuth: () => Promise<GhAuth>, fetchImpl: Fetch = fetch, options: ClientOptions = {}) {
     this.base = base.replace(/\/+$/, "");
@@ -297,6 +331,7 @@ export class GitHubClient {
     this.fetchImpl = fetchImpl;
     this.shared = options.shared ?? null;
     this.now = options.now ?? Date.now;
+    this.observe = options.observe ?? (() => undefined);
   }
 
   /** How many paths' ETags and answers this client keeps (tests hold it under a bound). */
@@ -360,6 +395,18 @@ export class GitHubClient {
       this.store = a.kind === "ok" && this.shared ? this.shared.forLogin(this.base, a.token) : null;
     }
     return this.auth.value;
+  }
+
+  /**
+   * The repository itself, for the setup checks' one live call (`status`): whether GitHub shows it to this login, and
+   * whether it is a fork. A name GitHub would not allow is not_found, without a request.
+   */
+  async repoInfo(repo: string): Promise<ApiResult<{ fork: boolean; private: boolean }>> {
+    if (!REPO_NAME.test(repo)) return { kind: "not_found" };
+    return this.get(`/repos/${repo}`, 0, (j) => {
+      const r = (j ?? {}) as { fork?: unknown; private?: unknown };
+      return { fork: r.fork === true, private: r.private === true };
+    });
   }
 
   getPull(repo: string, pr: number): Promise<ApiResult<PullInfo>> {
@@ -620,13 +667,16 @@ export class GitHubClient {
     // The newest ETag on this machine, with the value it stands for: another session's when it is newer.
     const own = this.cached<T>(path);
     const known = stored ? { etag: stored.etag, value: stored.value } : own;
-    let res = await this.request(path, auth.token, known?.etag);
+    let res = await this.request(path, auth.token, known?.etag, auth.source);
     if ("kind" in res) return res;
     if (res.status === 401) {
       await res.body?.cancel();
       const fresh = await this.login(true);
       if (fresh.kind !== "ok") return { kind: "auth", auth: fresh };
-      if (fresh.token === auth.token) return { kind: "auth", auth: { kind: "signed_out" } };
+      if (fresh.token === auth.token) {
+        this.observe({ what: "token_rejected", path, source: auth.source });
+        return { kind: "auth", auth: { kind: "signed_out" } };
+      }
       auth = fresh;
       return this.ask(path, auth, map, this.store, null);
     }
@@ -636,6 +686,8 @@ export class GitHubClient {
     else this.requests.other++;
     const scopeHeader = res.headers.get("x-oauth-scopes");
     this.scopes = scopeHeader === null ? null : scopeHeader.split(",").map((x) => x.trim()).filter(Boolean);
+    if (this.scopes !== null) this.observe({ what: this.scopes.includes("repo") ? "repo_scope" : "no_repo_scope", path, source: auth.source });
+    if (res.status === 200 || res.status === 304) this.observe({ what: "ok", path, source: auth.source });
     const remaining = Number(res.headers.get("x-ratelimit-remaining"));
     const resource = res.headers.get("x-ratelimit-resource");
     if (res.headers.has("x-ratelimit-remaining") && Number.isFinite(remaining) && (resource === null || resource === "core")) {
@@ -659,6 +711,7 @@ export class GitHubClient {
       const wait = rateLimitWait(res.headers) ?? (await secondaryLimitWait(res));
       await res.body?.cancel().catch(() => undefined);
       if (wait !== undefined) return { kind: "retry", reason: `GitHub rate limit (HTTP ${res.status})`, afterMs: wait };
+      if (res.status === 403) this.observe({ what: res.headers.has("x-github-sso") ? "sso" : "forbidden", path, source: auth.source });
       return { kind: "not_found" };
     }
     if (res.status === 404 || res.status === 410) {
@@ -707,7 +760,7 @@ export class GitHubClient {
     }
   }
 
-  private async request(path: string, token: string, etag: string | undefined): Promise<Response | { kind: "retry"; reason: string }> {
+  private async request(path: string, token: string, etag: string | undefined, source: "env" | "gh"): Promise<Response | { kind: "retry"; reason: string }> {
     const headers: Record<string, string> = {
       authorization: `Bearer ${token}`,
       accept: "application/vnd.github+json",
@@ -718,8 +771,11 @@ export class GitHubClient {
     try {
       return await this.fetchImpl(`${this.base}${path}`, { headers, signal: AbortSignal.timeout(20_000), redirect: "error" });
     } catch (error) {
-      const e = error as Error;
+      const e = error as Error & { cause?: { code?: unknown } };
       log(`GitHub request failed: ${e.name === "TimeoutError" ? "timed out" : e.message}`);
+      // fetch reports a TLS failure as "fetch failed", with Node's own code on the cause.
+      const code = e.cause?.code;
+      if (typeof code === "string" && CERT_ERRORS.has(code)) this.observe({ what: "cert_error", path, source });
       return { kind: "retry", reason: e.name === "TimeoutError" ? "GitHub timed out" : e.message };
     }
   }

@@ -1,10 +1,12 @@
 ---
-description: Install the GitHub CLI (gh) and sign it in, so the runners.io CI channel can read pull requests' CI from GitHub. Use when a runners-io channel event of kind channel_github_setup_needed arrives, when a runners-io tool says gh is not installed or not signed in, or when the user asks to set up the runners.io channel.
+description: Install the GitHub CLI (gh) and sign it in, so the runners.io CI channel can read pull requests' CI from GitHub. Use when the plugin's launch notice or its setup checks say gh is not installed or not signed in, when a runners-io channel event of kind channel_github_setup_needed arrives, when a runners-io tool says gh is not installed or not signed in, or when the user asks to set up the runners.io channel.
 ---
 
 # Set up GitHub for the runners.io channel
 
 The runners.io CI channel reads your pull requests' CI from GitHub with **your own GitHub login**: the one the GitHub CLI (`gh`) holds. It sends nothing to runners.io. It needs `gh` installed and signed in to github.com. Once both are true, the channel starts watching by itself within about 20 seconds, with no restart.
+
+**How you got here.** At every launch the plugin checks what this machine is missing and, when something is, shows the user one line and gives you the fix to offer. That offer is yours to make once, asking first; this skill is how a missing or signed-out `gh` is fixed. `/runners-io:doctor` runs every check and shows each as ready or not: run it after a fix, to confirm the line now reads ready. If the user says no to a fix, record it with the command the launch notice gave you (`node "<the plugin's folder>/hooks/readiness.mjs" decline <check id>`), so it is not offered again for 7 days.
 
 ## 1. Find out what is missing
 
@@ -28,7 +30,7 @@ Tell the user that the channel needs the GitHub CLI, and **ask before installing
 
 A command that needs `sudo` or an administrator prompt is the user's to run: give them the command, and ask them to type it in the prompt with a leading `!` (for example `! sudo dnf install gh`) so it runs in this session.
 
-Confirm with `gh --version`.
+Confirm with `gh --version`. git is installed the same way when it is the one missing: `xcode-select --install` or `brew install git` on macOS, `winget install --id Git.Git` on Windows, `sudo apt-get install git` or `sudo dnf install git` on Linux, asking first.
 
 ## 3. Sign in (the user does this)
 
@@ -44,7 +46,7 @@ Confirm with `gh auth status --hostname github.com`.
 
 ## 4. Check the channel
 
-Call the runners-io `ci_status` tool, which defaults to the current branch's pull request. If it answers the PR's state, the channel works. If the session was not started with the channel on, results are not pushed: the plugin showed the user a line at launch saying so. Offer step 5, and use `ci_status` meanwhile.
+Run `/runners-io:doctor`: the lines about `gh` and its login should now read ready. Then call the runners-io `ci_status` tool, which defaults to the current branch's pull request. If it answers the PR's state, the channel works. If the session was not started with the channel on, results are not pushed: the plugin showed the user a line at launch saying so. Offer step 5, and use `ci_status` meanwhile.
 
 ## 5. Offer a `claude-gh` command (ask first)
 

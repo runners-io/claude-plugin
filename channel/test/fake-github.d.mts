@@ -6,6 +6,7 @@ export interface FakeGitHub {
     secondaryLimited: boolean;
     scopes: string | null;
     failNext: { pattern: RegExp; status: number; count: number }[];
+    repos: Map<string, Record<string, unknown>>;
   };
   readonly requests: { path: string; status: number }[];
   setPull(repo: string, number: number, fields?: Record<string, unknown>): Record<string, unknown>;

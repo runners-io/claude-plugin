@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 // SessionStart hook, at every launch:
+//   - when the machine is missing something the plugin needs (the GitHub CLI, its login, git, a writable data
+//     folder, ...), tell the user in one line and give Claude the fix to offer, asking first (readiness.mjs: the
+//     setup checks). A machine that is ready adds nothing. RUNNERS_IO_NO_SETUP_CHECKS=1 turns the offers off;
 //   - when this session was launched without the runners-io channel flag, tell the user how to relaunch it with
 //     live CI events on;
 //   - when the user has no `claude-gh` command, have Claude offer to set it up. A no is recorded (claude-gh.mjs
@@ -7,17 +10,21 @@
 //     the offer off for good.
 //
 // Claude Code drops a channel's events silently in a session that did not opt in (channels-reference), so without
-// this a user who typed plain `claude` sees nothing and concludes the plugin is broken. The signal is the claude
-// process's own flags (hooks/launch.mjs). It is silent when the channel is on, in `claude -p` (which ignores the
-// flag anyway: scripts and other headless runs get no noise), and after /clear or /compact, which are not
-// launches. Where the flags cannot be read (no `ps`), the line is conditional, never a claim.
+// this a user who typed plain `claude` sees nothing and concludes the plugin is broken; and the channel's own word
+// that gh is missing or signed out is one of those dropped events, which is why the setup checks are made here. The
+// signal for the channel is the claude process's own flags (hooks/launch.mjs). The hook is silent in `claude -p`
+// (which ignores the flag anyway: scripts and other headless runs get no noise), and after /clear or /compact, which
+// are not launches: no check is even run then. Where the flags cannot be read (no `ps`), the channel line is
+// conditional, never a claim.
 //
-// Every path exits 0 and prints JSON or nothing. Dependency-free plain JavaScript, Node 20.
+// Every path exits 0 and prints JSON or nothing. Dependency-free plain JavaScript, Node 20. It is run through
+// hooks/node.sh, which says so when there is no Node.js to run it.
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { claudeGhForOffer } from "../skills/setup-github/claude-gh.mjs";
 import { SESSION_ID, channelFlags, findLaunch, relaunchSentence, shellWord } from "./launch.mjs";
+import { setupFor } from "./readiness.mjs";
 
 const LAUNCHES = new Set(["startup", "resume", "fork"]);
 
@@ -25,14 +32,21 @@ export const OFFER_QUESTION =
   "Set up `claude-gh` so live CI events are on whenever you start Claude Code with it? It starts Claude Code with " +
   "its development flag for channels, which shows a confirmation screen at every launch; `claude` itself is unchanged.";
 
+/** Whether this start is a launch with a person at it: not /clear or /compact, and not a headless run. */
+export function isLaunch(input, launch) {
+  if (!input || typeof input !== "object") return false;
+  if (!LAUNCHES.has(input.source ?? "startup")) return false;
+  return Boolean(launch) && launch.state !== "headless";
+}
+
 /**
  * The hook's output, or null. `launch` is findLaunch()'s answer; `pluginRoot` is CLAUDE_PLUGIN_ROOT;
- * `claudeGh` is claudeGhForOffer()'s answer (null: cannot tell, or turned off, so no offer).
+ * `claudeGh` is claudeGhForOffer()'s answer (null: cannot tell, or turned off, so no offer); `setup` is the setup
+ * checks' answer (readiness.mjs setupFor: a line for the user and the context for Claude, or null on a ready machine).
+ * A setup problem comes first: it is why nothing else would work.
  */
-export function noticeFor(input, launch, pluginRoot, { claudeGh = null } = {}) {
-  if (!input || typeof input !== "object") return null;
-  if (!LAUNCHES.has(input.source ?? "startup")) return null;
-  if (launch?.state === "headless" || !launch) return null;
+export function noticeFor(input, launch, pluginRoot, { claudeGh = null, setup = null } = {}) {
+  if (!isLaunch(input, launch)) return null;
 
   const id = typeof input.session_id === "string" && SESSION_ID.test(input.session_id) ? input.session_id : null;
   const resume = id ? `--resume ${id}` : "--continue";
@@ -61,14 +75,51 @@ export function noticeFor(input, launch, pluginRoot, { claudeGh = null } = {}) {
           : "") +
         "do not ask again in this session and do not mention it again."
       : null;
-  if (!line && !offer) return null;
-  const context = [line && `${line} The user has been shown this line. Do not repeat it unless they ask why CI events are not arriving.`, offer]
+  if (!line && !offer && !setup) return null;
+  const context = [setup?.context, line && `${line} The user has been shown this line. Do not repeat it unless they ask why CI events are not arriving.`, offer]
     .filter(Boolean)
     .join("\n\n");
+  const shown = [setup?.line, line].filter(Boolean);
   return {
-    ...(line ? { systemMessage: line } : {}),
+    ...(shown.length ? { systemMessage: shown.join("\n") } : {}),
     hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: context },
   };
+}
+
+/** The setup checks are local and take well under a second; past this they are given up on, inside the hook's 10 s. */
+const SETUP_LIMIT_MS = 5000;
+
+function within(ms, promise) {
+  return new Promise((resolve) => {
+    // Not unref'd: checks that hang hold nothing open, and the hook must still answer when the limit passes.
+    const timer = setTimeout(() => resolve(null), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(null);
+      },
+    );
+  });
+}
+
+/**
+ * Everything the hook does for one start, or null when it has nothing to say. Nothing is run for a start that is
+ * not a launch with a person at it. The claude-gh question and the setup checks run side by side; either failing
+ * or running out of time leaves the other's answer standing.
+ */
+export async function hookOutput(input, { env = process.env, launch = findLaunch(process.ppid), platform = process.platform, claudeGhFor = claudeGhForOffer, setup = setupFor, setupLimitMs = SETUP_LIMIT_MS } = {}) {
+  if (!isLaunch(input, launch)) return null;
+  const [claudeGh, found] = await Promise.all([
+    Promise.resolve()
+      .then(() => claudeGhFor(env))
+      .catch(() => null),
+    within(setupLimitMs, Promise.resolve().then(() => setup(input, env, { platform }))),
+  ]);
+  return noticeFor(input, launch, env.CLAUDE_PLUGIN_ROOT, { claudeGh, setup: found });
 }
 
 function readStdin() {
@@ -90,11 +141,7 @@ async function main() {
   } catch {
     return;
   }
-  let claudeGh = null;
-  try {
-    claudeGh = await claudeGhForOffer(process.env);
-  } catch {}
-  const out = noticeFor(input, findLaunch(process.ppid), process.env.CLAUDE_PLUGIN_ROOT, { claudeGh });
+  const out = await hookOutput(input);
   if (out) process.stdout.write(`${JSON.stringify(out)}\n`);
 }
 
