@@ -200,27 +200,69 @@ test("the repository has no workflow file: information that there is no CI to wa
   assert.match(r.fix, /^Nothing to fix/);
 });
 
-test("an upstream remote on GitHub: information that the upstream's pull requests are not watched by themselves", async () => {
+test("an upstream remote on GitHub: nothing to say at launch, since the pull request on the upstream repository is watched too; the doctor says so", async () => {
   const m = machine();
-  const r = one(await check(m, project(m, { upstream: "https://github.com/upstream-org/widgets.git" })), "fork");
-  assert.equal(r.effect, "info");
-  assert.match(r.line, /^this clone has an upstream remote, so it looks like a fork/);
-  assert.match(r.fix, /subscribe tool with that repository and the pull request's number/);
+  const rows = await check(m, project(m, { upstream: "https://github.com/upstream-org/widgets.git" }));
+  const r = one(rows, "fork");
+  assert.equal(r.state, "ready");
+  assert.equal(r.label, "a fork's pull request on the repository it was forked from is found");
+  assert.match(r.why, /^this clone has an upstream remote on GitHub: the branch's pull request is looked for there first/);
+  assert.deepEqual(notReady(rows), [], "a fork is nothing to tell the user about any more");
+  assert.equal(JSON.stringify(r).includes("upstream-org"), false, "the upstream repository is not named");
   const same = machine();
-  assert.equal(one(await check(same, project(same, { upstream: "git@github.com:acme/widgets.git" })), "fork").state, "ready", "an upstream that is origin is no fork");
+  const plain = one(await check(same, project(same, { upstream: "git@github.com:acme/widgets.git" })), "fork");
+  assert.equal(plain.state, "ready", "an upstream that is origin is no fork");
+  assert.equal(plain.why, undefined);
 });
 
-test("HTTPS_PROXY or https_proxy set: it degrades and says the channel does not use the proxy yet", async () => {
+test("HTTPS_PROXY or https_proxy set: nothing to say at launch, since the channel goes through the proxy; the doctor names its host and port, never its login", async () => {
   for (const name of ["HTTPS_PROXY", "https_proxy"]) {
-    const m = machine({ env: { [name]: "http://proxy.corp.example:3128" } });
-    const r = one(await check(m, project(m)), "proxy");
-    assert.equal(r.effect, "degrades", name);
-    assert.equal(r.line, `${name} is set, and the plugin's channel doesn't use the proxy yet, so behind it CI may not arrive.`);
-    assert.match(r.fix, /NODE_USE_ENV_PROXY=1/);
-    assert.equal(JSON.stringify(r).includes("proxy.corp.example"), false, "the proxy's address is not repeated");
+    const m = machine({ env: { [name]: "http://ada:s3cr3t-pa55@proxy.corp.example:3128" } });
+    const rows = await check(m, project(m));
+    const r = one(rows, "proxy");
+    assert.equal(r.state, "ready", name);
+    assert.equal(r.label, "GitHub is reached directly, or through a proxy the channel can use");
+    assert.equal(r.why, `through proxy.corp.example:3128, from ${name}`);
+    assert.deepEqual(notReady(rows), []);
+    assert.equal(/s3cr3t|ada/.test(JSON.stringify(rows)), false, "the proxy's login is in no row");
+    assert.match(renderTable(rows), /ready {6}GitHub is reached directly, or through a proxy the channel can use \(through proxy\.corp\.example:3128, from /);
   }
-  const told = machine({ env: { HTTPS_PROXY: "http://p:1", NODE_USE_ENV_PROXY: "1" } });
-  assert.equal(one(await check(told, project(told)), "proxy").state, "ready", "Node was told to use the proxy");
+  const none = machine();
+  const plain = one(await check(none, project(none)), "proxy");
+  assert.equal(plain.state, "ready");
+  assert.equal(plain.why, undefined, "with no proxy variable there is nothing to add");
+});
+
+test("NODE_USE_ENV_PROXY=1 on a Node.js that reads the proxy variables itself: the doctor says Node.js does the proxying", async () => {
+  const m = machine({ env: { HTTPS_PROXY: "http://proxy.corp.example:3128", NODE_USE_ENV_PROXY: "1" } });
+  const dir = project(m);
+  assert.equal(one(await check(m, dir, { nodeVersion: "24.16.0" }), "proxy").why, "through proxy.corp.example:3128, from HTTPS_PROXY, by Node.js itself (NODE_USE_ENV_PROXY=1)");
+  assert.equal(one(await check(m, dir, { nodeVersion: "20.19.0" }), "proxy").why, "through proxy.corp.example:3128, from HTTPS_PROXY");
+});
+
+test("NO_PROXY naming GitHub's host: the doctor says GitHub is asked directly", async () => {
+  const m = machine({ env: { HTTPS_PROXY: "http://proxy.corp.example:3128", NO_PROXY: "localhost,.github.com" } });
+  const r = one(await check(m, project(m)), "proxy");
+  assert.equal(r.state, "ready");
+  assert.equal(r.why, "directly: NO_PROXY names GitHub's host");
+  // The list is read for the host the channel asks: GitHub Enterprise's, when the plugin is set to one.
+  const ghe = machine({ env: { https_proxy: "http://proxy.corp.example:3128", no_proxy: "ghe.corp.example", RUNNERS_IO_GITHUB_API: "https://ghe.corp.example/api/v3" } });
+  assert.equal(one(await check(ghe, project(ghe)), "proxy").why, "directly: no_proxy names GitHub's host");
+  const other = machine({ env: { https_proxy: "http://proxy.corp.example:3128", no_proxy: "ghe.corp.example" } });
+  assert.equal(one(await check(other, project(other)), "proxy").why, "through proxy.corp.example:3128, from https_proxy");
+});
+
+test("a proxy the channel cannot use (SOCKS, or no address at all): it degrades, once per project, and the value is never repeated", async () => {
+  for (const value of ["socks5://ada:s3cr3t-pa55@proxy.corp.example:1080", "http://"]) {
+    const m = machine({ env: { HTTPS_PROXY: value } });
+    const r = one(await check(m, project(m)), "proxy");
+    assert.equal(r.effect, "degrades", value);
+    assert.equal(r.once, true);
+    assert.equal(r.line, "HTTPS_PROXY names a proxy the plugin's channel can't use (it uses http:// and https:// proxies only), so it asks GitHub directly; behind that proxy CI may not arrive.");
+    assert.match(r.fix, /^Nothing to install\./);
+    assert.match(r.fix, /Never print the variable's value/);
+    assert.equal(/s3cr3t|ada|proxy\.corp/.test(JSON.stringify(r)), false);
+  }
 });
 
 test("the plugin's data folder cannot be written: it degrades, names the folder, and says what is off", async () => {
@@ -309,14 +351,137 @@ test("a certificate that does not verify, recorded: it blocks, and the fix is NO
   assert.equal(r.fix.includes("NODE_TLS_REJECT_UNAUTHORIZED"), false);
 });
 
-test("a fork, recorded for one project: information there, and nothing in another project", () => {
+test("a fork GitHub reported, recorded for one project: the doctor says its pull request is looked for on the parent, there and in no other project", async () => {
   const m = machine();
   recordFirstCall(m.env, "fork", { project: projectKey("/work/fork"), now: T0 });
   const record = readFirstCall(m.env, T0);
   const r = one(firstCallRows(record, { env: m.env, projectDir: "/work/fork" }), "fork");
-  assert.equal(r.effect, "info");
-  assert.match(r.line, /^this repository is a fork on GitHub/);
+  assert.equal(r.state, "ready");
+  assert.match(r.why, /^GitHub says this repository is a fork: the branch's pull request is looked for on the repository it was forked from first/);
   assert.equal(one(firstCallRows(record, { env: m.env, projectDir: "/work/other" }), "fork"), undefined);
+  // Beside the launch's own plain "ready", the row that says why is the one shown.
+  const dir = project(m);
+  recordFirstCall(m.env, "fork", { project: projectKey(dir), now: T0 });
+  const rows = mergeRows(await check(m, dir), firstCallRows(readFirstCall(m.env, T0), { env: m.env, projectDir: dir }));
+  assert.equal(rows.filter((x) => x.id === "fork").length, 1);
+  assert.match(one(rows, "fork").why, /^GitHub says this repository is a fork/);
+  assert.deepEqual(notReady(rows), []);
+});
+
+test("of two ready rows for one check, the one that says why is kept; a NOT READY row still wins over both", () => {
+  const plain = { id: "x", label: "x", state: "ready" };
+  const why = { id: "x", label: "x", state: "ready", why: "because" };
+  const bad = { id: "x", label: "x", state: "not_ready", effect: "info", line: "l", fix: "f" };
+  assert.deepEqual(mergeRows([plain], [why]), [why]);
+  assert.deepEqual(mergeRows([why], [plain]), [why]);
+  assert.deepEqual(mergeRows([why], [bad]), [bad]);
+  assert.deepEqual(mergeRows([bad], [why]), [bad]);
+});
+
+// ---- live CI events that cannot arrive, whatever flag the session is started with ---------------------------------
+
+test("Claude Code on Amazon Bedrock, Google Cloud or Microsoft Foundry: live CI events are not available there, said once per project, with nothing to install", async () => {
+  for (const [name, provider] of [
+    ["CLAUDE_CODE_USE_BEDROCK", "Amazon Bedrock"],
+    ["CLAUDE_CODE_USE_MANTLE", "Amazon Bedrock"],
+    ["CLAUDE_CODE_USE_VERTEX", "Google Cloud's Agent Platform (Vertex AI)"],
+    ["CLAUDE_CODE_USE_FOUNDRY", "Microsoft Foundry"],
+  ]) {
+    const m = machine({ env: { [name]: "1" } });
+    const r = one(await check(m, project(m)), "live_events");
+    assert.equal(r.effect, "info", name);
+    assert.equal(r.line, `Claude Code is set to use ${provider} (${name}), where live CI events are not available; CI on request (ci_status) still works.`);
+    assert.match(r.fix, /^Nothing to install\./);
+    assert.match(r.fix, /a claude\.ai account or a Claude Console API key/);
+    assert.match(r.fix, /Do not offer the channel flag or claude-gh/);
+  }
+  for (const on of ["true", "TRUE", "yes", "on"]) {
+    const m = machine({ env: { CLAUDE_CODE_USE_BEDROCK: on } });
+    assert.equal(one(await check(m, project(m)), "live_events").state, "not_ready", on);
+  }
+  for (const off of ["0", "false", "", "no", "off"]) {
+    const m = machine({ env: { CLAUDE_CODE_USE_BEDROCK: off } });
+    assert.equal(one(await check(m, project(m)), "live_events").state, "ready", `"${off}" is off`);
+  }
+});
+
+test("an API key is no reason: Claude Code takes channels with a Console API key as with a claude.ai login", async () => {
+  const m = machine({ env: { ANTHROPIC_API_KEY: "sk-ant-not-a-real-key", ANTHROPIC_AUTH_TOKEN: "x" } });
+  const rows = await check(m, project(m));
+  assert.equal(one(rows, "live_events").state, "ready");
+  assert.deepEqual(notReady(rows), []);
+  assert.equal(JSON.stringify(rows).includes("sk-ant"), false);
+});
+
+test("started with the channel flag where live events cannot arrive: no longer a once-only note, since it blocks what the user is trying to use", async () => {
+  const m = machine({ env: { CLAUDE_CODE_USE_VERTEX: "1" } });
+  const dir = project(m);
+  const on = one(await check(m, dir, { launchState: "on" }), "live_events");
+  assert.equal(on.effect, "degrades");
+  assert.match(on.line, /^Claude Code is set to use Google Cloud's Agent Platform \(Vertex AI\) \(CLAUDE_CODE_USE_VERTEX\), where live CI events are not available, so this session's channel flag brings none;/);
+  for (const state of ["off", "unknown", undefined]) assert.equal(one(await check(m, dir, { launchState: state }), "live_events").effect, "info", String(state));
+  // At launch: said at every start with the flag, and once only without it.
+  const first = await setupFor({ cwd: dir }, m.env, { platform: "linux", now: T0, launchState: "on" });
+  const second = await setupFor({ cwd: dir }, m.env, { platform: "linux", now: T0 + 1000, launchState: "on" });
+  assert.match(first.line, /^runners\.io: Claude Code is set to use Google Cloud/);
+  assert.equal(second.line, first.line);
+  const other = machine({ env: { CLAUDE_CODE_USE_VERTEX: "1" } });
+  const otherDir = project(other);
+  assert.match((await setupFor({ cwd: otherDir }, other.env, { platform: "linux", now: T0, launchState: "off" })).line, /live CI events are not available; CI on request/);
+  assert.equal(await setupFor({ cwd: otherDir }, other.env, { platform: "linux", now: T0 + 1000, launchState: "off" }), null, "said once in the project");
+});
+
+test("an organisation's managed settings file that does not switch channels on: said once, as probable, with who can change it", async () => {
+  const m = machine();
+  const dir = project(m);
+  const managed = m.env.RUNNERS_IO_TEST_MANAGED_SETTINGS_DIR;
+  assert.equal(one(await check(m, dir), "live_events").state, "ready", "no managed settings on the machine: nothing to say");
+  writeFileSync(join(managed, "managed-settings.json"), JSON.stringify({ permissions: { deny: ["Read(./.env)"] } }));
+  const r = one(await check(m, dir), "live_events");
+  assert.equal(r.effect, "info");
+  assert.equal(
+    r.line,
+    "this machine has Claude Code settings managed by an organisation, and they do not switch channels on (channelsEnabled), so live CI events are probably blocked here; CI on request (ci_status) still works.",
+  );
+  assert.match(r.fix, /^Nothing for the user to install\./);
+  assert.match(r.fix, /Owner/);
+  assert.match(r.fix, /cannot be read from here/);
+  // Started with the channel flag it is still a note: Claude Code says so itself at start when channels are blocked.
+  assert.equal(one(await check(m, dir, { launchState: "on" }), "live_events").effect, "info");
+  writeFileSync(join(managed, "managed-settings.json"), JSON.stringify({ channelsEnabled: true }));
+  assert.equal(one(await check(m, dir), "live_events").state, "ready");
+});
+
+test("managed settings are read as Claude Code reads them: the file first, then each drop-in in name order, and only what is plainly there", async () => {
+  const m = machine();
+  const dir = project(m);
+  const managed = m.env.RUNNERS_IO_TEST_MANAGED_SETTINGS_DIR;
+  const state = async () => one(await check(m, dir), "live_events").state;
+  mkdirSync(join(managed, "managed-settings.d"));
+  writeFileSync(join(managed, "managed-settings.json"), JSON.stringify({ channelsEnabled: false }));
+  writeFileSync(join(managed, "managed-settings.d", "10-channels.json"), JSON.stringify({ channelsEnabled: true }));
+  assert.equal(await state(), "ready", "a drop-in sets the key after the file");
+  writeFileSync(join(managed, "managed-settings.d", "20-off.json"), JSON.stringify({ channelsEnabled: false }));
+  assert.equal(await state(), "not_ready", "the later drop-in wins");
+  writeFileSync(join(managed, "managed-settings.d", "20-off.json"), JSON.stringify({ model: "x" }));
+  assert.equal(await state(), "ready", "a drop-in that does not set the key leaves it as it was");
+  writeFileSync(join(managed, "managed-settings.d", ".30-hidden.json"), JSON.stringify({ channelsEnabled: false }));
+  writeFileSync(join(managed, "managed-settings.d", "40-notes.txt"), JSON.stringify({ channelsEnabled: false }));
+  assert.equal(await state(), "ready", "hidden files and files that are not .json are not read");
+  // A file that cannot be understood is no reading at all: nothing is claimed from it.
+  rmSync(join(managed, "managed-settings.d"), { recursive: true });
+  writeFileSync(join(managed, "managed-settings.json"), "{ not json");
+  assert.equal(await state(), "ready");
+  writeFileSync(join(managed, "managed-settings.json"), JSON.stringify(["channelsEnabled"]));
+  assert.equal(await state(), "ready");
+});
+
+test("a provider where channels are not available is said, not the managed settings as well: one reason is enough", async () => {
+  const m = machine({ env: { CLAUDE_CODE_USE_BEDROCK: "1" } });
+  writeFileSync(join(m.env.RUNNERS_IO_TEST_MANAGED_SETTINGS_DIR, "managed-settings.json"), JSON.stringify({}));
+  const rows = await check(m, project(m));
+  assert.equal(rows.filter((r) => r.id === "live_events").length, 1);
+  assert.match(one(rows, "live_events").line, /Amazon Bedrock/);
 });
 
 test("reads refused with a variable's token: the token variable is no longer a once-only note, and wins over the launch's row", async () => {

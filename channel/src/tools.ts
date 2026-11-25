@@ -14,6 +14,7 @@ import { NO_EVENT_LOG } from "./eventlog.ts";
 import type { EventLog } from "./eventlog.ts";
 import { NAMES_LABEL, clean, describe, setupText } from "./format.ts";
 import type { GitScope } from "./git.ts";
+import { ForkParents, findBranchPull } from "./forks.ts";
 import type { GitHubClient } from "./github.ts";
 import { fetchSnapshot } from "./poller.ts";
 import { type Involves, type ScopeStore, isRepoName } from "./scopes.ts";
@@ -72,7 +73,12 @@ const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
 
 const target = {
   repo: { type: "string", description: "owner/name on GitHub. Default: this session's repository (its origin remote)." },
-  pr: { type: "integer", minimum: 1, description: "Pull request number. Default: the open pull request for the current branch." },
+  pr: {
+    type: "integer",
+    minimum: 1,
+    description:
+      "Pull request number. Default: the open pull request for the current branch; with no repo named, in a fork that is the one on the repository it was forked from, when there is one.",
+  },
 } as const;
 
 const muteFields = {
@@ -167,6 +173,8 @@ interface Deps {
   readonly subs: Subscriptions;
   readonly gh: GitHubClient;
   readonly readScope: () => Promise<GitScope>;
+  /** Which repository the clone was forked from (forks.ts); the poller's own, so GitHub is asked once. One of its own by default. */
+  readonly parents?: ForkParents;
   /** The durable record (eventlog.ts); none by default. */
   readonly eventLog?: EventLog;
   /** False when this session was launched without the channel flag (hooks/launch.mjs): nothing pushed arrives. */
@@ -181,6 +189,9 @@ export const EVENTS_OFF_NOTE =
   `To turn them on, ${relaunchSentence(null)}; /runners-io:setup-github sets claude-gh up. ci_status still reads a PR's state on request.`;
 
 type Target = { ok: true; repo: string; pr: number } | { ok: false; text: string };
+
+/** For a repository named outright: it is asked itself, and never about a parent. */
+const NO_PARENTS: Pick<ForkParents, "parentOf"> = { parentOf: async () => null };
 
 async function resolveTarget(deps: Deps, args: Record<string, unknown>): Promise<Target> {
   let repo: string;
@@ -197,15 +208,20 @@ async function resolveTarget(deps: Deps, args: Record<string, unknown>): Promise
     return { ok: true, repo, pr: args.pr };
   }
   const scope = await deps.readScope();
-  if (!scope.branch || scope.repo?.toLowerCase() !== repo.toLowerCase()) {
+  if (!scope.branch || !scope.repo || scope.repo.toLowerCase() !== repo.toLowerCase()) {
     return { ok: false, text: `Pass pr: there is no current branch of ${repo} in this session's folder to find it from.` };
   }
-  const found = await deps.gh.findOpenPull(repo, scope.branch);
+  // With no repository named, the branch's pull request is found as the automatic watch finds it: in a fork, on the
+  // repository it was forked from first (forks.ts). A repository named outright is the only one asked.
+  const found =
+    args.repo === undefined
+      ? await findBranchPull(deps.gh, { repo: scope.repo, branch: scope.branch, upstream: scope.upstream }, deps.parents ?? NO_PARENTS)
+      : await findBranchPull(deps.gh, { repo, branch: scope.branch }, NO_PARENTS);
   if (found.kind === "auth") return { ok: false, text: setupText(found.auth) };
   if (found.kind !== "ok") return { ok: false, text: `Could not ask GitHub for the branch's pull request (${found.kind}); pass pr.` };
   // The local branch's name is chosen by whoever named it (a fetched fork's branch included), so it is cleaned like any name.
   if (found.value === null) return { ok: false, text: `There is no open pull request for branch ${clean(scope.branch, 100)} in ${repo}: pass pr.` };
-  return { ok: true, repo, pr: found.value };
+  return { ok: true, repo: found.value.repo, pr: found.value.pr };
 }
 
 function parseEvents(raw: unknown): { ok: true; events: EventKind[] | "all" } | { ok: false; text: string } {
@@ -298,7 +314,9 @@ function scopeStore(deps: Deps, args: Record<string, unknown>): { ok: true; stor
   return { ok: true, store: deps.scopes };
 }
 
-export function makeTools(deps: Deps): ToolHost {
+export function makeTools(given: Deps): ToolHost {
+  // One memory of which repository the clone was forked from for all the tools' calls.
+  const deps: Deps = { ...given, parents: given.parents ?? new ForkParents(given.gh) };
   const err = (text: string): ToolResult => ({ text, isError: true });
   const listed = defs(deps.scopes !== undefined);
 

@@ -197,3 +197,51 @@ test("gh pr create in another repository asks Claude for nothing: the session wa
   assert.equal(handle(bash("gh pr create -R stranger/bait --fill", "https://github.com/stranger/bait/pull/1\n"), opts(scratch(), off)), null);
   assert.equal(handle(bash("gh pr create --fill", "https://github.com/acme/widgets/pull/7\n"), opts(scratch(), { ...off, repoOf: () => null })), null);
 });
+
+// A clone that is a fork: its pull requests are opened on the repository it was forked from (the `upstream` remote), so
+// that repository's PRs are the session's own too. Any other repository's stay text anyone can write.
+const fork = (root, extra = {}) => opts(root, { repoOf: () => "ada/widgets", parentOf: () => "acme/widgets", ...extra });
+
+test("in a fork, gh pr create's pull request on the upstream repository is handed over, and Claude is told it is watched", () => {
+  const root = scratch();
+  const out = handle(bash("gh pr create --fill", "https://github.com/acme/widgets/pull/7\n"), fork(root));
+  const dir = join(root, "requests", "4242");
+  assert.deepEqual(readdirSync(dir).map((f) => JSON.parse(readFileSync(join(dir, f), "utf8"))), [{ repo: "acme/widgets", pr: 7, at: 1000 }]);
+  assert.match(out, /now watching acme\/widgets PR #7/);
+});
+
+test("in a fork, a script's pull request on the upstream repository is handed over like one in the fork itself", () => {
+  const root = scratch();
+  const out = handle(bash("./tools/open-pr.sh", "https://github.com/acme/widgets/pull/42\nhttps://github.com/ada/widgets/pull/3\n"), fork(root));
+  const dir = join(root, "requests", "4242");
+  const handed = readdirSync(dir).map((f) => JSON.parse(readFileSync(join(dir, f), "utf8")).repo).sort();
+  assert.deepEqual(handed, ["acme/widgets", "ada/widgets"]);
+  assert.equal(out, null);
+});
+
+test("in a fork, a pull request in any other repository is still not the session's: nothing is handed over and Claude is asked for nothing", () => {
+  const root = scratch();
+  assert.equal(handle(bash("gh pr create -R stranger/bait --fill", "https://github.com/stranger/bait/pull/1\n"), fork(root)), null);
+  assert.deepEqual(readdirSync(root), []);
+});
+
+test("in a fork whose channel is not on, gh pr create on the upstream repository asks Claude to subscribe to it there", () => {
+  const out = handle(bash("gh pr create --fill", "https://github.com/acme/widgets/pull/7\n"), fork(scratch(), { launch: () => ({ state: "off", claudePid: 4242 }) }));
+  assert.match(out, /You opened acme\/widgets PR #7/);
+  assert.match(out, /repo="acme\/widgets" pr=7/);
+});
+
+test("the upstream remote is read from the clone: a fork's gh pr create is answered with the upstream repository's pull request", () => {
+  const clone = mkdtempSync(join(tmpdir(), "rio-hook-fork-"));
+  execFileSync("git", ["init", "-q", clone]);
+  execFileSync("git", ["-C", clone, "remote", "add", "origin", "git@github.com:ada/widgets.git"]);
+  execFileSync("git", ["-C", clone, "remote", "add", "upstream", "https://github.com/acme/widgets.git"]);
+  const input = { ...bash("gh pr create --fill", "https://github.com/acme/widgets/pull/7\n"), cwd: clone };
+  const r = run(input);
+  assert.equal(r.code, 0);
+  assert.match(JSON.parse(r.stdout).hookSpecificOutput.additionalContext, /repo="acme\/widgets" pr=7/);
+  // With no upstream remote the hook cannot know of a parent: it asks for nothing, and the channel's own branch watch
+  // finds the pull request (it asks GitHub which repository the clone was forked from).
+  execFileSync("git", ["-C", clone, "remote", "remove", "upstream"]);
+  assert.equal(run(input).stdout, "");
+});

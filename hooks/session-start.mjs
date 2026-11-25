@@ -15,7 +15,8 @@
 // signal for the channel is the claude process's own flags (hooks/launch.mjs). The hook is silent in `claude -p`
 // (which ignores the flag anyway: scripts and other headless runs get no noise), and after /clear or /compact, which
 // are not launches: no check is even run then. Where the flags cannot be read (no `ps`), the channel line is
-// conditional, never a claim.
+// conditional, never a claim. And where Claude Code cannot deliver channel events at all (on Amazon Bedrock, Google
+// Cloud or Microsoft Foundry), the relaunch line and the claude-gh offer are left out: the setup checks say why.
 //
 // Every path exits 0 and prints JSON or nothing. Dependency-free plain JavaScript, Node 20. It is run through
 // hooks/node.sh, which says so when there is no Node.js to run it.
@@ -24,7 +25,7 @@ import { fileURLToPath } from "node:url";
 
 import { claudeGhForOffer } from "../skills/setup-github/claude-gh.mjs";
 import { SESSION_ID, channelFlags, findLaunch, relaunchSentence, shellWord } from "./launch.mjs";
-import { setupFor } from "./readiness.mjs";
+import { liveEventsBlocker, setupFor } from "./readiness.mjs";
 
 const LAUNCHES = new Set(["startup", "resume", "fork"]);
 
@@ -43,10 +44,19 @@ export function isLaunch(input, launch) {
  * The hook's output, or null. `launch` is findLaunch()'s answer; `pluginRoot` is CLAUDE_PLUGIN_ROOT;
  * `claudeGh` is claudeGhForOffer()'s answer (null: cannot tell, or turned off, so no offer); `setup` is the setup
  * checks' answer (readiness.mjs setupFor: a line for the user and the context for Claude, or null on a ready machine).
- * A setup problem comes first: it is why nothing else would work.
+ * A setup problem comes first: it is why nothing else would work. `liveEventsUnavailable`: Claude Code cannot deliver
+ * channel events here whatever flag it is started with (readiness.mjs liveEventsBlocker), so neither the relaunch line
+ * nor the claude-gh offer is made: both would send the user after something that cannot work. The setup checks say so.
  */
-export function noticeFor(input, launch, pluginRoot, { claudeGh = null, setup = null } = {}) {
+export function noticeFor(input, launch, pluginRoot, { claudeGh = null, setup = null, liveEventsUnavailable = false } = {}) {
   if (!isLaunch(input, launch)) return null;
+  if (liveEventsUnavailable) {
+    if (!setup) return null;
+    return {
+      ...(setup.line ? { systemMessage: setup.line } : {}),
+      hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: setup.context },
+    };
+  }
 
   const id = typeof input.session_id === "string" && SESSION_ID.test(input.session_id) ? input.session_id : null;
   const resume = id ? `--resume ${id}` : "--continue";
@@ -117,9 +127,9 @@ export async function hookOutput(input, { env = process.env, launch = findLaunch
     Promise.resolve()
       .then(() => claudeGhFor(env))
       .catch(() => null),
-    within(setupLimitMs, Promise.resolve().then(() => setup(input, env, { platform }))),
+    within(setupLimitMs, Promise.resolve().then(() => setup(input, env, { platform, launchState: launch.state }))),
   ]);
-  return noticeFor(input, launch, env.CLAUDE_PLUGIN_ROOT, { claudeGh, setup: found });
+  return noticeFor(input, launch, env.CLAUDE_PLUGIN_ROOT, { claudeGh, setup: found, liveEventsUnavailable: liveEventsBlocker(env) !== null });
 }
 
 function readStdin() {

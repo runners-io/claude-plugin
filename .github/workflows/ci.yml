@@ -80,10 +80,11 @@ jobs:
 
       - name: The bundle end to end, the hooks and the setup checks, and the manifest's promises (Node 20)
         # The hooks are plain JavaScript run by whatever Node.js the user has, so their tests run on the oldest one too.
+        # The proxy test as well: Node 20 has no proxy support of its own, so there the channel's is all there is.
         run: |
           set -euo pipefail
           node scripts/check-plugin.mjs
-          node --test channel/test/bundle.test.mjs channel/test/doctor.test.mjs channel/test/readiness.test.mjs channel/test/node-wrapper.test.mjs channel/test/session-start.test.mjs
+          node --test channel/test/bundle.test.mjs channel/test/doctor.test.mjs channel/test/readiness.test.mjs channel/test/node-wrapper.test.mjs channel/test/session-start.test.mjs channel/test/proxy-bundle.test.mjs
 
       - name: claude plugin validate --strict
         run: |

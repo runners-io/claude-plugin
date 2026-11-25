@@ -27,6 +27,7 @@ import { type RequestsSeen, requestChanges, requestMessage } from "./requests.ts
 import { type ReviewState, reviewChanges } from "./reviews.ts";
 import { type ChannelMessage, REPLY, clean, describe, safeLink, scopeMessage, setupMessage, toMessage } from "./format.ts";
 import type { GitScope } from "./git.ts";
+import { ForkParents, findBranchPull } from "./forks.ts";
 import { type EventLog, NO_EVENT_LOG } from "./eventlog.ts";
 import type { BaseRunInfo, ApiResult, GhProblem, GitHubClient } from "./github.ts";
 import { log } from "./log.ts";
@@ -122,6 +123,11 @@ export interface PollerDeps {
   readonly scopeEveryMs?: number;
   /** How long a held pull request that left the open list is kept to report its end (cadence.ts SCOPE_LEAVE_MS); tests set 0. */
   readonly scopeLeaveMs?: number;
+  /**
+   * Which repository the clone was forked from (forks.ts): the branch's pull request is looked for there first. One of
+   * its own by default; main.ts hands the tools the same one, so GitHub is asked about a repository once.
+   */
+  readonly parents?: ForkParents;
   /** PRs the PostToolUse hook handed over since the last pass (hookrequests.ts takeRequests); none by default. */
   readonly takeHookRequests?: () => readonly HookRequest[];
   readonly limits?: Partial<typeof DEFAULT_LIMITS>;
@@ -368,6 +374,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
   const lastPushed = new Map<string, string | null>();
   /** Per watched PR: until when it is looked at every pass, after the session's own push to its branch. */
   const fastUntil = new Map<string, number>();
+  const parents = deps.parents ?? new ForkParents(gh, now);
   let findLabel = "";
   let findSince = 0;
   let foundAt = Number.NEGATIVE_INFINITY;
@@ -745,25 +752,29 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       }
       // The branch's PR is looked for only while none is watched: every minute for five minutes after a branch
       // change, then every five. A watched one that merges or closes is unwatched below, and the looking resumes.
+      // The branch's PR is one in the clone's own repository, or, in a fork, one on the repository it was forked from
+      // whose head is the clone's own repository (forks.ts): both have this branch as their head.
       const repo = scope.repo?.toLowerCase();
-      const watched = subs.list().some((e) => e.source === "auto" && e.repo.toLowerCase() === repo && e.last?.state === "open" && e.last.headRef === scope.branch);
+      const branchPr = (e: Entry) => e.last?.headRef === scope.branch && (e.repo.toLowerCase() === repo || e.last.headRepo?.toLowerCase() === repo);
+      const watched = subs.list().some((e) => e.source === "auto" && e.last?.state === "open" && branchPr(e));
       const findEvery = now() - findSince < 5 * 60_000 ? lookEvery("pending", 0, 0) : lookEvery("finished", 0, 99);
       if (scope.repo && scope.branch && (watched || pressure().pause || now() - foundAt < findEvery * pressure().stretch)) {
         current = "keep";
       } else if (scope.repo && scope.branch) {
         foundAt = now();
-        const found = await gh.findOpenPull(scope.repo, scope.branch);
+        // In a fork: on the repository it was forked from first, then here (forks.ts).
+        const found = await findBranchPull(gh, { repo: scope.repo, branch: scope.branch, upstream: scope.upstream }, parents);
         if (found.kind === "auth") {
           await problem(found.auth);
           await sleep(waitMs, signal);
           continue;
         }
-        if (found.kind === "ok" && found.value !== null && subs.mutes.mutesPr(scope.repo, found.value)) {
+        if (found.kind === "ok" && found.value !== null && subs.mutes.mutesPr(found.value.repo, found.value.pr)) {
           current = null; // muted in this session (the mute tool, or unsubscribed): never added back
         } else if (found.kind === "ok" && found.value !== null) {
-          const isNew = !subs.get(scope.repo, found.value);
-          current = subs.add({ repo: scope.repo, pr: found.value, source: "auto" }).key;
-          if (isNew) events.write("subscribe", { repo: scope.repo, pr: found.value, source: "auto", events: [...AUTO_EVENTS] });
+          const isNew = !subs.get(found.value.repo, found.value.pr);
+          current = subs.add({ repo: found.value.repo, pr: found.value.pr, source: "auto" }).key;
+          if (isNew) events.write("subscribe", { repo: found.value.repo, pr: found.value.pr, source: "auto", events: [...AUTO_EVENTS] });
         } else if (found.kind !== "ok") {
           current = "keep"; // GitHub did not answer: leave the automatic subscription as it is
         }
@@ -773,7 +784,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
           if (e.source !== "auto" || e.key === current) continue;
           // No open PR for this branch any more, but this entry IS the branch's PR: it was just merged or
           // closed. Keep it for this pass so the merge is reported; the poll below ends it.
-          const sameBranch = current === null && e.repo === scope.repo && e.last?.headRef === scope.branch;
+          const sameBranch = current === null && branchPr(e);
           if (!sameBranch) unsubscribe(e, "branch_switch");
         }
       }
@@ -790,7 +801,8 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       const repo = scope.repo.toLowerCase();
       const t = now();
       for (const [key, until] of fastUntil) if (until <= t) fastUntil.delete(key);
-      const open = subs.list().filter((e) => e.repo.toLowerCase() === repo && e.last?.state === "open" && e.last.headRef);
+      // A fork's pull request on another repository has its head here too: `git push` to origin is a push to it.
+      const open = subs.list().filter((e) => (e.repo.toLowerCase() === repo || e.last?.headRepo?.toLowerCase() === repo) && e.last?.state === "open" && e.last.headRef);
       const refs = deps.readPushed && open.length > 0 ? await deps.readPushed([...new Set(open.map((e) => e.last?.headRef ?? ""))]) : null;
       const reading = (headRef: string): string | null | undefined => {
         // The folder's own branch, as readScope read it this pass; any other branch, as readPushed did. undefined: no
@@ -825,7 +837,10 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
         refuse("auto_subscribe_off");
         continue;
       }
-      if (!scope?.repo || scope.repo.toLowerCase() !== req.repo.toLowerCase()) {
+      // The session's own repository, or, when the clone is a fork, the repository it was forked from, as far as that
+      // is already known (the upstream remote, or what GitHub answered when the branch's pull request was looked for).
+      const sessionRepos = scope?.repo ? [scope.repo, parents.knownParent(scope)] : [];
+      if (!sessionRepos.some((r) => r?.toLowerCase() === req.repo.toLowerCase())) {
         refuse("other_repo");
         continue;
       }
@@ -908,7 +923,9 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
         snap.state === "open" &&
         snap.headSha &&
         snap.headSha !== prev.headSha &&
-        scope?.repo?.toLowerCase() === entry.repo.toLowerCase() &&
+        // A PR whose head is the session's own repository: one in it, or a fork's on the repository it was forked from.
+        scope?.repo &&
+        (scope.repo.toLowerCase() === entry.repo.toLowerCase() || scope.repo.toLowerCase() === snap.headRepo?.toLowerCase()) &&
         (await deps.inOwnHistory(snap.headSha)) === false
       ) {
         changes.unshift({ kind: "pr.head_moved", snapshot: snap, ...(snap.updatedAt ? { at: snap.updatedAt } : {}) });

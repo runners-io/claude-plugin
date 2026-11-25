@@ -25,6 +25,16 @@ test("live CI events off: it degrades, says CI on request still works, and gives
   assert.match(r.fix ?? "", /setup-github skill's step 5, asking first/);
 });
 
+test("live CI events where they cannot arrive at all: the row is skipped with the reason, never an instruction to relaunch", () => {
+  for (const state of ["off", "on", "unknown"] as const) {
+    const r = channelRow(state, "Amazon Bedrock");
+    assert.equal(r.state, "skipped", state);
+    assert.equal(r.why, "live CI events are not available on Amazon Bedrock");
+    assert.equal(r.fix, undefined);
+  }
+  assert.equal(channelRow("off", null).state, "not_ready");
+});
+
 const auth = async (): Promise<GhAuth> => ({ kind: "ok", token: "gho_fakeToken123", source: "gh" });
 const answering = (status: number, body: unknown) =>
   new GitHubClient("https://api.github.com", auth, async () => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } }));

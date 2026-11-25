@@ -14,7 +14,13 @@ Run this with the Bash tool, in the session's folder. This skill's base director
 node "<this skill's base directory>/../../channel/dist/runners-io-channel.mjs" status
 ```
 
-It reads the GitHub login the way the channel does, asks GitHub once whether it shows the folder's repository to that login (and once for the branch's open pull request), and prints the login, the repository, the branch, the pull request, and then the checks. It sends nothing to runners.io and prints no token.
+It reads the GitHub login the way the channel does, asks GitHub once whether it shows the folder's repository to that login (and once for the branch's open pull request; in a fork, once more, of the repository it was forked from, where a fork's pull request usually lives), and prints the login, the repository, the branch, the pull request, and then the checks. It sends nothing to runners.io and prints no token.
+
+Three lines are usually `ready` and say more in brackets when there is something to know:
+
+- **"GitHub is reached directly, or through a proxy the channel can use"**: behind a company proxy (`HTTPS_PROXY`) it names the proxy's host and port, or says that `NO_PROXY` names GitHub's host. It never shows a proxy's user name or password, and neither should you: do not print the variable's value.
+- **"a fork's pull request on the repository it was forked from is found"**: in a fork it says how the fork was recognised (an `upstream` remote, or GitHub's own answer). The "pull request:" line above the checks then names the repository the pull request is on.
+- **"Claude Code can deliver live CI events here"**: `NOT READY` when Claude Code runs on Amazon Bedrock, Google Cloud's Agent Platform (Vertex AI) or Microsoft Foundry, where there are no channel events. Nothing fixes that from here: do not offer the channel flag or `claude-gh`, and read CI with the `ci_status` tool when asked.
 
 If `node` is not found, or is older than 20, that is the first thing to fix: nothing else in the plugin can run. Offer to help install Node.js, asking first: `brew install node` on macOS, `winget install OpenJS.NodeJS.LTS` on Windows, the distribution's package or nvm on Linux. Claude Code must be restarted afterwards.
 

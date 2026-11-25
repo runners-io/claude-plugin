@@ -36,7 +36,7 @@ const whats = (seen: Observation[]) => seen.map((o) => o.what);
 
 test("a good answer is seen as ok, with the path and where the token came from", async () => {
   const { gh, seen } = client(() => json(200, { fork: false, private: true }, { etag: '"a"' }), "env");
-  assert.deepEqual(await gh.repoInfo("acme/widgets"), { kind: "ok", value: { fork: false, private: true } });
+  assert.deepEqual(await gh.repoInfo("acme/widgets"), { kind: "ok", value: { fork: false, private: true, parent: null } });
   assert.deepEqual(seen, [{ what: "ok", path: "/repos/acme/widgets", source: "env" }]);
 });
 

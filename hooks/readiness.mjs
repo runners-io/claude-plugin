@@ -24,6 +24,8 @@ import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { nodeProxiesItself, proxyFor } from "./proxy.mjs";
+
 /** `1` turns the offers off: nothing is offered, and only a blocker's one-line notice is still shown. */
 export const OPT_OUT = "RUNNERS_IO_NO_SETUP_CHECKS";
 /** After the user says no to a fix, it is not offered again for this long. */
@@ -375,6 +377,8 @@ const skipped = (id, label, why) => ({ id, label, state: "skipped", why });
 const unknown = (id, label, why) => ({ id, label, state: "unknown", why });
 const found = (id, label, effect, line, fix, more = {}) => ({ id, label, state: "not_ready", effect, line, fix, ...more });
 
+const FORK_LABEL = "a fork's pull request on the repository it was forked from is found";
+
 const USERS_COMMAND = "is the user's own command: ask them to type it in the prompt with a leading `!`, so it runs in this session";
 
 function installHint(what, platform) {
@@ -398,11 +402,123 @@ function signInFix(host) {
   );
 }
 
+// ---- live CI events that cannot arrive --------------------------------------------------------------------------
+
+/**
+ * Where Claude Code does not deliver channel events at all. Its documentation (Channels): channels "require Anthropic
+ * authentication through claude.ai or a Console API key, and are not available on Amazon Bedrock, Google Cloud's
+ * Agent Platform, or Microsoft Foundry". These are the variables that switch Claude Code to one of those (its
+ * environment variables reference). An API key is no reason: a Console API key takes channels.
+ */
+const PROVIDERS = [
+  ["CLAUDE_CODE_USE_BEDROCK", "Amazon Bedrock"],
+  ["CLAUDE_CODE_USE_MANTLE", "Amazon Bedrock"],
+  ["CLAUDE_CODE_USE_VERTEX", "Google Cloud's Agent Platform (Vertex AI)"],
+  ["CLAUDE_CODE_USE_FOUNDRY", "Microsoft Foundry"],
+];
+/** How Claude Code reads an on/off variable: these four words, in any case. */
+const ON = new Set(["1", "true", "yes", "on"]);
+
+/** The provider this session's Claude Code is set to that takes no channels, with the variable that says so, or null. */
+export function liveEventsBlocker(env = process.env) {
+  for (const [variable, provider] of PROVIDERS) if (ON.has((env[variable] ?? "").trim().toLowerCase())) return { variable, provider };
+  return null;
+}
+
+/**
+ * The folder an organisation's managed Claude Code settings file is in, as Claude Code's documentation gives it for
+ * each system. RUNNERS_IO_TEST_MANAGED_SETTINGS_DIR is the tests' own: a folder of theirs, so the real machine's
+ * settings are never read by a test.
+ */
+function managedSettingsDir(env, platform) {
+  if (env.RUNNERS_IO_TEST_MANAGED_SETTINGS_DIR && isAbsolute(env.RUNNERS_IO_TEST_MANAGED_SETTINGS_DIR)) return env.RUNNERS_IO_TEST_MANAGED_SETTINGS_DIR;
+  if (platform === "darwin") return "/Library/Application Support/ClaudeCode";
+  if (platform === "win32") return "C:\\Program Files\\ClaudeCode";
+  return "/etc/claude-code";
+}
+
+function settingsFile(file) {
+  try {
+    const st = statSync(file);
+    if (!st.isFile() || st.size > 1024 * 1024) return null;
+    const value = JSON.parse(readFileSync(file, "utf8"));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What the machine's managed settings FILES say of `channelsEnabled`: true, false, "unset" when there are such files
+ * and none sets it, or null when there is no file to read (or none that can be understood). Read as Claude Code
+ * reads them: managed-settings.json first, then each *.json in managed-settings.d in name order, hidden files left
+ * out, a later file's value over an earlier one's.
+ *
+ * Only the files are read. An organisation can also deliver settings from the claude.ai admin console or by device
+ * management, which rank above the files and cannot be read from here, so a "not switched on" from the files is
+ * probable, never certain.
+ */
+export function managedChannels(env = process.env, platform = process.platform) {
+  const dir = managedSettingsDir(env, platform);
+  const files = [join(dir, "managed-settings.json")];
+  try {
+    for (const name of readdirSync(join(dir, "managed-settings.d")).sort()) if (!name.startsWith(".") && name.endsWith(".json")) files.push(join(dir, "managed-settings.d", name));
+  } catch {}
+  let read = 0;
+  let value = "unset";
+  for (const file of files) {
+    const settings = settingsFile(file);
+    if (!settings) continue;
+    read++;
+    if (typeof settings.channelsEnabled === "boolean") value = settings.channelsEnabled;
+  }
+  return read ? value : null;
+}
+
+/**
+ * Whether Claude Code can deliver live CI events here at all. Two things say no, and neither is fixed by the channel
+ * flag: a provider that takes no channels (certain: said at every launch when the session was started with the flag,
+ * `launchState` "on", since it blocks what the user is trying to use; otherwise once per project), and an
+ * organisation's managed settings that do not switch channels on (probable: once per project). What cannot be read
+ * from this machine is never claimed: a claude.ai Team or Enterprise organisation that has not switched channels on
+ * in its admin console looks, from here, like any other login. Claude Code says so itself at start.
+ */
+function liveEventsRow(env, platform, launchState) {
+  const id = "live_events";
+  const label = "Claude Code can deliver live CI events here";
+  const blocker = liveEventsBlocker(env);
+  if (blocker) {
+    const flagOn = launchState === "on";
+    return found(
+      id,
+      label,
+      flagOn ? "degrades" : "info",
+      `Claude Code is set to use ${blocker.provider} (${blocker.variable}), where live CI events are not available` +
+        `${flagOn ? ", so this session's channel flag brings none" : ""}; CI on request (ci_status) still works.`,
+      "Nothing to install. Claude Code delivers a channel's events only when it is signed in to Anthropic itself (a claude.ai account or a Claude Console API key), and not on Amazon Bedrock, " +
+        "Google Cloud's Agent Platform (Vertex AI) or Microsoft Foundry. Do not offer the channel flag or claude-gh here: neither brings live events. " +
+        "When the user asks about CI, read it with the runners-io ci_status tool.",
+    );
+  }
+  if ([false, "unset"].includes(managedChannels(env, platform))) {
+    return found(
+      id,
+      label,
+      "info",
+      "this machine has Claude Code settings managed by an organisation, and they do not switch channels on (channelsEnabled), so live CI events are probably blocked here; CI on request (ci_status) still works.",
+      "Nothing for the user to install. Channels are switched on for an organisation by an Owner (in the claude.ai admin console: Organization settings, Claude Code, Channels) or by " +
+        "`channelsEnabled: true` in its managed settings. Settings an organisation delivers from the admin console or by device management cannot be read from here and rank above this " +
+        "machine's settings file, so this may already be done: when channels are blocked, Claude Code says so in a notice at start. Meanwhile read CI with the runners-io ci_status tool when asked.",
+    );
+  }
+  return ready(id, label);
+}
+
 /**
  * The LAUNCH checks: local, no network call, well under a second (each command has a 2.5 s limit of its own, and
  * they run side by side). One row per check, in the order they are listed to the user.
  */
-export async function launchChecks({ env = process.env, projectDir = env.CLAUDE_PROJECT_DIR || process.cwd(), platform = process.platform } = {}) {
+export async function launchChecks({ env = process.env, projectDir = env.CLAUDE_PROJECT_DIR || process.cwd(), platform = process.platform, launchState, nodeVersion = process.versions.node } = {}) {
   const rows = [];
   const host = loginHost(env);
   const hostOk = sayable(host) === host;
@@ -500,7 +616,7 @@ export async function launchChecks({ env = process.env, projectDir = env.CLAUDE_
   const repoLabel = "the session's folder is a git repository";
   const remoteLabel = "the repository's origin is on github.com";
   const workflowsLabel = "the repository has GitHub Actions workflows";
-  const forkLabel = "the clone is not a fork with its pull requests elsewhere";
+  const forkLabel = FORK_LABEL;
   if (!git) {
     rows.push(
       found(
@@ -577,37 +693,40 @@ export async function launchChecks({ env = process.env, projectDir = env.CLAUDE_
                 "Nothing to fix. Once a workflow file is pushed, its runs on a pull request are reported as they finish.",
               ),
         );
+        // A fork is nothing to tell the user about: the channel looks for the branch's pull request on the repository
+        // the clone was forked from first (channel/src/forks.ts). The doctor says that it does, and why.
         const parent = upstream?.ok ? githubRepo(upstream.stdout) : null;
         rows.push(
           parent && parent.toLowerCase() !== repo.toLowerCase()
-            ? found(
-                "fork",
-                forkLabel,
-                "info",
-                "this clone has an upstream remote, so it looks like a fork: a pull request opened on the upstream repository isn't watched by itself yet.",
-                "Nothing to install. After a pull request is opened on the upstream repository, call the runners-io subscribe tool with that repository and the pull request's number.",
-              )
+            ? { ...ready("fork", forkLabel), why: "this clone has an upstream remote on GitHub: the branch's pull request is looked for there first, then in the clone's own repository" }
             : ready("fork", forkLabel),
         );
       }
     }
   }
 
-  // 6. a proxy the channel does not use
-  const proxyLabel = "no proxy stands between the channel and GitHub";
-  const proxyVar = ["HTTPS_PROXY", "https_proxy"].find((n) => (env[n] ?? "").trim());
-  if (proxyVar && env.NODE_USE_ENV_PROXY !== "1") {
+  // 6. a proxy between this machine and GitHub: the channel goes through it, as gh does (proxy.mjs)
+  const proxyLabel = "GitHub is reached directly, or through a proxy the channel can use";
+  const route = proxyFor(env, env.RUNNERS_IO_GITHUB_API || "https://api.github.com");
+  if (route.kind === "unusable") {
     rows.push(
       found(
         "proxy",
         proxyLabel,
         "degrades",
-        `${proxyVar} is set, and the plugin's channel doesn't use the proxy yet, so behind it CI may not arrive.`,
-        "Nothing to install. If CI results do not arrive or ci_status cannot reach GitHub, the proxy is why. With Node.js 24 or later, setting " +
-          "`NODE_USE_ENV_PROXY=1` in the environment Claude Code starts from makes Node send the channel's requests through the proxy; the user sets it, then restarts Claude Code.",
+        `${route.variable} names a proxy the plugin's channel can't use (it uses http:// and https:// proxies only), so it asks GitHub directly; behind that proxy CI may not arrive.`,
+        "Nothing to install. The channel sends its GitHub requests through the http:// or https:// proxy named in `HTTPS_PROXY` (or `https_proxy`) and asks the hosts in `NO_PROXY` directly, " +
+          "as gh does; it cannot use a SOCKS proxy or a proxy configuration (PAC) file. If CI results do not arrive or ci_status cannot reach GitHub, that is why: the user sets the variable to " +
+          "their proxy's http:// address in the environment Claude Code starts from, then restarts Claude Code. Never print the variable's value: it can hold a password.",
         { once: true },
       ),
     );
+  } else if (route.kind === "proxy") {
+    // The proxy's host and port only: the variable can also hold the proxy's login, which is never shown.
+    const byNode = nodeProxiesItself(env, nodeVersion) ? ", by Node.js itself (NODE_USE_ENV_PROXY=1)" : "";
+    rows.push({ ...ready("proxy", proxyLabel), why: `through ${route.proxy.display}, from ${route.variable}${byNode}` });
+  } else if (route.why === "no_proxy") {
+    rows.push({ ...ready("proxy", proxyLabel), why: `directly: ${route.variable} names GitHub's host` });
   } else rows.push(ready("proxy", proxyLabel));
 
   // 7. the plugin's own folders
@@ -629,7 +748,10 @@ export async function launchChecks({ env = process.env, projectDir = env.CLAUDE_
     );
   } else rows.push(ready("data_dir", dataLabel));
 
-  // 8. Windows
+  // 8. live CI events that cannot arrive, whatever flag the session is started with
+  rows.push(liveEventsRow(env, platform, launchState));
+
+  // 9. Windows
   if (platform === "win32") {
     rows.push(
       found(
@@ -730,29 +852,28 @@ export function firstCallRows(record, { env = process.env, projectDir = env.CLAU
   }
 
   if (mine.fork) {
-    rows.push(
-      found(
-        "fork",
-        "the clone is not a fork with its pull requests elsewhere",
-        "info",
-        "this repository is a fork on GitHub: a pull request opened on the upstream repository isn't watched by itself yet.",
-        "Nothing to install. After a pull request is opened on the upstream repository, call the runners-io subscribe tool with that repository and the pull request's number.",
-      ),
-    );
+    rows.push({
+      ...ready("fork", FORK_LABEL),
+      why: "GitHub says this repository is a fork: the branch's pull request is looked for on the repository it was forked from first, then in this one",
+    });
   }
   return rows;
 }
 
 /**
  * One row per check id: a recorded answer adds to a launch check, never repeats it. A not_ready row wins over any
- * other, and of two not_ready rows the one that is not once-only (GitHub refused something) over the one that is.
+ * other, and of two not_ready rows the one that is not once-only (GitHub refused something) over the one that is. Of
+ * two ready rows, the one that says why is kept: it is the one with something to tell.
  */
 export function mergeRows(...lists) {
   const out = new Map();
   for (const row of lists.flat()) {
     const was = out.get(row.id);
     const stronger = was && row.state === "not_ready" && (was.state !== "not_ready" || (was.once === true && row.once !== true));
+    const saysWhy = was && row.state === "ready" && was.state === "ready" && row.why !== undefined && was.why === undefined;
     if (!was || stronger) out.set(row.id, row);
+    // In the first row's place, so the table keeps its order.
+    else if (saysWhy) out.set(row.id, row);
   }
   return [...out.values()];
 }
@@ -884,10 +1005,10 @@ export function setupNotice(rows, { state = { declined: {}, said: {} }, optOut =
  * The SessionStart hook's whole path: the launch checks, what GitHub last answered, what was already said or declined.
  * null on a machine that is ready, and whenever there is nothing new to say.
  */
-export async function setupFor(input, env = process.env, { platform = process.platform, now = Date.now(), pluginRoot = env.CLAUDE_PLUGIN_ROOT } = {}) {
+export async function setupFor(input, env = process.env, { platform = process.platform, now = Date.now(), pluginRoot = env.CLAUDE_PLUGIN_ROOT, launchState } = {}) {
   const cwd = input && typeof input.cwd === "string" && isAbsolute(input.cwd) ? input.cwd : process.cwd();
   const projectDir = env.CLAUDE_PROJECT_DIR && isAbsolute(env.CLAUDE_PROJECT_DIR) ? env.CLAUDE_PROJECT_DIR : cwd;
-  const launch = await launchChecks({ env, projectDir, platform });
+  const launch = await launchChecks({ env, projectDir, platform, launchState });
   const rows = mergeRows(launch, firstCallRows(readFirstCall(env, now), { env, projectDir, platform }));
   if (!findings(rows).length) return null;
   const root = stateRoot(env);

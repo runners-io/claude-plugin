@@ -15,20 +15,22 @@ import { SharedStore, defaultSharedRoot } from "./shared.ts";
 import { fakeGitHubAllowed, loadConfig } from "./config.ts";
 import { channelRow, liveRow } from "./doctor.ts";
 import { FirstCallRecorder } from "./firstcall.ts";
+import { ForkParents, findBranchPull } from "./forks.ts";
 import { inOwnHistory, readGitScope, readPushed } from "./git.ts";
 import { GitHubClient, readGhAuth } from "./github.ts";
 import { log } from "./log.ts";
 import { startMcp } from "./mcp.ts";
 import { runPoller } from "./poller.ts";
+import { githubFetch, proxyNote } from "./proxy.ts";
 import { ScopeStore, defaultScopeRoot, scopeFile } from "./scopes.ts";
 import { Subscriptions } from "./subscriptions.ts";
 import { INSTRUCTIONS } from "./instructions.ts";
 import { makeTools } from "./tools.ts";
 import { NO_EVENT_LOG, openEventLog } from "./eventlog.ts";
 import { findLaunch, pollsIn } from "../../hooks/launch.mjs";
-import { firstCallRows, launchChecks, mergeRows, readFirstCall, renderTable } from "../../hooks/readiness.mjs";
+import { firstCallRows, launchChecks, liveEventsBlocker, mergeRows, readFirstCall, renderTable } from "../../hooks/readiness.mjs";
 
-export const VERSION = "0.3.14";
+export const VERSION = "0.3.15";
 
 /**
  * Notes what GitHub answers, for the next launch's setup checks (firstcall.ts). Not under the tests' fake GitHub
@@ -42,11 +44,14 @@ function firstCallRecorder(projectDir: string): FirstCallRecorder | null {
 function serve(): void {
   const config = loadConfig();
   const firstCall = firstCallRecorder(config.projectDir);
-  const gh = new GitHubClient(config.githubApi, () => readGhAuth(process.env, undefined, config.githubApi), fetch, {
+  // Behind a company proxy (HTTPS_PROXY), GitHub is asked through it; with none set this is Node's own fetch (proxy.ts).
+  const gh = new GitHubClient(config.githubApi, () => readGhAuth(process.env, undefined, config.githubApi), githubFetch(process.env), {
     shared: new SharedStore(defaultSharedRoot()),
     observe: (o) => firstCall?.observe(o),
   });
   const subs = new Subscriptions();
+  // Which repository the clone was forked from: one answer for the poller and the tools (forks.ts).
+  const parents = new ForkParents(gh);
   // This project's repository scopes (scopes.ts): the one choice kept beyond the session, in the plugin's own data
   // folder. The tools set and end them; the poller holds their pull requests.
   const scopes = new ScopeStore(scopeFile(defaultScopeRoot(), config.projectDir));
@@ -78,7 +83,7 @@ function serve(): void {
     name: "runners-io",
     version: VERSION,
     instructions: INSTRUCTIONS,
-    tools: makeTools({ subs, gh, readScope, eventLog, liveEvents, scopes }),
+    tools: makeTools({ subs, gh, readScope, eventLog, liveEvents, scopes, parents }),
     onReady: () => {
       if (!liveEvents) {
         if (launch === "off") eventLog.write("channel_inactive", { launch });
@@ -90,6 +95,7 @@ function serve(): void {
         gh,
         subs,
         scopes,
+        parents,
         readScope,
         notify: (m) => server.notify(m),
         signal: stop.signal,
@@ -114,6 +120,8 @@ function serve(): void {
     `started ${VERSION}; GitHub API ${config.githubApi}; automatic subscription: ${config.autoSubscribe}; ` +
       `event log: ${config.eventLogDir ?? "off"}`,
   );
+  const proxy = proxyNote(process.env, config.githubApi);
+  if (proxy) log(proxy);
 }
 
 async function status(): Promise<void> {
@@ -127,16 +135,22 @@ async function status(): Promise<void> {
         ? "the GitHub CLI (gh) is not installed"
         : "gh is not signed in to github.com";
   const firstCall = firstCallRecorder(config.projectDir);
-  const client = new GitHubClient(config.githubApi, async () => auth, fetch, { observe: (o) => firstCall?.observe(o) });
-  let pr = "none";
-  if (auth.kind === "ok" && scope.repo && scope.branch) {
-    const found = await client.findOpenPull(scope.repo, scope.branch);
-    pr = found.kind === "ok" ? (found.value === null ? "no open pull request" : `#${found.value}`) : `could not ask GitHub (${found.kind})`;
-  }
+  const client = new GitHubClient(config.githubApi, async () => auth, githubFetch(process.env), { observe: (o) => firstCall?.observe(o) });
   const checks = { env: process.env, projectDir: config.projectDir };
-  const local = await launchChecks(checks);
-  const live = auth.kind === "ok" ? [await liveRow(client, scope.repo, firstCall)] : [];
-  const rows = mergeRows(local, live, firstCallRows(readFirstCall(process.env), checks), [channelRow(findLaunch(process.ppid).state)]);
+  const launch = findLaunch(process.ppid).state;
+  const local = await launchChecks({ ...checks, launchState: launch });
+  // The checks' one live call, made first: its answer also says whether the repository is a fork, so finding the
+  // branch's pull request below does not ask GitHub the same thing again.
+  const parents = new ForkParents(client);
+  const live = auth.kind === "ok" ? [await liveRow(client, scope.repo, firstCall, parents)] : [];
+  let pr = "none";
+  // Found as the automatic watch finds it: in a fork, on the repository it was forked from first (forks.ts).
+  if (auth.kind === "ok" && scope.repo && scope.branch) {
+    const found = await findBranchPull(client, { repo: scope.repo, branch: scope.branch, upstream: scope.upstream }, parents);
+    const where = found.kind === "ok" && found.value && found.value.repo.toLowerCase() !== scope.repo.toLowerCase() ? ` on ${found.value.repo} (this clone is a fork of it)` : "";
+    pr = found.kind === "ok" ? (found.value === null ? "no open pull request" : `#${found.value.pr}${where}`) : `could not ask GitHub (${found.kind})`;
+  }
+  const rows = mergeRows(local, live, firstCallRows(readFirstCall(process.env), checks), [channelRow(launch, liveEventsBlocker(process.env)?.provider ?? null)]);
   process.stdout.write(
     `runners-io-channel ${VERSION}\n${login}\nrepository: ${scope.repo ?? "none"}, branch: ${scope.branch ?? "none"}, pull request: ${pr}\n` +
       `automatic subscription: ${config.autoSubscribe}, every ${config.pollSeconds} s; event log: ${config.eventLogDir ?? "off"}\n` +

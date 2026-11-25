@@ -6,6 +6,7 @@
 import { type LaunchState, relaunchSentence } from "../../hooks/launch.mjs";
 import type { Row } from "../../hooks/readiness.mjs";
 import type { FirstCallRecorder } from "./firstcall.ts";
+import type { ForkParents } from "./forks.ts";
 import type { GitHubClient } from "./github.ts";
 
 /**
@@ -13,10 +14,18 @@ import type { GitHubClient } from "./github.ts";
  * with none, for the login itself). The client reports what the answer says, so the record the rows below are read
  * from is as of now.
  */
-export async function liveRow(client: GitHubClient, repo: string | null, firstCall: Pick<FirstCallRecorder, "fork"> | null): Promise<Row> {
+export async function liveRow(
+  client: GitHubClient,
+  repo: string | null,
+  firstCall: Pick<FirstCallRecorder, "fork"> | null,
+  parents: Pick<ForkParents, "learn"> | null = null,
+): Promise<Row> {
   const id = "github_answers";
   const label = repo ? "GitHub answers for this repository" : "GitHub answers for this login";
   const r = repo ? await client.repoInfo(repo) : await client.viewerLogin();
+  // The answer also says whether the repository is a fork and of what, which finding the branch's pull request needs
+  // (forks.ts): handed on, so that the doctor's one live call stays one.
+  if (repo) parents?.learn(repo, r.kind === "ok" && typeof r.value === "object" ? r.value : null);
   if (r.kind === "ok") {
     if (repo && typeof r.value === "object") firstCall?.fork(r.value.fork);
     return { id, label, state: "ready", why: "asked just now" };
@@ -36,10 +45,15 @@ export async function liveRow(client: GitHubClient, repo: string | null, firstCa
   };
 }
 
-/** Whether this session was started with the channel flag, when `status` is run from inside one (the doctor skill). */
-export function channelRow(state: LaunchState): Row {
+/**
+ * Whether this session was started with the channel flag, when `status` is run from inside one (the doctor skill).
+ * `unavailableOn`: the provider Claude Code is set to that takes no channels at all (readiness.mjs liveEventsBlocker);
+ * then the flag is beside the point, and the row never tells the user to relaunch with it.
+ */
+export function channelRow(state: LaunchState, unavailableOn: string | null = null): Row {
   const id = "channel_off";
   const label = "live CI events are on in this session";
+  if (unavailableOn) return { id, label, state: "skipped", why: `live CI events are not available on ${unavailableOn}` };
   if (state === "on") return { id, label, state: "ready" };
   if (state === "headless") return { id, label, state: "skipped", why: "a headless run (claude -p) takes no channel" };
   if (state === "unknown") return { id, label, state: "unknown", why: "not run from inside a Claude Code session, or its flags cannot be read" };

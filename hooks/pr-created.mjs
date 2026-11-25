@@ -6,9 +6,10 @@
 // A prompt to subscribe can be ignored, and most PRs are opened by scripts whose command never says `gh pr create`,
 // so the hook hands the PR over instead: a file per PR under `<shared root>/requests/<claude pid>/`, which the
 // channel (channel/src/hookrequests.ts) reads. A PR URL in output is text anyone can write (a log, a README, a
-// comment), so only a PR in the repository the session's folder belongs to is handed over, only when the channel is
-// on and automatic subscription is not off; the channel then keeps it only if GitHub says it is open, was created
-// minutes ago and was opened by the signed-in login. Otherwise Claude is asked to subscribe, as before.
+// comment), so only a PR in the repository the session's folder belongs to is handed over (or, when the folder's
+// clone is a fork, in the repository its `upstream` remote names, where a fork's pull requests are opened), only when
+// the channel is on and automatic subscription is not off; the channel then keeps it only if GitHub says it is open,
+// was created minutes ago and was opened by the signed-in login. Otherwise Claude is asked to subscribe, as before.
 //
 // It never blocks anything: every path exits 0, and it prints nothing unless
 // it found the PR it is talking about. Dependency-free plain JavaScript, so it
@@ -56,9 +57,14 @@ function text(value) {
   }
 }
 
+/** The session's repositories as a list: `own` is one `owner/name`, or several (a fork and the repository it was forked from). */
+function repos(own) {
+  return (Array.isArray(own) ? own : [own]).filter((r) => typeof r === "string" && r).map((r) => r.toLowerCase());
+}
+
 /**
  * The PR this session just opened, as text asking Claude to subscribe, or null. `own` is the session folder's
- * repository. Only the create's own result counts: for Bash, the last line of output when that line is nothing but the
+ * repository, or a list of them (a fork's own and the one it was forked from). Only the create's own result counts: for Bash, the last line of output when that line is nothing but the
  * PR's address (what `gh pr create` prints), and only a PR in `own`. Anything else in the output -- a log, a README, a
  * failed create's text -- is whoever wrote it, so a stranger's PR address there is never offered to Claude.
  */
@@ -76,10 +82,11 @@ export function contextFor(input, own) {
   );
 }
 
-/** The PR a create in this tool call made, in the session's own repository `own`, or null (see contextFor). */
+/** The PR a create in this tool call made, in one of the session's own repositories `own`, or null (see contextFor). */
 export function createdPr(input, own) {
   if (!input || typeof input !== "object" || Array.isArray(input)) return null;
-  if (typeof own !== "string" || !own) return null;
+  const session = repos(own);
+  if (!session.length) return null;
   const tool = typeof input.tool_name === "string" ? input.tool_name : "";
   let m = null;
   if (tool === "Bash") {
@@ -98,7 +105,7 @@ export function createdPr(input, own) {
   const repo = `${m[1]}/${m[2].replace(/\.git$/, "")}`;
   const pr = Number(m[3]);
   if (!Number.isSafeInteger(pr) || pr < 1) return null;
-  if (repo.toLowerCase() !== own.toLowerCase()) return null;
+  if (!session.includes(repo.toLowerCase())) return null;
   return { repo, pr };
 }
 
@@ -184,27 +191,40 @@ export function repoOfRemote(url) {
   return m && m[2] !== "." && m[2] !== ".." ? `${m[1]}/${m[2]}` : null;
 }
 
-/** The repository the session's folder belongs to: its `origin` remote on GitHub, or null. */
-function repoOfFolder(cwd) {
+/** The GitHub repository a remote of the session's folder names, or null. */
+function repoOfFolder(cwd, remote = "origin") {
   if (typeof cwd !== "string" || !cwd) return null;
   try {
-    return repoOfRemote(execFileSync("git", ["-C", cwd, "remote", "get-url", "origin"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }));
+    return repoOfRemote(execFileSync("git", ["-C", cwd, "remote", "get-url", remote], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }));
   } catch {
     return null;
   }
 }
 
 /**
- * The text for Claude, or null. `launch` is called only when the output names a PR (it walks the process table);
- * `repoOf` gives the session folder's repository; `env` carries the plugin's settings.
+ * The repository the folder's clone was forked from, as the clone says it: its `upstream` remote on GitHub, or null.
+ * The channel also asks GitHub (channel/src/forks.ts); the hook makes no request, so it knows a parent only by this
+ * remote. Without one, the channel's own watch of the branch finds a pull request on the parent a little later.
  */
-export function handle(input, { launch, root, now, env = process.env, repoOf = repoOfFolder }) {
+function parentOfFolder(cwd) {
+  return repoOfFolder(cwd, "upstream");
+}
+
+/**
+ * The text for Claude, or null. `launch` is called only when the output names a PR (it walks the process table);
+ * `repoOf` gives the session folder's repository and `parentOf` the one it was forked from, if the clone says so;
+ * `env` carries the plugin's settings.
+ */
+export function handle(input, { launch, root, now, env = process.env, repoOf = repoOfFolder, parentOf = parentOfFolder }) {
   const prs = prsIn(input);
   if (!prs.length) return null;
-  const own = repoOf(input?.cwd);
+  const origin = repoOf(input?.cwd);
+  // The session's own repositories: the folder's, and for a fork the one its pull requests are opened on.
+  const own = origin ? [origin, parentOf(input?.cwd)].filter(Boolean) : [];
   const prompt = contextFor(input, own);
   if (String(env.RUNNERS_IO_AUTO_SUBSCRIBE ?? "").trim().toLowerCase() === "off") return prompt;
-  const mine = own ? prs.filter((p) => p.repo.toLowerCase() === own.toLowerCase()) : [];
+  const session = repos(own);
+  const mine = prs.filter((p) => session.includes(p.repo.toLowerCase()));
   if (!mine.length) return prompt;
   const l = launch();
   if (l?.state !== "on" || !l.claudePid) return prompt;

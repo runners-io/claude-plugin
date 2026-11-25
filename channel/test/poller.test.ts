@@ -128,12 +128,15 @@ test("off means no automatic subscription", async () => {
 });
 
 test("a fork PR's failure reaches Claude as tell the user, not as read the log", async () => {
-  const t = await setup();
+  // Watched because Claude subscribed to it: the branch watch never takes a stranger's fork's pull request for the
+  // session's own, since GitHub answers `head=owner:branch` by the head repository's owner.
+  const t = await setup({ autoSubscribe: "off" });
   try {
     // As on GitHub: a fork PR's runs live in the base repository and name the fork as their head repository.
     const fork = { full_name: "stranger/widgets" };
     t.gh.setPull("acme/widgets", 7, { head: { repo: fork } });
     t.gh.setRuns("acme/widgets", SHA, [{ id: 41, name: "CI", status: "queued", head_repository: fork }]);
+    await t.tools.call("subscribe", { repo: "acme/widgets", pr: 7 });
     await until("baseline", () => t.subs.list()[0]?.last !== null && t.subs.list().length === 1);
     t.gh.setJobs(41, [{ name: "unit tests", conclusion: "failure" }]);
     t.gh.setRuns("acme/widgets", SHA, [{ id: 41, name: "CI", status: "completed", conclusion: "failure", head_repository: fork }]);

@@ -23,6 +23,8 @@ export function fakeMachine({ gh = "signed-in", git = true, hosts, env = {} } = 
   const bin = join(root, "bin");
   mkdirSync(bin);
   mkdirSync(join(root, "gh"));
+  // Where this "machine" keeps an organisation's managed Claude Code settings: empty, so the real machine's are never read.
+  mkdirSync(join(root, "managed"));
   if (gh) {
     writeFileSync(join(bin, "gh"), FAKE_GH);
     chmodSync(join(bin, "gh"), 0o755);
@@ -40,6 +42,7 @@ export function fakeMachine({ gh = "signed-in", git = true, hosts, env = {} } = 
       GH_CONFIG_DIR: join(root, "gh"),
       FAKE_GH: gh ?? "",
       FAKE_GH_LOG: join(root, "gh.log"),
+      RUNNERS_IO_TEST_MANAGED_SETTINGS_DIR: join(root, "managed"),
       ...env,
     },
   };

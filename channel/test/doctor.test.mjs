@@ -1,7 +1,7 @@
 // `runners-io-channel status`, which the doctor skill runs: every setup check on a line, with one live GitHub call.
 // The BUNDLE, as a user runs it, against a fake GitHub; plain JavaScript so it also runs on Node 20.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
@@ -18,13 +18,15 @@ after(async () => {
   for (const c of cleanup) await c();
 });
 
-async function status({ machine = {}, repo = {}, github = {} } = {}) {
+async function status({ machine = {}, repo: { branch, ...repo } = {}, github = {}, pulls = [] } = {}) {
   const gh = await startFakeGitHub({ token: TOKEN });
   cleanup.push(() => gh.close());
   Object.assign(gh.state, github);
+  for (const [name, number, fields] of pulls) gh.setPull(name, number, fields);
   const m = fakeMachine(machine);
   cleanup.push(() => rmSync(m.root, { recursive: true, force: true }));
   const dir = project(m, repo);
+  if (branch) execFileSync("git", ["-C", dir, "checkout", "-q", "-b", branch]);
   const env = { ...m.env, CLAUDE_PROJECT_DIR: dir, RUNNERS_IO_GITHUB_API: gh.base, RUNNERS_IO_TEST_FAKE_GITHUB: "1", RUNNERS_IO_TEST_GITHUB_TOKEN: TOKEN };
   // Asynchronously: the fake GitHub lives in this process, and a synchronous spawn would never let it answer.
   const child = spawn(process.execPath, [bundle, "status"], { env, stdio: ["ignore", "pipe", "pipe"] });
@@ -61,12 +63,37 @@ test("status on a machine with no git: the blocker is NOT READY with its fix, an
   assert.match(line(r.stdout, "the session's folder is a git repository"), /^ {2}skipped /);
 });
 
-test("status finds a fork from GitHub's own answer, says so, and notes it for the next launch without naming the repository", async () => {
-  const r = await status({ github: { repos: new Map([["acme/widgets", { fork: true, private: false }]]) } });
-  assert.match(line(r.stdout, "the clone is not a fork"), /^ {2}NOT READY .*\[info; fork\]: this repository is a fork on GitHub/);
+test("status finds a fork from GitHub's own answer, says where its pull request is looked for, and notes it for the next launch without naming the repository", async () => {
+  const r = await status({
+    repo: { branch: "feat" },
+    github: { repos: new Map([["acme/widgets", { fork: true, private: false, parent: { full_name: "upstream-org/widgets" } }]]) },
+    pulls: [["upstream-org/widgets", 7, { head: { ref: "feat", sha: "c".repeat(40), repo: { full_name: "acme/widgets" } } }]],
+  });
+  assert.match(line(r.stdout, "a fork's pull request on the repository it was forked from is found"), /^ {2}ready .*GitHub says this repository is a fork/);
+  assert.match(r.stdout, /pull request: #7 on upstream-org\/widgets \(this clone is a fork of it\)$/m, "found on the repository GitHub named as the parent");
+  assert.equal(r.gh.requests.filter((q) => q.path === "/repos/acme/widgets").length, 1, "the checks' one live call is also what says it is a fork: not asked twice");
   const record = readFileSync(join(r.m.env.XDG_STATE_HOME, "runners-io", "first-call.json"), "utf8");
   assert.match(record, /"fork"/);
-  assert.equal(/acme|widgets/.test(record), false);
+  assert.equal(/acme|widgets|upstream-org/.test(record), false);
+});
+
+test("status in a fork: the branch's pull request on the upstream repository is the one it would watch", async () => {
+  const r = await status({
+    repo: { origin: "https://github.com/ada/widgets.git", upstream: "git@github.com:acme/widgets.git", branch: "feat" },
+    pulls: [["acme/widgets", 7, { head: { ref: "feat", sha: "c".repeat(40), repo: { full_name: "ada/widgets" } } }]],
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /^repository: ada\/widgets, branch: feat, pull request: #7 on acme\/widgets \(this clone is a fork of it\)$/m);
+  assert.match(line(r.stdout, "a fork's pull request on the repository it was forked from is found"), /^ {2}ready .*this clone has an upstream remote on GitHub/);
+  assert.equal(r.gh.requests.some((q) => /^\/repos\/acme\/widgets\/pulls\?head=ada%3Afeat&/.test(q.path)), true);
+});
+
+test("status with Claude Code on Amazon Bedrock: live CI events are not available there, and the session's own row does not tell the user to relaunch", async () => {
+  const r = await status({ machine: { env: { CLAUDE_CODE_USE_BEDROCK: "1" } } });
+  assert.match(line(r.stdout, "Claude Code can deliver live CI events"), /^ {2}NOT READY .*\[info; live_events\]: Claude Code is set to use Amazon Bedrock \(CLAUDE_CODE_USE_BEDROCK\)/);
+  assert.match(line(r.stdout, "live CI events are on in this session"), /^ {2}skipped .*not available on Amazon Bedrock/);
+  const ready = await status();
+  assert.match(line(ready.stdout, "Claude Code can deliver live CI events"), /^ {2}ready /);
 });
 
 test("status when GitHub does not show the repository to this login: NOT READY, and it says what that usually means", async () => {

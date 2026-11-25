@@ -38,7 +38,11 @@ export function projectKey(dir: string): string;
 export function ownerKey(owner: string): string;
 export function loginHost(env?: Env): string;
 
-export function launchChecks(options?: { env?: Env; projectDir?: string; platform?: string }): Promise<Row[]>;
+/** `launchState`: how the session was started (hooks/launch.mjs), when the caller knows. */
+export function launchChecks(options?: { env?: Env; projectDir?: string; platform?: string; launchState?: string; nodeVersion?: string }): Promise<Row[]>;
+/** The provider Claude Code is set to that takes no channels (Amazon Bedrock, Google Cloud, Microsoft Foundry), or null. */
+export function liveEventsBlocker(env?: Env): { variable: string; provider: string } | null;
+export function managedChannels(env?: Env, platform?: string): boolean | "unset" | null;
 export function firstCallRows(record: FirstCallRecord, options?: { env?: Env; projectDir?: string; platform?: string }): Row[];
 export function mergeRows(...lists: readonly (readonly Row[])[]): Row[];
 export function findings(rows: readonly Row[]): Row[];

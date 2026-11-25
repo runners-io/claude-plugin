@@ -117,7 +117,8 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
       }
       const [owner, branch] = (url.searchParams.get("head") ?? "").split(":");
       const open = [...state.pulls.entries()]
-        .filter(([k, p]) => k.startsWith(`${repo}#`) && p.state === "open" && p.head.ref === branch && owner === m[1])
+        // As GitHub answers `head=owner:branch`: the head's own repository's owner, which for a fork's PR is the fork's.
+        .filter(([k, p]) => k.startsWith(`${repo}#`) && p.state === "open" && p.head.ref === branch && (p.head.repo?.full_name ?? repo).split("/")[0] === owner)
         .map(([, p]) => p);
       return send(req, res, 200, open);
     }

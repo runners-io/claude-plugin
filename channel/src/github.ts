@@ -160,6 +160,14 @@ export interface RunInfo {
   readonly triggeringActor?: string;
 }
 
+/** A repository as the setup checks and the fork lookup read it. */
+export interface RepoInfo {
+  readonly fork: boolean;
+  readonly private: boolean;
+  /** `owner/name` of the repository this one was forked from, or null. */
+  readonly parent: string | null;
+}
+
 export type ApiResult<T> =
   | { readonly kind: "ok"; readonly value: T }
   | { readonly kind: "auth"; readonly auth: GhProblem }
@@ -234,6 +242,9 @@ const nullString = (v: unknown): boolean => v === null || typeof v === "string";
 const runShape = (r: Loose): boolean =>
   isId(r.id) && typeof r.name === "string" && typeof r.status === "string" && RUN_STATUSES.has(r.status) && (r.conclusion === null || (typeof r.conclusion === "string" && CONCLUSIONS.has(r.conclusion)));
 
+/** A repository as `owner/name`, in the characters GitHub allows: nothing else is ever put into a request path. */
+const REPO_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}$/;
+
 /**
  * What a stored answer must look like to be used (shared.ts): another process of this user can write the store, and
  * a run's or job's id goes into a `gh run view` sentence, its status decides the cadence and the events.
@@ -244,6 +255,10 @@ const STORED = {
   baseRuns: (v: unknown) => each(v, runShape),
   jobs: (v: unknown) => each(v, (j) => runShape(j) && Array.isArray(j.labels) && typeof j.url === "string"),
   prNumber: (v: unknown) => v === null || isId(v),
+  repo: (v: unknown) => {
+    const r = (v ?? {}) as Loose;
+    return v !== null && typeof v === "object" && typeof r.fork === "boolean" && typeof r.private === "boolean" && (r.parent === null || (typeof r.parent === "string" && REPO_NAME.test(r.parent)));
+  },
 };
 /** A token is re-read from gh this often, so a `gh auth login` as another account is picked up. */
 const TOKEN_TTL_MS = 5 * 60_000;
@@ -292,9 +307,6 @@ const CERT_ERRORS = new Set([
   "CERT_UNTRUSTED",
   "ERR_TLS_CERT_ALTNAME_INVALID",
 ]);
-
-/** A repository as `owner/name`, in the characters GitHub allows: nothing else is ever put into a request path. */
-const REPO_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}$/;
 
 /** One `x-ratelimit-*` reading: when it was taken, and the reset as epoch milliseconds. */
 type RateReading = { remaining: number; at: number; limit?: number; reset?: number };
@@ -398,15 +410,23 @@ export class GitHubClient {
   }
 
   /**
-   * The repository itself, for the setup checks' one live call (`status`): whether GitHub shows it to this login, and
-   * whether it is a fork. A name GitHub would not allow is not_found, without a request.
+   * The repository itself: whether GitHub shows it to this login, whether it is a fork, and of which repository
+   * (`parent`, null when it is no fork or GitHub names none a repository could have). Read for the setup checks' one
+   * live call (`status`, always asked), and once a session to find a fork's pull request (forks.ts, with `freshMs` so
+   * the machine's sessions share the answer). A name GitHub would not allow is not_found, without a request.
    */
-  async repoInfo(repo: string): Promise<ApiResult<{ fork: boolean; private: boolean }>> {
+  async repoInfo(repo: string, freshMs = 0): Promise<ApiResult<RepoInfo>> {
     if (!REPO_NAME.test(repo)) return { kind: "not_found" };
-    return this.get(`/repos/${repo}`, 0, (j) => {
-      const r = (j ?? {}) as { fork?: unknown; private?: unknown };
-      return { fork: r.fork === true, private: r.private === true };
-    });
+    return this.get(
+      `/repos/${repo}`,
+      freshMs,
+      (j) => {
+        const r = (j ?? {}) as { fork?: unknown; private?: unknown; parent?: { full_name?: unknown } | null };
+        const parent = r.parent?.full_name;
+        return { fork: r.fork === true, private: r.private === true, parent: typeof parent === "string" && REPO_NAME.test(parent) ? parent : null };
+      },
+      STORED.repo,
+    );
   }
 
   getPull(repo: string, pr: number): Promise<ApiResult<PullInfo>> {
@@ -434,9 +454,12 @@ export class GitHubClient {
     });
   }
 
-  findOpenPull(repo: string, branch: string): Promise<ApiResult<number | null>> {
-    const owner = repo.split("/")[0];
-    const q = new URLSearchParams({ head: `${owner}:${branch}`, state: "open", per_page: "5" });
+  /**
+   * The open pull request in `repo` whose head is `headOwner`'s branch `branch`: the repository's own owner by
+   * default, a fork's owner for a fork's pull request on the repository it was forked from (forks.ts).
+   */
+  findOpenPull(repo: string, branch: string, headOwner: string = repo.split("/")[0]): Promise<ApiResult<number | null>> {
+    const q = new URLSearchParams({ head: `${headOwner}:${branch}`, state: "open", per_page: "5" });
     return this.get(`/repos/${repo}/pulls?${q}`, this.freshMs, (j) => {
       const first = Array.isArray(j) ? (j[0] as { number?: unknown } | undefined) : undefined;
       return first && isId(first.number) ? first.number : null;

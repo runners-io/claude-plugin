@@ -13,7 +13,10 @@ The plugin bundles four things:
   preview too.
 - **Tools to choose what to watch**, per session: `subscribe`, `unsubscribe`, `list_subscriptions`, `ci_status`, `mute` and `unmute`.
 - **A hook** that watches a pull request just opened in your session's own repository, by your GitHub login, whether
-  Claude or a script opened it. A pull request anywhere else is never watched without Claude subscribing to it.
+  Claude or a script opened it (in a fork: also one opened on the repository you forked from). A pull request anywhere
+  else is never watched without Claude subscribing to it.
+- **Forks and company proxies handled.** In a fork, the pull request on the repository you forked from is the one
+  watched. Behind a proxy, `HTTPS_PROXY` and `NO_PROXY` are used as `gh` uses them, on every Node.js from 20.
 - **Setup checks at launch**: when your machine is missing something the plugin needs (the GitHub CLI, its login,
   git, Node.js), it says so in one line and Claude offers the fix, asking first. A machine that is ready hears nothing.
   See [Setup checks](#setup-checks).
@@ -31,11 +34,11 @@ in to github.com. If you don't have `gh`, the plugin's `setup-github` skill walk
 your agreement, and you sign in with `! gh auth login --web --scopes repo`.
 
 ```bash
-claude plugin marketplace add runners-io/claude-plugin#v0.3.14
+claude plugin marketplace add runners-io/claude-plugin#v0.3.15
 claude plugin install runners-io@runners-io
 ```
 
-This installs exactly one release: every release has a new version and a tag of its own (`v0.3.14` is this one), and
+This installs exactly one release: every release has a new version and a tag of its own (`v0.3.15` is this one), and
 the `#` and tag pin the marketplace to it. We do not move a release tag once it is published, so updating that
 marketplace never takes you past the release you chose. To move to a newer release, run
 `claude plugin marketplace remove runners-io` (which uninstalls the plugin), then the two commands above with the newer
@@ -63,7 +66,7 @@ Or from inside a session: `/plugin marketplace add runners-io/claude-plugin`, th
 To install from a copy you have checked out and read yourself:
 
 ```bash
-git clone --branch v0.3.14 --depth 1 https://github.com/runners-io/claude-plugin.git
+git clone --branch v0.3.15 --depth 1 https://github.com/runners-io/claude-plugin.git
 claude plugin marketplace add ./claude-plugin
 claude plugin install runners-io@runners-io
 ```
@@ -127,6 +130,11 @@ development flag:
 `allowedChannelPlugins` replaces Anthropic's list for your organisation, so include any other channel plugins you
 use. Pro, Max and Ultra accounts outside an organisation skip both settings.
 
+Channels need Claude Code signed in to Anthropic itself, with a claude.ai account or a Claude Console API key. They
+are not available when Claude Code runs on Amazon Bedrock, Google Cloud's Agent Platform (Vertex AI) or Microsoft
+Foundry: there the plugin says so once at launch instead of telling you to relaunch, and `ci_status` still reads CI
+on request.
+
 ## Setup checks
 
 At every launch the plugin checks whether your machine is ready for it. **A machine that is ready adds nothing to the
@@ -147,9 +155,21 @@ The launch checks are local: no network call, and well under a second.
 | the plugin's data folder cannot be written | degrades | which folder, and what is off without it |
 | `GH_TOKEN` / `GITHUB_TOKEN` is set over `gh`'s own login | degrades, said once per project | which variable is in use, and what to do if reads are refused |
 | `gh` holds several accounts | degrades, said once per project | `gh auth switch`, if the active one is the wrong one |
-| `HTTPS_PROXY` is set | degrades, said once per project | the channel does not use the proxy yet; with Node.js 24 or later, `NODE_USE_ENV_PROXY=1` makes Node use it |
+| `HTTPS_PROXY` names a proxy the channel cannot use (a SOCKS proxy, or no address) | degrades, said once per project | the channel uses `http://` and `https://` proxies only, and asks GitHub directly meanwhile |
+| Claude Code is started with the channel flag on Amazon Bedrock, Google Cloud's Agent Platform (Vertex AI) or Microsoft Foundry | degrades | nothing to install: Claude Code delivers no channel events there, so the flag brings none; `ci_status` still reads CI |
 | Windows | degrades, said once per project | the plugin cannot read the launch there, or set up `claude-gh` |
-| the folder is not a git repository; origin is not on GitHub; there are no workflow files; the clone has an `upstream` remote (a fork) | info, said once per project | nothing to fix: what the plugin will not do here |
+| Claude Code is set to Bedrock, Vertex AI or Foundry (`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_MANTLE`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`), and the session has no channel flag | info, said once per project | nothing to fix: live CI events are not available there; `ci_status` still reads CI |
+| the machine has managed Claude Code settings that do not set `channelsEnabled` | info, said once per project | nothing for you to install: an Owner switches channels on; said as probable, since settings sent from the admin console cannot be read here |
+| the folder is not a git repository; origin is not on GitHub; there are no workflow files | info, said once per project | nothing to fix: what the plugin will not do here |
+
+Where live CI events cannot arrive (the Bedrock, Vertex AI and Foundry rows), the launch line that tells you how to
+relaunch with the channel flag, and the offer of `claude-gh`, are left out: neither would bring any. An API key is no
+such case: Claude Code takes channels with a Claude Console API key as with a claude.ai login.
+
+**Two things that used to be on this list are now simply handled.** Behind a company proxy the channel sends its
+GitHub requests through it ([below](#behind-a-company-proxy)), and in a fork it watches the pull request on the
+repository the clone was forked from ([Choosing what to watch](#choosing-what-to-watch)). The doctor shows both as
+`ready`, with the proxy's host and port, or the reason the fork was recognised.
 
 Some problems show only in GitHub's answers, so the channel notes them and **the next launch** reports them: a login
 GitHub refuses (blocks), a certificate that does not verify, as on a network that inspects HTTPS (blocks; the fix is
@@ -175,10 +195,44 @@ node <the plugin's folder>/channel/dist/runners-io-channel.mjs status
 
 On Windows the Node.js check relies on Claude Code running hook commands through Git Bash.
 
+### Behind a company proxy
+
+The channel reads `https_proxy` or `HTTPS_PROXY` (the lower-case one first) and `no_proxy` or `NO_PROXY`, the way `gh`
+and curl do, on every Node.js it supports (20 or later). Node's own `fetch` ignores them, and only Node.js 24 and late
+22 can be told otherwise, so the channel makes the request itself: a `CONNECT` to the proxy naming GitHub's host, then
+the TLS handshake with GitHub inside that tunnel. With no proxy variable set, nothing changes: Node's own `fetch` is
+used, exactly as before. And if you have told Node.js to read the proxy variables itself (`NODE_USE_ENV_PROXY=1`, on
+Node.js 24, or 22.21 and later), the channel stands aside and Node's own `fetch` does it.
+
+- **What the proxy sees:** the host it is asked to connect to (`api.github.com:443`) and encrypted bytes. It is never
+  handed your GitHub token or any header of the request, and GitHub's certificate is checked as always. On a network
+  that inspects HTTPS, set `NODE_EXTRA_CA_CERTS` to your company's root certificate; the setup checks say so when a
+  certificate does not verify.
+- **A proxy's own login** (`http://user:password@proxy:8080`) is sent to the proxy in that `CONNECT` and nowhere else.
+  It is never printed, logged or written to a file: the channel's log and the doctor name the proxy's host and port
+  only.
+- **`NO_PROXY`** lists hosts that are asked directly: a name matches itself and every name below it (`github.com`,
+  `.github.com` and `*.github.com` all cover `api.github.com`), `host:port` matches that port only, and `*` is every
+  host. An address range (`10.0.0.0/8`) is not read.
+- **Not supported:** a SOCKS proxy, a proxy found through a PAC file, and a proxy that wants NTLM or Kerberos. The
+  channel then asks GitHub directly, as it did before, and the setup checks say that the proxy is one it cannot use.
+- If the proxy refuses or cannot be reached, the request is not sent some other way: the doctor's GitHub line reads
+  `unknown` with the proxy's host and its answer (for example `HTTP 407`).
+
 ## Choosing what to watch
 
 **Automatically:** the pull request for the branch your session's folder is on. The channel reads the repository from
 `git remote get-url origin` and the branch from `git branch --show-current`, and follows you when you switch branch.
+
+**In a fork**, that pull request usually lives on the repository you forked from, with your fork's branch as its head
+(`you:fix-login` on `acme/widgets`), so the channel looks there first and in your fork after it. It knows the
+repository you forked from by your clone's `upstream` remote, when that is a GitHub repository; without one it asks
+GitHub once which repository yours was forked from. A pull request you open there with `gh pr create` is watched as
+one in your own repository is (the hook below reads the `upstream` remote; without one, the branch watch finds it
+within a minute or so). A failure on it is reported with "comes from a fork": Claude tells you and reads the log when
+you ask, as for any fork's pull request.
+
+
 The automatic watch, and the hook's watch of a pull request just opened (below), send every kind except
 `ci.workflow_succeeded`, `ci.workflow_started` and `ci.job_stuck_queued`:
 `ci.run_all_done` says when all CI has finished, which workflows did not succeed and whether the pull request may be
@@ -253,7 +307,9 @@ Only a repository can be a scope: an organisation or a whole account is refused.
 
 **A pull request just opened in this repository** is watched without a subscribe call when a tool's output names it,
 whether Claude ran `gh pr create` or a script opened it, but only when all of these hold: it is in the repository your
-session's folder belongs to; GitHub says your login opened it, minutes ago; the channel is on; and `auto_subscribe` is
+session's folder belongs to, or, when your clone is a fork, in the repository it was forked from (its `upstream`
+remote, or what GitHub answered when the branch's pull request was looked for); GitHub says your login opened it,
+minutes ago; the channel is on; and `auto_subscribe` is
 not `off`. A pull request URL in a log, a README or a comment is text anyone can write, so nothing else is watched
 this way. The hook adds at most 5 pull requests, and a session watches at most 20 in all; past a budget of events for
 one pull request in 10 minutes, the channel says so once and holds back the rest. **When Claude opens a pull request
@@ -368,13 +424,17 @@ reset, and when GitHub refuses a request for the limit, the channel waits until 
 ## What is sent, and what is never sent
 
 **From your machine to GitHub, with your own `gh` login:** requests to read the signed-in login's name (`/user`), the
-open pull request for the current branch, the open pull requests of each repository a scope covers, the watched pull
+open pull request for the current branch (in a fork, asked of the repository it was forked from as well), the
+repository itself once a session, to see whether it is a fork and of which repository (not asked when your clone has
+an `upstream` remote), the open pull requests of each repository a scope covers, the watched pull
 requests, the workflow runs on each one's head commit, the
 jobs of each run that has not finished and of a failed run, a failed job's annotations (file, line and level only),
 the latest push runs on each watched pull request's base branch, and, through GraphQL, each watched pull request's
 reviews, review threads and merge state; with review requests on (`RUNNERS_IO_REVIEW_REQUESTS=on`), also a GraphQL
-search for the review requests made of your login; and, only when the doctor (the `status` command) is run, the
+search for the review requests made of your login; and, when the doctor (the `status` command) is run, the
 repository itself, to see that GitHub shows it to your login and whether it is a fork. Nothing is written to GitHub.
+With `HTTPS_PROXY` set, these requests go to GitHub through your proxy's `CONNECT` tunnel
+([Behind a company proxy](#behind-a-company-proxy)): the proxy learns the host and carries encrypted bytes.
 
 **To runners.io, by the channel:** nothing.
 
@@ -408,7 +468,9 @@ in memory, and never writes it to a file or a log.
 
 **Your GitHub token.** The channel asks `gh auth token` for it when it starts, and again every few minutes, or reads
 `GH_TOKEN` / `GITHUB_TOKEN` if you set one. It keeps it in memory only. It sends it in one place: the
-`Authorization` header of its requests to `https://api.github.com`. For GitHub Enterprise Server, set
+`Authorization` header of its requests to `https://api.github.com`. Behind a proxy (`HTTPS_PROXY`) that header is
+written only inside TLS to GitHub, through the proxy's tunnel, so the proxy cannot read it; a redirect is never
+followed, with or without a proxy, so the token is not carried to another address. For GitHub Enterprise Server, set
 `RUNNERS_IO_GITHUB_API` to your server's https API address: the channel then reads that server's own login
 (`gh auth token --hostname <your server>`, with its port if the address has one, or `GH_ENTERPRISE_TOKEN` /
 `GITHUB_ENTERPRISE_TOKEN` only when `GH_HOST` names that same server, since those two variables name no host of their own), never your github.com token, so a token
@@ -460,8 +522,9 @@ terminal. Each is started with a fixed list of
 arguments, never through a shell with text from GitHub, and nothing from an event is ever run or evaluated. The
 setup-github skill edits your shell's rc file only after asking you, and shows the lines first. The setup checks at
 launch run `gh auth token` (to see that gh has a login; the token is not kept) and `git` in the session's folder,
-read the account names in gh's own `hosts.yml`, and write a file into each of the plugin's own folders to see that
-they can. They make no network call.
+read the account names in gh's own `hosts.yml`, read whether an organisation's managed Claude Code settings file on
+the machine sets `channelsEnabled` (that one key, nothing else of the file), and write a file into each of the
+plugin's own folders to see that they can. They make no network call.
 
 **Reporting a vulnerability.** See [SECURITY.md](SECURITY.md).
 
@@ -476,6 +539,8 @@ These are read from the environment you start Claude Code from. None is needed.
 | `RUNNERS_IO_POLL_SECONDS` | `20` | seconds between looks at a pull request whose CI is running, 5 to 300; the slower looks are never shorter than this |
 | `RUNNERS_IO_RATE_FLOOR` | `200` | below this many GitHub requests left in the hour, look four times less often (on top of the backoff at 30% and 15% left). Raise it when the same `gh` login also drives other tools |
 | `RUNNERS_IO_EVENT_LOG_DIR` | off | an absolute directory for the event log (below) |
+| `https_proxy`, `HTTPS_PROXY` | unset | the `http://` or `https://` proxy the channel reaches GitHub through ([Behind a company proxy](#behind-a-company-proxy)); the lower-case name is read first |
+| `no_proxy`, `NO_PROXY` | unset | hosts asked directly, past the proxy |
 
 ### The event log
 
@@ -526,6 +591,14 @@ The script exits 0 when it finds nothing, 1 on a miss, a gap or an error, and 2 
   `runners-io` server should be connected. Run `node …/channel/dist/runners-io-channel.mjs status` in the repository to
   see the GitHub login, the repository, the branch and the pull request the channel would watch. Start with
   `claude --debug …` and read the channel's lines (`[runners-io-channel]`) in `~/.claude/debug/<session>.txt`.
+- **Behind a company proxy.** The channel uses `HTTPS_PROXY` and `NO_PROXY` as `gh` does
+  ([Behind a company proxy](#behind-a-company-proxy)). The doctor's line "GitHub is reached directly, or through a
+  proxy the channel can use" says which way it goes, and its GitHub line says what the proxy answered when it refused.
+- **A fork, and nothing is watched.** The channel looks for your branch's pull request on the repository you forked
+  from, then in your fork. `status` prints the pull request it would watch and on which repository. A pull request
+  whose head is another branch than the one you are on is not the branch's: name it to `subscribe`.
+- **Claude Code on Bedrock, Vertex AI or Foundry.** Claude Code delivers no channel events there, so nothing is pushed
+  whatever flag the session is started with. Ask Claude for a pull request's CI (`ci_status`), which works everywhere.
 - **"the GitHub CLI (gh) is not installed / not signed in".** Ask Claude to use the `setup-github` skill.
 - **"no repo scope", or "GitHub no longer shows PR #n".** A private repository needs a `gh` login with the `repo` scope:
   `gh auth refresh --hostname github.com --scopes repo`. An organisation that enforces SSO needs the token authorised

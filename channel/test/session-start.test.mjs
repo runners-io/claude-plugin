@@ -210,3 +210,39 @@ test("run as Claude Code runs it on a machine with no gh: the JSON it prints car
   assert.match(out.systemMessage, /^runners\.io: the GitHub CLI isn't installed, so CI can't be read\. Ask me to set it up\./);
   assert.match(out.hookSpecificOutput.additionalContext, /hooks\/readiness\.mjs decline/);
 });
+
+// Where live CI events cannot arrive whatever flag the session is started with (Claude Code on Amazon Bedrock, Google
+// Cloud or Microsoft Foundry), telling the user to relaunch with the flag, or offering claude-gh, would send them
+// after something that cannot work: the one line about it is said instead.
+test("where live CI events cannot arrive, the relaunch line and the claude-gh offer are left out", () => {
+  const setup = { line: "runners.io: Claude Code is set to use Amazon Bedrock", context: "ctx" };
+  const out = noticeFor(input(), { state: "off" }, "/x", { claudeGh: false, setup, liveEventsUnavailable: true });
+  assert.equal(out.systemMessage, setup.line);
+  assert.equal(out.hookSpecificOutput.additionalContext, "ctx");
+  assert.equal(noticeFor(input(), { state: "off" }, "/x", { claudeGh: false, liveEventsUnavailable: true }), null, "and with nothing new to say, nothing");
+  assert.equal(noticeFor(input(), { state: "unknown" }, "/x", { claudeGh: false, liveEventsUnavailable: true }), null);
+  // Without it, as before.
+  assert.match(noticeFor(input(), { state: "off" }, "/x", { claudeGh: false }).systemMessage, /live CI events are OFF/);
+});
+
+test("Claude Code on Bedrock, launched without the flag: one line once in the project, never the relaunch line or the claude-gh offer", async () => {
+  const m = machine({ env: { CLAUDE_CODE_USE_BEDROCK: "1" } });
+  const dir = project(m);
+  const options = { env: m.env, launch: { state: "off" }, platform: "linux", claudeGhFor: () => false };
+  const first = await hookOutput({ ...input(), cwd: dir }, options);
+  assert.equal(first.systemMessage, "runners.io: Claude Code is set to use Amazon Bedrock (CLAUDE_CODE_USE_BEDROCK), where live CI events are not available; CI on request (ci_status) still works.");
+  assert.equal(first.hookSpecificOutput.additionalContext.includes(OFFER_QUESTION), false);
+  assert.equal(/relaunch|claude-gh --/.test(first.systemMessage), false);
+  assert.equal(await hookOutput({ ...input(), cwd: dir }, options), null, "said once: the next launch adds nothing");
+});
+
+test("Claude Code on Bedrock, launched WITH the channel flag: the line is said at every launch, since the flag brings nothing", async () => {
+  const m = machine({ env: { CLAUDE_CODE_USE_BEDROCK: "1" } });
+  const dir = project(m);
+  const options = { env: m.env, launch: { state: "on" }, platform: "linux", claudeGhFor: () => true };
+  for (let launch = 0; launch < 2; launch++) {
+    const out = await hookOutput({ ...input(), cwd: dir }, options);
+    assert.match(out.systemMessage, /where live CI events are not available, so this session's channel flag brings none; CI on request \(ci_status\) still works\.$/);
+    assert.match(out.hookSpecificOutput.additionalContext, /\[degrades\] \(live_events\)/);
+  }
+});

@@ -153,7 +153,7 @@ if (existsSync(hooksFile)) {
   const wrapper = 'sh "${CLAUDE_PLUGIN_ROOT}/hooks/node.sh" ';
   check(starts.some((c) => c === `${wrapper}session-start "\${CLAUDE_PLUGIN_ROOT}/hooks/session-start.mjs"`), "no SessionStart hook runs hooks/session-start.mjs through hooks/node.sh as session-start");
   check(pr && pr.command === `${wrapper}quiet "\${CLAUDE_PLUGIN_ROOT}/hooks/pr-created.mjs"`, "the PR hook does not run through hooks/node.sh as quiet");
-  for (const name of ["node.sh", "session-start.mjs", "readiness.mjs", "launch.mjs"]) check(existsSync(join(root, "hooks", name)), `hooks/${name} does not exist`);
+  for (const name of ["node.sh", "session-start.mjs", "readiness.mjs", "proxy.mjs", "launch.mjs"]) check(existsSync(join(root, "hooks", name)), `hooks/${name} does not exist`);
 }
 
 const skills = join(root, "skills");

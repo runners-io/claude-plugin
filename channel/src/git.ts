@@ -19,6 +19,11 @@ export interface GitScope {
    * Read from the clone, never from GitHub. Absent where a scope is not read from git.
    */
   readonly pushed?: string | null;
+  /**
+   * `owner/name` of the clone's `upstream` remote, when it is a GitHub repository other than origin: by convention the
+   * repository a fork was forked from, where the fork's pull requests live (forks.ts). Absent otherwise.
+   */
+  readonly upstream?: string | null;
 }
 
 const OWNER = "[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})";
@@ -50,16 +55,20 @@ function git(dir: string, args: string[]): Promise<string | null> {
 }
 
 export async function readGitScope(dir: string): Promise<GitScope> {
-  const [remote, branch] = await Promise.all([
+  const [remote, branch, upstreamUrl] = await Promise.all([
     git(dir, ["remote", "get-url", "origin"]),
     git(dir, ["branch", "--show-current"]),
+    git(dir, ["remote", "get-url", "upstream"]),
   ]);
+  const repo = remote ? parseGitHubRemote(remote) : null;
+  const upstream = upstreamUrl ? parseGitHubRemote(upstreamUrl) : null;
   // A branch name git itself gave, after `refs/remotes/origin/`, so it cannot be read as an option; no shell runs.
   const pushed = branch ? await git(dir, ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`]) : null;
   return {
-    repo: remote ? parseGitHubRemote(remote) : null,
+    repo,
     branch: branch ? branch : null,
     pushed: pushed && /^[0-9a-f]{40}$/.test(pushed) ? pushed : null,
+    ...(repo && upstream && upstream.toLowerCase() !== repo.toLowerCase() ? { upstream } : {}),
   };
 }
 
