@@ -21,6 +21,12 @@
 // looks), with no event logged for the PR by a session watching it in between (which would show a look happened).
 // Seen live: one day's event log had 10 false MISSes of that kind, `hold` added and taken off 14-24 s apart on four
 // PRs, and taken off 79 and 111 s before a merge on two more, when only a watch that ended within a minute counted.
+// Also overtaken: a merge or close that the watch ended less than FINISHED_MAX_MS after (a PR whose CI has finished is
+// not looked at every poll); and a base branch's turn undone before the session's next possible read of the base
+// (rules.mjs: BASE_EVERY_MS while the session logged a CI record dated inside the turn, BASE_IDLE_MS otherwise),
+// each such pair listed. A change GitHub dates (whole seconds) at or before the second a watch began was in its first
+// look, which is a baseline (state.ts: diff(null, s) is empty). Every window test compares times, not strings:
+// "09:50:15Z" sorts after "09:50:15.145Z", because "Z" sorts after ".", and that made a baseline change a MISS.
 //
 // Exit 0: nothing found. Exit 1: a miss, a gap, an event that could not be sent, or a setup problem.
 // Exit 2: could not evaluate (no records in the window, or GitHub could not be read); never an all-clear.
@@ -28,7 +34,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 
-import { FINISHED_MAX_MS, baseVerdict } from "../channel/src/rules.mjs";
+import { BASE_EVERY_MS, BASE_IDLE_MS, FINISHED_MAX_MS, baseVerdict } from "../channel/src/rules.mjs";
 
 const args = process.argv.slice(2);
 const opt = (name, fallback) => {
@@ -64,6 +70,16 @@ function printable(text) {
 function printableJson(value) {
   return JSON.stringify(value, null, 2).replace(/[\u007f-\u009f\u2028-\u202e\u2066-\u2069]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
+
+/** A time, from GitHub (whole seconds) or a log record (milliseconds): never compare the two as strings. */
+const ms = (t) => Date.parse(t);
+/**
+ * Whether a change at `t` came after the first look of a watch that began at `from`. GitHub dates in whole seconds, so
+ * a change it dates at or before the second the watch began may have been in that look, the baseline.
+ */
+const afterStart = (t, from) => ms(t) >= Math.floor(ms(from) / 1000) * 1000 + 1000;
+/** Inside a watch from `from` to `to`, by time. */
+const within = (t, from, to) => afterStart(t, from) && ms(t) <= ms(to);
 
 function couldNotEvaluate(why) {
   process.stderr.write(`could not evaluate: ${printable(why)}\n`);
@@ -348,6 +364,9 @@ async function checkGitHub() {
   // Whether a change at time t of this kind was the channel's to report. A window that wanted it and stayed open at
   // least one poll after t: "in". One that wanted it but closed (or reached now) within one poll of t: "overtaken",
   // as when a session stops watching seconds after a merge, before its next look. Otherwise "out".
+  // A merge or close is the channel's only if the window stayed open FINISHED_MAX_MS after it: by then a PR's CI has
+  // usually finished, and a finished PR is looked at every FINISHED_MS..FINISHED_MAX_MS (cadence.ts), not every poll.
+  // Seen live: #6833 merged at 10:44:23Z, and its session's own tool unsubscribed 70 s later.
   const POLL_MS = 60_000;
   // What each session had muted, and when. A mute names a PR or (repo null) every PR, and kinds or (null)
   // every kind; one that names a workflow mutes that workflow only, which a kind-level check cannot tell apart, so it
@@ -366,18 +385,20 @@ async function checkGitHub() {
     }
   }
   const muted = (session, key, kind, t) =>
-    mutes.some((m) => m.session === session && (m.key === null || m.key === key) && (m.kinds === null || m.kinds.includes(kind)) && t >= m.from && (!m.to || t < m.to));
+    mutes.some((m) => m.session === session && (m.key === null || m.key === key) && (m.kinds === null || m.kinds.includes(kind)) && ms(t) >= ms(m.from) && (!m.to || ms(t) < ms(m.to)));
   // When GitHub merged or closed the PR. The channel reports only pr.merged (or pr.closed) once a poll sees
   // it, so any other change is the channel's only if a poll could see it while the PR was still open: for those
   // kinds the window ends at GitHub's time, not at the unsubscribe the session logged when it noticed (a minute or
   // two later, which made a label taken off 11 s before an auto-merge look like a MISS).
   const prEnds = new Map();
   const where = (key, t, kind) => {
-    const end = kind === "pr.merged" || kind === "pr.closed" ? null : prEnds.get(key);
+    const closing = kind === "pr.merged" || kind === "pr.closed";
+    const end = closing ? null : prEnds.get(key);
+    const reach = closing ? FINISHED_MAX_MS : POLL_MS;
     const wanting = (windows.get(key) ?? [])
-      .filter(([a, b, ev, session]) => t >= a && t <= b && (ev === "all" || ev.includes(kind)) && !muted(session, key, kind, t))
-      .map(([a, b, ev, session]) => [a, end && end < b ? end : b, ev, session]);
-    if (wanting.some(([, b]) => Date.parse(b) - Date.parse(t) >= POLL_MS)) return "in";
+      .filter(([a, b, ev, session]) => within(t, a, b) && (ev === "all" || ev.includes(kind)) && !muted(session, key, kind, t))
+      .map(([a, b, ev, session]) => [a, end && ms(end) < ms(b) ? end : b, ev, session]);
+    if (wanting.some(([, b]) => ms(b) - ms(t) >= reach)) return "in";
     return wanting.length ? "overtaken" : "out";
   };
   const inside = (key, t, kind) => where(key, t, kind) !== "out";
@@ -386,12 +407,14 @@ async function checkGitHub() {
   const sent = new Set(records.filter(seen).map((r) => `${r.repo}#${r.pr}|${r.kind}|${r.run_id ?? ""}`));
   const sentKinds = new Set(records.filter(seen).map((r) => `${r.repo}#${r.pr}|${r.kind}`));
   let overtaken = 0;
+  // Base turns undone before the next read could see them, once each per repository, base and time.
+  const overtakenBaseFlips = new Map();
 
   // A base branch's push runs, back to before the earliest window, a page of 100 at a time: a workflow's last verdict
   // can be older than the newest 100 runs (a failure was once off the page 70 minutes later, and the check saw a
   // green that never was). At most 10 pages, and read ONCE per repository and branch, shared by every PR on it: read
   // per PR, one day's replay of 99 PRs spent the hourly limit of a login every other tool and session share.
-  const earliest = [...windows.values()].flat().map(([a]) => a).sort()[0];
+  const earliest = [...windows.values()].flat().map(([a]) => a).sort((x, y) => ms(x) - ms(y))[0];
   const baseHistories = new Map();
   const baseHistory = (repo, ref) => {
     const k = `${repo}@${ref}`;
@@ -405,7 +428,7 @@ async function checkGitHub() {
             const got = (await gh(`/repos/${repo}/actions/runs?${q}`, auth)).workflow_runs ?? [];
             for (const r of got) byId.set(r.id, r);
             const oldest = got.map((r) => r.created_at).filter(Boolean).sort()[0];
-            if (got.length < 100 || (oldest && oldest < earliest)) break;
+            if (got.length < 100 || (oldest && ms(oldest) < ms(earliest))) break;
           }
           return [...byId.values()];
         })(),
@@ -435,7 +458,7 @@ async function checkGitHub() {
       const runsBySha = new Map(shas.map((sha) => [sha, []]));
       const headRef = pull.head?.ref;
       const headRepo = (pull.head?.repo?.full_name ?? repo).toLowerCase();
-      const firstWatch = (windows.get(key) ?? []).map(([a]) => a).sort()[0];
+      const firstWatch = (windows.get(key) ?? []).map(([a]) => a).sort((x, y) => ms(x) - ms(y))[0];
       for (let page = 1; headRef && page <= 5; page++) {
         const q = new URLSearchParams({ branch: headRef, per_page: "100", page: String(page) });
         const got = (await gh(`/repos/${repo}/actions/runs?${q}`, auth)).workflow_runs ?? [];
@@ -443,14 +466,14 @@ async function checkGitHub() {
           if (runsBySha.has(run.head_sha) && (run.head_repository?.full_name ?? repo).toLowerCase() === headRepo) runsBySha.get(run.head_sha).push(run);
         }
         const oldest = got.map((x) => x.created_at).filter(Boolean).sort()[0];
-        if (got.length < 100 || (oldest && oldest < firstWatch)) break;
+        if (got.length < 100 || (oldest && ms(oldest) < ms(firstWatch))) break;
       }
       // A commit's push time is its first run's creation; the head at time T is the latest commit pushed by T.
       const pushed = shas
         .map((sha) => ({ sha, at: (runsBySha.get(sha) ?? []).map((r) => r.created_at).filter(Boolean).sort()[0] }))
         .filter((p) => p.at)
-        .sort((a, b) => a.at.localeCompare(b.at));
-      const headAt = (t) => pushed.filter((p) => p.at <= t).at(-1)?.sha;
+        .sort((a, b) => ms(a.at) - ms(b.at));
+      const headAt = (t) => pushed.filter((p) => ms(p.at) <= ms(t)).at(-1)?.sha;
       for (const [sha, runs] of runsBySha) {
         for (const run of runs) {
           if (run.status !== "completed" || !["failure", "timed_out", "startup_failure"].includes(run.conclusion)) continue;
@@ -461,7 +484,7 @@ async function checkGitHub() {
           }
           if (!sent.has(`${key}|ci.workflow_failed|${run.id}`)) {
             // A newer commit pushed within one poll of the failure: the channel's next look found the head moved.
-            const replaced = pushed.some((p) => p.at > run.updated_at && Date.parse(p.at) - Date.parse(run.updated_at) < POLL_MS);
+            const replaced = pushed.some((p) => ms(p.at) > ms(run.updated_at) && ms(p.at) - ms(run.updated_at) < POLL_MS);
             if (replaced || where(key, run.updated_at, "ci.workflow_failed") === "overtaken") {
               overtaken++;
               continue;
@@ -562,21 +585,56 @@ async function checkGitHub() {
       const baseRef = pull.base?.ref;
       if (baseRef && !closedAt) {
         const baseRuns = await baseHistory(repo, baseRef);
-        const done = baseRuns.filter((r) => r.status === "completed" && r.updated_at).sort((a, b) => a.updated_at.localeCompare(b.updated_at));
-        const starts = (windows.get(key) ?? []).map(([a]) => a).sort();
-        let red = baseVerdict(done.filter((r) => r.updated_at <= starts[0])).red;
+        const done = baseRuns.filter((r) => r.status === "completed" && r.updated_at).sort((a, b) => ms(a.updated_at) - ms(b.updated_at));
+        const starts = (windows.get(key) ?? []).map(([a]) => a).sort((x, y) => ms(x) - ms(y));
+        // A run GitHub dates at or before the watch's first second was in the first read, the baseline.
+        let red = baseVerdict(done.filter((r) => !afterStart(r.updated_at, starts[0]))).red;
+        const turns = [];
         for (const r of done) {
-          if (r.updated_at <= starts[0]) continue;
-          const v = baseVerdict(done.filter((x) => x.updated_at <= r.updated_at));
+          if (!afterStart(r.updated_at, starts[0])) continue;
+          const v = baseVerdict(done.filter((x) => ms(x.updated_at) <= ms(r.updated_at)));
           if (v.red === red) continue;
           red = v.red;
-          // A session reads a base branch once for all its PRs on it, and tells each turn once, on any one of them.
-          const kind = red ? "base.red" : "base.green";
-          const watchers = new Set(
-            (windows.get(key) ?? []).filter(([a, b, ev]) => r.updated_at >= a && r.updated_at <= b && (ev === "all" || ev.includes(kind))).map(([, , , who]) => who),
-          );
-          const toldOnAnother = (x) => x.repo === repo && watchers.has(x.session) && (x.base ?? baseRef) === baseRef;
-          if (!records.some((x) => seen(x) && x.kind === kind && toldOnAnother(x) && Date.parse(x.t) >= Date.parse(r.updated_at) - 5_000)) expect(kind, r.updated_at);
+          turns.push({ kind: red ? "base.red" : "base.green", at: r.updated_at });
+        }
+        // A session reads a base branch once for all its PRs on it, and tells each turn once, on any one of them.
+        const watchersAt = (t, kind) =>
+          new Set((windows.get(key) ?? []).filter(([a, b, ev]) => within(t, a, b) && (ev === "all" || ev.includes(kind))).map(([, , , who]) => who));
+        const told = (kind, at, watchers) =>
+          records.some((x) => seen(x) && x.kind === kind && x.repo === repo && watchers.has(x.session) && (x.base ?? baseRef) === baseRef && ms(x.t) >= ms(at) - 5_000);
+        // The session's next read of the base after a turn: BASE_EVERY_MS while one of its PRs is busy, BASE_IDLE_MS once
+        // all have settled (poller.ts checkBases). Busy is judged from the log: a CI record dated inside the turn.
+        const nextRead = (from, to, watchers) =>
+          records.some(
+            (x) => x.type === "event" && String(x.kind ?? "").startsWith("ci.") && watchers.has(x.session) && x.github_at && ms(x.github_at) >= ms(from) && ms(x.github_at) <= ms(to),
+          )
+            ? BASE_EVERY_MS
+            : BASE_IDLE_MS;
+        for (let i = 0; i < turns.length; i++) {
+          const turn = turns[i];
+          const undo = turns[i + 1];
+          const watchers = watchersAt(turn.at, turn.kind);
+          // A turn undone before the next read changed nothing a read could see: both halves are overtaken. Seen live:
+          // main green at 09:42:42Z and red again at 09:44:55Z, with the one watching session idle (reads 600 s apart).
+          if (undo && where(key, turn.at, turn.kind) !== "out" && !told(turn.kind, turn.at, watchers)) {
+            const read = nextRead(turn.at, undo.at, watchers);
+            const lasted = ms(undo.at) - ms(turn.at);
+            if (lasted <= read) {
+              for (const half of [turn, undo]) if (where(key, half.at, half.kind) !== "out" && !told(half.kind, half.at, watchersAt(half.at, half.kind))) overtaken++;
+              overtakenBaseFlips.set(`${repo}@${baseRef}|${turn.at}`, {
+                repo,
+                base: baseRef,
+                kind: turn.kind,
+                at: turn.at,
+                undone_at: undo.at,
+                seconds: Math.round(lasted / 1000),
+                next_read_s: read / 1000,
+              });
+              i++;
+              continue;
+            }
+          }
+          if (!told(turn.kind, turn.at, watchers)) expect(turn.kind, turn.at);
         }
       }
 
@@ -590,6 +648,7 @@ async function checkGitHub() {
     misses,
     superseded,
     overtaken,
+    overtaken_base_flips: [...overtakenBaseFlips.values()].sort((a, b) => ms(a.at) - ms(b.at)),
     not_checked:
       "merge conflicts (GitHub keeps no history of them), pr.head_moved (whether this machine had the commit), pr.body_edited (REST keeps no edit history), pr.review_thread_resolved and pr.ready_to_merge (no history of either), ci.job_failed and ci.job_stuck_queued (a job's history does not say what the run was doing at the time) and review.requested (not tied to a watched pull request)",
   };
@@ -625,6 +684,10 @@ function text(s) {
   for (const g of s.gaps) out.push(`  ${g.session} ${g.project}: ${g.from} .. ${g.to} (${g.minutes} min)`);
   if (s.github) {
     out.push(`GitHub check: ${s.github.checked_prs} PR(s), ${s.github.misses.length} miss(es), ${s.github.superseded} superseded failure(s) rightly not sent, ${s.github.overtaken ?? 0} overtaken before a look could see them, ${s.github.requests ?? "?"} GitHub request(s); not checked: ${s.github.not_checked}`);
+    out.push(`base flips overtaken: ${s.github.overtaken_base_flips?.length ?? 0}`);
+    for (const f of s.github.overtaken_base_flips ?? []) {
+      out.push(`  ${f.repo}@${f.base} ${f.kind} ${f.at}, undone ${f.undone_at} (${f.seconds} s; next base read ${f.next_read_s} s)`);
+    }
     for (const m of s.github.misses) {
       out.push(`  MISS ${m.kind} ${m.repo}#${m.pr}${m.run_id ? ` run ${m.run_id} "${m.workflow}"` : ""}${m.state ? ` ${m.state}` : ""} at ${m.github_at}`);
     }

@@ -1,6 +1,8 @@
 /**
  * The channel's tools: Claude chooses, per session, which pull requests it
- * hears about: some pull requests, or all of the current branch's.
+ * hears about: some pull requests, or all of the current branch's. A scope
+ * (scopes.ts) is the one choice kept beyond the session: every open pull
+ * request in a repository, set once for the project.
  *
  * THESE ARE NOT A REPLY PATH. They read GitHub and change only this process's
  * own lists of what to watch and what to mute. Nothing here approves a tool call, sends a
@@ -14,6 +16,7 @@ import { NAMES_LABEL, clean, describe, setupText } from "./format.ts";
 import type { GitScope } from "./git.ts";
 import type { GitHubClient } from "./github.ts";
 import { fetchSnapshot } from "./poller.ts";
+import { type Involves, type ScopeStore, isRepoName } from "./scopes.ts";
 import { EVENT_KINDS, type EventKind, isEventKind } from "./state.ts";
 import { type Entry, MAX_MUTES, MAX_SUBSCRIPTIONS, type Mute, type Subscriptions } from "./subscriptions.ts";
 
@@ -74,42 +77,70 @@ function def(name: (typeof TOOL_NAMES)[number], title: string, description: stri
   };
 }
 
-const DEFS: ToolDef[] = [
-  def(
-    "subscribe",
-    "Watch a pull request's CI",
-    "Push this pull request's CI results and merge-conflict changes into the session as they happen. Call it after you open a pull request, " +
-      "or when the user asks you to watch one. Answers the PR's current state; after that only changes are pushed. " +
-      `events limits what is pushed (default: all of ${EVENT_KINDS.join(", ")}). ` +
-      WATCH_COST,
-    { ...target, events: { type: "array", items: { type: "string", enum: [...EVENT_KINDS] }, description: "Kinds to push. Omit for all." } },
-  ),
-  def(
-    "unsubscribe",
-    "Stop watching CI",
-    "Stop pushing one pull request's CI results: pr, or with no arguments the current branch's pull request, as subscribe takes it. " +
-      "whole_repo: true stops every pull request of a repository (repo, default this session's), and all: true stops everything.",
-    {
-      ...target,
-      whole_repo: { type: "boolean", description: "Stop watching every pull request of the repository (repo, default this session's), not just one." },
-      all: { type: "boolean", description: "Stop watching everything." },
-    },
-  ),
-  def("list_subscriptions", "List watched pull requests", "The pull requests this session is watching, which events each pushes, and this session's mutes.", {}),
-  def("ci_status", "Read a pull request's CI now", "The pull request's current CI and merge-conflict state, read from GitHub now. Does not subscribe.", target),
-  def(
-    "mute",
-    "Stop hearing some events",
-    "In this session only, stop pushing events that match: a pull request (repo and pr), some kinds on every pull request (kinds), " +
-      "kinds on one pull request (repo, pr and kinds), or one workflow by its name (workflow). Other sessions are not affected. " +
-      `A pull request muted on its own is never watched automatically. At most ${MAX_MUTES}; they end with the session.`,
-    muteFields,
-  ),
-  def("unmute", "Hear muted events again", "Remove one mute (the same fields it was made with), or every mute (all: true).", {
-    ...muteFields,
-    all: { type: "boolean", description: "Remove every mute." },
-  }),
-];
+const scopeArg = {
+  type: "string",
+  enum: ["repo"],
+  description: "repo: the whole repository (repo, default this session's), kept for this project across restarts. Takes no pr.",
+} as const;
+
+/** The tools as listed. `withScopes`: the session has a scope store, so subscribe and unsubscribe offer a scope. */
+function defs(withScopes: boolean): ToolDef[] {
+  const scoped = (extra: Record<string, unknown>) => (withScopes ? extra : {});
+  return [
+    def(
+      "subscribe",
+      "Watch a pull request's CI",
+      "Push this pull request's CI results and merge-conflict changes into the session as they happen. Call it after you open a pull request, " +
+        "or when the user asks you to watch one. Answers the PR's current state; after that only changes are pushed. " +
+        `events limits what is pushed (default: all of ${EVENT_KINDS.join(", ")}). ` +
+        WATCH_COST +
+        (withScopes
+          ? ' With scope: "repo", it watches every open pull request in the repository instead, new ones included, with no further subscribe ' +
+            'call; involves: "me" narrows that to the pull requests that involve the signed-in GitHub login.'
+          : ""),
+      {
+        ...target,
+        events: { type: "array", items: { type: "string", enum: [...EVENT_KINDS] }, description: "Kinds to push. Omit for all." },
+        ...scoped({
+          scope: scopeArg,
+          involves: { type: "string", enum: ["all", "me"], description: "With scope: all (default) or only those that involve you." },
+        }),
+      },
+    ),
+    def(
+      "unsubscribe",
+      "Stop watching CI",
+      "Stop pushing one pull request's CI results: pr, or with no arguments the current branch's pull request, as subscribe takes it. " +
+        "whole_repo: true stops every pull request of a repository (repo, default this session's), and all: true stops everything." +
+        (withScopes ? ' With scope: "repo", end the repository\'s scope.' : ""),
+      {
+        ...target,
+        whole_repo: { type: "boolean", description: "Stop watching every pull request of the repository (repo, default this session's), not just one." },
+        all: { type: "boolean", description: "Stop watching everything." },
+        ...scoped({ scope: scopeArg }),
+      },
+    ),
+    def(
+      "list_subscriptions",
+      "List watched pull requests",
+      `${withScopes ? "The scopes set for this project, and the" : "The"} pull requests this session is watching, which events each pushes, and this session's mutes.`,
+      {},
+    ),
+    def("ci_status", "Read a pull request's CI now", "The pull request's current CI and merge-conflict state, read from GitHub now. Does not subscribe.", target),
+    def(
+      "mute",
+      "Stop hearing some events",
+      "In this session only, stop pushing events that match: a pull request (repo and pr), some kinds on every pull request (kinds), " +
+        "kinds on one pull request (repo, pr and kinds), or one workflow by its name (workflow). Other sessions are not affected. " +
+        `A pull request muted on its own is never watched automatically. At most ${MAX_MUTES}; they end with the session.`,
+      muteFields,
+    ),
+    def("unmute", "Hear muted events again", "Remove one mute (the same fields it was made with), or every mute (all: true).", {
+      ...muteFields,
+      all: { type: "boolean", description: "Remove every mute." },
+    }),
+  ];
+}
 
 interface Deps {
   readonly subs: Subscriptions;
@@ -119,6 +150,8 @@ interface Deps {
   readonly eventLog?: EventLog;
   /** False when this session was launched without the channel flag (hooks/launch.mjs): nothing pushed arrives. */
   readonly liveEvents?: boolean;
+  /** This project's scopes (scopes.ts); none: a scope is refused. */
+  readonly scopes?: ScopeStore;
 }
 
 /** The relaunch is launch.mjs's one sentence, as the launch notice and the watch-this-pr skill say it. */
@@ -219,8 +252,30 @@ const label = (events: ReadonlySet<EventKind> | EventKind[] | "all") => {
   return list.length > left.length ? `all events but ${left.join(", ")}` : list.join(", ");
 };
 
+const REPO_TEXT = "repo must be owner/name as GitHub allows it, for example acme/widgets.";
+
+/** What a scope covers, in words: "every open pull request in acme/widgets" (that involves you). */
+const covers = (repo: string, involves: Involves, joiner = " in ") =>
+  `every open pull request${joiner}${repo}${involves === "me" ? " that involves you" : ""}`;
+
+/** The repository a scope call names: `repo`, else this session's. */
+async function scopeRepo(deps: Deps, args: Record<string, unknown>): Promise<{ ok: true; repo: string } | { ok: false; text: string }> {
+  if (args.repo !== undefined) return isRepoName(args.repo) ? { ok: true, repo: args.repo } : { ok: false, text: REPO_TEXT };
+  const repo = (await deps.readScope()).repo;
+  if (!repo) return { ok: false, text: "This session's folder has no GitHub origin remote: pass repo (owner/name)." };
+  return isRepoName(repo) ? { ok: true, repo } : { ok: false, text: REPO_TEXT };
+}
+
+/** The project's scope store, or why a scope argument is refused. Only a repository scope exists so far. */
+function scopeStore(deps: Deps, args: Record<string, unknown>): { ok: true; store: ScopeStore } | { ok: false; text: string } {
+  if (args.scope !== "repo") return { ok: false, text: 'Only a repository scope (scope: "repo") is available.' };
+  if (!deps.scopes) return { ok: false, text: "Scopes are not available in this session." };
+  return { ok: true, store: deps.scopes };
+}
+
 export function makeTools(deps: Deps): ToolHost {
   const err = (text: string): ToolResult => ({ text, isError: true });
+  const listed = defs(deps.scopes !== undefined);
 
   const read = async (repo: string, pr: number) => {
     const r = await fetchSnapshot(deps.gh, repo, pr);
@@ -236,10 +291,32 @@ export function makeTools(deps: Deps): ToolHost {
   };
 
   return {
-    list: () => DEFS,
+    list: () => listed,
     async call(name, args) {
       switch (name) {
         case "subscribe": {
+          if (args.scope !== undefined) {
+            const scopes = scopeStore(deps, args);
+            if (!scopes.ok) return err(scopes.text);
+            if (args.pr !== undefined) return err("A scope takes no pr: it covers every open pull request in the repository.");
+            if (args.events !== undefined) return err("A scope takes no events: every kind is pushed for its pull requests.");
+            const involves = args.involves ?? "all";
+            if (involves !== "all" && involves !== "me") return err('involves must be "all" or "me".');
+            const r = await scopeRepo(deps, args);
+            if (!r.ok) return err(r.text);
+            const added = scopes.store.add({ kind: "repo", repo: r.repo, involves, events: "all" });
+            if (!added.ok) return err(added.text);
+            (deps.eventLog ?? NO_EVENT_LOG).write("scope_set", { repo: r.repo, kind: "repo", involves, saved: added.saved });
+            const kept = added.saved
+              ? "It is kept for this project, so a restarted session goes on watching."
+              : `It holds for this session only. ${scopes.store.problem ?? ""}`.trim();
+            return {
+              text:
+                `Watching ${covers(r.repo, involves)}. A pull request opened there later is watched with no subscribe call. ${kept}\n` +
+                (deps.liveEvents === false ? EVENTS_OFF_NOTE : CHANNEL_NOTE),
+            };
+          }
+          if (args.involves !== undefined) return err('involves goes with scope: "repo".');
           const events = parseEvents(args.events);
           if (!events.ok) return err(events.text);
           const t = await resolveTarget(deps, args);
@@ -272,6 +349,22 @@ export function makeTools(deps: Deps): ToolHost {
         case "unsubscribe": {
           const record = (repo: string | null, pr: number | null, count: number) =>
             (deps.eventLog ?? NO_EVENT_LOG).write("unsubscribe", { repo, pr, source: "tool", reason: "tool", count });
+          if (args.scope !== undefined) {
+            const scopes = scopeStore(deps, args);
+            if (!scopes.ok) return err(scopes.text);
+            if (args.pr !== undefined || args.all !== undefined || args.whole_repo !== undefined)
+              return err("A scope is ended by its repository alone: pass scope and repo.");
+            const r = await scopeRepo(deps, args);
+            if (!r.ok) return err(r.text);
+            if (scopes.store.remove(r.repo) === 0) return { text: `No scope is set for ${r.repo}.` };
+            // The pull requests the scope held go with it; one Claude, the hook or the branch asked for stays.
+            let held = 0;
+            for (const e of deps.subs.list()) {
+              if (e.source === "scope" && e.repo.toLowerCase() === r.repo.toLowerCase()) held += deps.subs.remove(e.repo, e.pr);
+            }
+            (deps.eventLog ?? NO_EVENT_LOG).write("scope_unset", { repo: r.repo, kind: "repo", count: held });
+            return { text: `Stopped watching ${r.repo} as a scope (${held} pull request(s) it held).` };
+          }
           // The branch's automatic watch would find its pull request again within minutes: unsubscribing it leaves a
           // mute of that pull request, which ends when the session's branch changes. Whoever holds it: the automatic
           // watch, the hook's hand-over of a PR just opened, or Claude's own subscribe.
@@ -340,13 +433,23 @@ export function makeTools(deps: Deps): ToolHost {
           return { text: count ? `Stopped watching ${one.repo} PR #${one.pr}.${note}` : `${one.repo} PR #${one.pr} was not watched.${note}` };
         }
         case "list_subscriptions": {
+          const scopes = deps.scopes?.list() ?? [];
           const all = deps.subs.list();
+          const problem = deps.scopes?.problem ? [deps.scopes.problem] : [];
           const mutes = deps.subs.mutes.list();
-          const watched = all.length
-            ? all.map((e) => `- ${e.repo} PR #${e.pr}: ${label(e.events)}${e.source === "auto" ? " (automatic: the current branch's PR)" : ""}`).join("\n")
-            : "No subscriptions in this session.";
-          if (!mutes.length) return { text: watched };
-          return { text: `${watched}\nMuted in this session only (${mutes.length} of ${MAX_MUTES}):\n${mutes.map((m) => `- ${muteText(m)}`).join("\n")}` };
+          const why = (source: string) =>
+            source === "auto" ? " (automatic: the current branch's PR)" : source === "scope" ? " (held by the scope)" : "";
+          const watched =
+            all.length || scopes.length
+              ? [
+                  ...scopes.map((s) => `- ${s.repo}: ${covers("", s.involves, "")} (scope)`),
+                  ...all.map((e) => `- ${e.repo} PR #${e.pr}: ${label(e.events)}${why(e.source)}`),
+                ].join("\n")
+              : "No subscriptions in this session.";
+          const muted = mutes.length
+            ? [`Muted in this session only (${mutes.length} of ${MAX_MUTES}):`, ...mutes.map((m) => `- ${muteText(m)}`)]
+            : [];
+          return { text: [watched, ...muted, ...problem].join("\n") };
         }
         case "mute": {
           const m = await parseMute(deps, args);

@@ -14,7 +14,8 @@ export interface GitScope {
   readonly branch: string | null;
   /**
    * The commit `origin/<branch>` names in this clone (`refs/remotes/origin/<branch>`), or null when there is none. A
-   * `git push` from the session's folder moves it, so a change is the session's own push (cadence.ts OWN_PUSH_FAST_MS).
+   * `git push` from the session's folder moves it, so a change is the session's own push (cadence.ts OWN_PUSH_FAST_MS);
+   * `readPushed` reads the same ref for every other watched PR's branch, which a push from a worktree moves.
    * Read from the clone, never from GitHub. Absent where a scope is not read from git.
    */
   readonly pushed?: string | null;
@@ -60,6 +61,42 @@ export async function readGitScope(dir: string): Promise<GitScope> {
     branch: branch ? branch : null,
     pushed: pushed && /^[0-9a-f]{40}$/.test(pushed) ? pushed : null,
   };
+}
+
+/**
+ * A branch name as GitHub gives a pull request's head, safe to put after `refs/remotes/origin/` as one argv entry: no
+ * space or control character, none of git's glob characters (so a pattern matches only its own ref, or refs below it),
+ * no `..`, no leading or trailing slash. git's own rules refuse all of these in a ref name, so nothing real is lost.
+ */
+function safeBranch(b: string): boolean {
+  if (b.length === 0 || b.length > 255 || b.startsWith("/") || b.endsWith("/") || b.includes("..")) return false;
+  for (const c of b) {
+    const code = c.codePointAt(0) ?? 0;
+    if (code <= 0x20 || code === 0x7f || "*?[\\^~:".includes(c) || /\s/.test(c)) return false;
+  }
+  return true;
+}
+
+/**
+ * The commit `refs/remotes/origin/<b>` names in this clone, for each of `branches`: null for a branch with no such
+ * ref. One `git for-each-ref` for all of them, never a GitHub request.
+ *
+ * Every git worktree of a clone shares its `refs/remotes`, so `git push` from any worktree moves the ref here, in the
+ * session's folder; a `git fetch` moves it too. A change is taken for the session's own push (cadence.ts
+ * OWN_PUSH_FAST_MS). null when git did not answer (no repository, a timeout), which is no reading at all.
+ */
+export async function readPushed(dir: string, branches: readonly string[]): Promise<Map<string, string | null> | null> {
+  const wanted = [...new Set(branches)].filter(safeBranch);
+  const out = new Map<string, string | null>(wanted.map((b) => [b, null]));
+  if (wanted.length === 0) return out;
+  // A pattern also matches refs below it (origin/feat matches origin/feat/x), so the answer is filtered to exact names.
+  const listed = await git(dir, ["for-each-ref", "--format=%(objectname) %(refname)", ...wanted.map((b) => `refs/remotes/origin/${b}`)]);
+  if (listed === null) return null;
+  for (const line of listed.split("\n")) {
+    const m = /^([0-9a-f]{40}) refs\/remotes\/origin\/(.+)$/.exec(line);
+    if (m && out.has(m[2])) out.set(m[2], m[1]);
+  }
+  return out;
 }
 
 /**

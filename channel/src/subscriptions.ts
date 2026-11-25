@@ -5,15 +5,18 @@
  */
 import { EVENT_KINDS, type EventKind, type Snapshot } from "./state.ts";
 
-/** `hook`: handed over by the PostToolUse hook (hookrequests.ts) for a PR named in a tool's output. */
-export type Source = "tool" | "auto" | "hook";
+/**
+ * `hook`: handed over by the PostToolUse hook (hookrequests.ts) for a PR named in a tool's output. `scope`: held
+ * because a scope (scopes.ts) covers it, for as long as it is open and in the scope.
+ */
+export type Source = "tool" | "auto" | "hook" | "scope";
 
 export interface Entry {
   readonly key: string;
   readonly repo: string;
   readonly pr: number;
   readonly events: ReadonlySet<EventKind> | "all";
-  /** Who asked: Claude through the subscribe tool, the channel for the current branch, or the PostToolUse hook. */
+  /** Who asked: Claude through the subscribe tool, the channel for the current branch, the PostToolUse hook, or a scope. */
   readonly source: Source;
   /** The state last seen, or null before the first look. */
   last: Snapshot | null;
@@ -118,7 +121,8 @@ export class Mutes {
   }
 }
 
-const RANK: Record<Source, number> = { tool: 2, hook: 1, auto: 0 };
+// A scope never takes a pull request from anyone else: it only fills in the ones nobody asked for.
+const RANK: Record<Source, number> = { tool: 2, hook: 1, auto: 0, scope: -1 };
 
 export function keyOf(repo: string, pr: number): string {
   return `${repo.toLowerCase()}#${pr}`;
@@ -133,13 +137,13 @@ export class Subscriptions {
   /** This session's mutes: held beside the subscriptions so the tools and the poller share them. */
   readonly mutes = new Mutes();
 
-  /** Adds or replaces, never with a lower-ranked source: Claude's own beats the hook's, which beats the branch's. */
+  /** Adds or replaces, never with a lower-ranked source: Claude's own beats the hook's, then the branch's, then a scope's. */
   add(input: { repo: string; pr: number; events?: readonly EventKind[] | "all"; source: Source; last?: Snapshot | null }): Entry {
     const key = keyOf(input.repo, input.pr);
     const existing = this.entries.get(key);
     if (existing && RANK[existing.source] > RANK[input.source]) return existing;
-    // The branch's automatic watch and the hook's hand-over (usually the PR just opened in this session), unless told
-    // otherwise, leave out the per-workflow kinds (AUTO_QUIET_KINDS). Only Claude's subscribe gets every kind unasked.
+    // The branch's automatic watch, the hook's hand-over (usually the PR just opened in this session) and a scope, unless
+    // told otherwise, leave out the per-workflow kinds (AUTO_QUIET_KINDS). Only Claude's subscribe gets every kind unasked.
     const asked = input.events ?? (input.source === "tool" ? "all" : AUTO_EVENTS);
     const events = asked === "all" ? "all" : new Set(asked);
     const entry: Entry = { key, repo: input.repo, pr: input.pr, events, source: input.source, last: input.last ?? existing?.last ?? null };

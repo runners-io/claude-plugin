@@ -165,7 +165,8 @@ test("with --github, a session that ended without a stop record watched until it
   gh.setPull("acme/widgets", 4, { head: { sha: A, ref: "x" }, state: "closed", closed_at: ago(39.6) });
   gh.setCommits("acme/widgets", 4, [A]);
   gh.setRuns("acme/widgets", A, []);
-  gh.setPull("acme/widgets", 5, { head: { sha: A, ref: "y" }, state: "closed", closed_at: ago(3) });
+  // Closed longer than FINISHED_MAX_MS before now, so the live session's watch reached past its next look.
+  gh.setPull("acme/widgets", 5, { head: { sha: A, ref: "y" }, state: "closed", closed_at: ago(10) });
   gh.setCommits("acme/widgets", 5, [A]);
   const killed = { session: "killed", project: "/w/a" };
   const killedLast = ago(40);
@@ -748,4 +749,111 @@ test("what the summary prints from a record carries no control characters: a rec
   const s = JSON.parse(json.stdout);
   assert.equal(s.sessions[0].session, session);
   assert.equal(s.sessions[0].project, project);
+});
+
+// Three more false MISSes from one day's check, each a change no look could have seen.
+
+// #6848's failure is dated 09:50:15Z by GitHub; the hook subscribed at 09:50:15.145Z. The first look after a subscribe
+// is a baseline (state.ts: diff(null, s) is empty), so that failure was in it. As strings, "...15Z" >= "...15.145Z",
+// because "Z" sorts after ".". A change GitHub dates (whole seconds) at or before the subscribe's second is baseline.
+test("with --github, a failure GitHub dates in the subscribe's own second is baseline; one 2 s after is a MISS", async () => {
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  const repo = "acme/widgets";
+  for (const [pr, failedAt] of [
+    [6848, "2026-11-20T09:50:15Z"],
+    [6849, "2026-11-20T09:50:17Z"], // the control
+  ]) {
+    const sha = String(pr % 10).repeat(40);
+    gh.setPull(repo, pr, { head: { sha, ref: `f${pr}` } });
+    gh.setCommits(repo, pr, [sha]);
+    gh.setRuns(repo, sha, [{ id: pr * 10, name: "CI", status: "completed", conclusion: "failure", created_at: "2026-11-20T09:40:00Z", updated_at: failedAt }]);
+  }
+  const at = (t, r) => ({ ...base, t, ...r });
+  const dir = writeLog([
+    at("2026-11-20T09:50:15.145Z", { type: "subscribe", repo, pr: 6848, source: "hook" }),
+    at("2026-11-20T09:50:15.145Z", { type: "subscribe", repo, pr: 6849, source: "hook" }),
+    beat(1),
+  ]);
+  const r = await run(["--dir", dir, "--since", "2026-11-20T09:00:00Z", "--json", "--github", "--github-api", gh.base]);
+  const out = JSON.parse(r.stdout);
+  assert.deepEqual(out.github.misses.map((m) => `${m.kind}#${m.pr}`), ["ci.workflow_failed#6849"], r.stderr);
+});
+
+// #6833 merged at 10:44:23Z; the watching session's own tool unsubscribed at 10:45:33Z, 70 s later. Its CI had finished,
+// so the PR was looked at every FINISHED_MS..FINISHED_MAX_MS (cadence.ts), not every poll.
+test("with --github, a merge the watch ended within FINISHED_MAX_MS of is overtaken; one watched longer is a MISS", async () => {
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  const repo = "acme/widgets";
+  const merged = "2026-11-20T10:44:23Z";
+  for (const pr of [6833, 6834]) gh.setPull(repo, pr, { head: { sha: String(pr % 10).repeat(40), ref: `f${pr}` }, state: "closed", merged: true, merged_at: merged, closed_at: merged });
+  const at = (t, r) => ({ ...base, t, ...r });
+  const dir = writeLog([
+    at("2026-11-20T10:00:00.000Z", { type: "subscribe", repo, pr: 6833, source: "tool" }),
+    at("2026-11-20T10:00:00.000Z", { type: "subscribe", repo, pr: 6834, source: "tool" }),
+    at("2026-11-20T10:45:33.000Z", { type: "unsubscribe", repo, pr: 6833, source: "tool", reason: "tool" }),
+    // The control: watched 301 s after the merge, longer than any finished PR goes between looks.
+    at("2026-11-20T10:49:24.000Z", { type: "unsubscribe", repo, pr: 6834, source: "tool", reason: "tool" }),
+    beat(1),
+  ]);
+  const r = await run(["--dir", dir, "--since", "2026-11-20T09:00:00Z", "--json", "--github", "--github-api", gh.base]);
+  const out = JSON.parse(r.stdout);
+  assert.deepEqual(out.github.misses.map((m) => `${m.kind}#${m.pr}`), ["pr.merged#6834"], r.stderr);
+  assert.equal(out.github.overtaken, 1, "#6833's merge, 70 s before the watch ended");
+});
+
+// main went green at 09:42:42Z (a re-run's second attempt passed) and red again at 09:44:55Z (web · CI failed): green
+// for 133 s. The one watching session had no CI running, so it read the base every baseIdleMs (poller.ts), and two
+// reads saw red and red. A base change undone before the session's next possible read is overtaken: baseEveryMs after
+// it when the session logged a CI record dated inside the flip, baseIdleMs otherwise.
+test("with --github, a base flip undone before the session's next base read is overtaken and listed; a longer one is a MISS", async () => {
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  const repo = "acme/widgets";
+  const red0 = { id: 1, name: "CI", status: "completed", conclusion: "failure", created_at: "2026-11-20T08:40:00Z", updated_at: "2026-11-20T08:50:00Z" };
+  const flip = (id, green, red) => [
+    red0,
+    { id: id, name: "CI", status: "completed", conclusion: "success", run_attempt: 2, created_at: "2026-11-20T08:55:00Z", updated_at: green },
+    { id: id + 1, name: "web · CI", status: "completed", conclusion: "failure", created_at: "2026-11-20T08:45:00Z", updated_at: red },
+  ];
+  // The flip the check reported: 133 s, nothing running. Overtaken.
+  gh.setBaseRuns(repo, "main", flip(10, "2026-11-20T09:42:42Z", "2026-11-20T09:44:55Z"));
+  // Controls: 601 s with nothing running, and 90 s with a CI record inside. Both MISSes, each half.
+  gh.setBaseRuns(repo, "long", flip(20, "2026-11-20T10:00:00Z", "2026-11-20T10:10:01Z"));
+  gh.setBaseRuns(repo, "busy", flip(30, "2026-11-20T10:20:00Z", "2026-11-20T10:21:30Z"));
+  // 40 s with a CI record inside: within baseEveryMs, overtaken.
+  gh.setBaseRuns(repo, "quick", flip(40, "2026-11-20T10:30:00Z", "2026-11-20T10:30:40Z"));
+  const prs = { 7001: "main", 7002: "long", 7003: "busy", 7004: "quick" };
+  for (const [pr, ref] of Object.entries(prs)) {
+    const sha = String(pr % 10).repeat(40);
+    gh.setPull(repo, Number(pr), { head: { sha, ref: `f${pr}` }, base: { ref } });
+    gh.setCommits(repo, Number(pr), [sha]);
+  }
+  const at = (t, r) => ({ ...base, t, ...r });
+  const ci = (t, github_at) => at(t, { type: "event", kind: "ci.workflow_succeeded", repo, pr: 7003, run_id: 99, outcome: "filtered", github_at });
+  const dir = writeLog([
+    ...Object.keys(prs).map((pr) => at("2026-11-20T09:00:00.000Z", { type: "subscribe", repo, pr: Number(pr), source: "tool" })),
+    ci("2026-11-20T10:20:40.000Z", "2026-11-20T10:20:30Z"),
+    ci("2026-11-20T10:30:20.000Z", "2026-11-20T10:30:10Z"),
+    beat(1, { subscriptions: 4 }),
+  ]);
+  const r = await run(["--dir", dir, "--since", "2026-11-20T08:00:00Z", "--json", "--github", "--github-api", gh.base]);
+  const out = JSON.parse(r.stdout);
+  assert.deepEqual(
+    out.github.misses.map((m) => `${m.kind}@${m.github_at}`).sort(),
+    ["base.green@2026-11-20T10:00:00Z", "base.green@2026-11-20T10:20:00Z", "base.red@2026-11-20T10:10:01Z", "base.red@2026-11-20T10:21:30Z"],
+    r.stderr,
+  );
+  assert.equal(out.github.overtaken, 4, "both halves of the main and quick flips");
+  assert.deepEqual(
+    out.github.overtaken_base_flips.map((f) => `${f.base} ${f.kind} ${f.at} undone ${f.undone_at} (${f.seconds} s, next read ${f.next_read_s} s)`),
+    [
+      "main base.green 2026-11-20T09:42:42Z undone 2026-11-20T09:44:55Z (133 s, next read 600 s)",
+      "quick base.green 2026-11-20T10:30:00Z undone 2026-11-20T10:30:40Z (40 s, next read 60 s)",
+    ],
+  );
+  const text = await run(["--dir", dir, "--since", "2026-11-20T08:00:00Z", "--github", "--github-api", gh.base]);
+  assert.match(text.stdout, /base flips overtaken: 2/);
+  assert.match(text.stdout, /acme\/widgets@main base\.green 2026-11-20T09:42:42Z, undone 2026-11-20T09:44:55Z \(133 s; next base read 600 s\)/);
 });

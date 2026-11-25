@@ -23,6 +23,7 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
     restReviews: new Map(), // "o/r#n" -> [{ id, state, submitted_at }] (REST pulls/{n}/reviews)
     reviewComments: new Map(), // "o/r#n" -> [{ id, created_at, in_reply_to_id? }] (REST pulls/{n}/comments)
     reviewRequests: { viewer: "octocat", nodes: [] }, // what the review-requested:@me search answers
+    involved: new Map(), // "o/r" -> PR numbers the involves:@me search answers
     reviewPulls: new Map(), // "o/r#n" -> the GraphQL pullRequest node the review query answers with
     graphqlRate: { remaining: 4990, limit: 5000 }, // GraphQL's own budget, separate from REST's
   };
@@ -106,11 +107,27 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
     m = /^\/repos\/([^/]+)\/([^/]+)\/pulls$/.exec(url.pathname);
     if (m) {
       const repo = `${m[1]}/${m[2]}`;
+      if (!url.searchParams.has("head")) {
+        // The repository's open PRs, newest first (a repo scope's discovery).
+        const all = [...state.pulls.entries()].filter(([k, p]) => k.startsWith(`${repo}#`) && p.state === "open").map(([, p]) => p);
+        return send(req, res, 200, all.sort((a, b) => b.number - a.number));
+      }
       const [owner, branch] = (url.searchParams.get("head") ?? "").split(":");
       const open = [...state.pulls.entries()]
         .filter(([k, p]) => k.startsWith(`${repo}#`) && p.state === "open" && p.head.ref === branch && owner === m[1])
         .map(([, p]) => p);
       return send(req, res, 200, open);
+    }
+    if (url.pathname === "/search/issues") {
+      // `is:pr is:open repo:o/r involves:@me`: the open PRs setInvolved named.
+      const q = url.searchParams.get("q") ?? "";
+      const repo = /(?:^|\s)repo:(\S+)/.exec(q)?.[1] ?? "";
+      const numbers = state.involved.get(repo) ?? [];
+      const items = numbers
+        .map((n) => state.pulls.get(`${repo}#${n}`))
+        .filter((p) => p && p.state === "open")
+        .map((p) => ({ number: p.number, html_url: p.html_url, repository_url: `https://api.github.com/repos/${repo}`, pull_request: {} }));
+      return send(req, res, 200, { total_count: items.length, incomplete_results: false, items });
     }
     m = /^\/repos\/([^/]+)\/([^/]+)\/actions\/runs$/.exec(url.pathname);
     if (m) {
@@ -180,6 +197,9 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
       if (fields.head) pull.head = { repo: { full_name: repo }, ...(prev?.head ?? {}), ...fields.head };
       state.pulls.set(`${repo}#${number}`, pull);
       return pull;
+    },
+    setInvolved(repo, numbers) {
+      state.involved.set(repo, numbers);
     },
     deletePull(repo, number) {
       state.pulls.delete(`${repo}#${number}`);

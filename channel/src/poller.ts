@@ -27,7 +27,7 @@ import type { GitScope } from "./git.ts";
 import { type EventLog, NO_EVENT_LOG } from "./eventlog.ts";
 import type { BaseRunInfo, ApiResult, GhProblem, GitHubClient } from "./github.ts";
 import { log } from "./log.ts";
-import { baseVerdict, latestPerWorkflow } from "./rules.mjs";
+import { BASE_EVERY_MS, BASE_IDLE_MS, baseVerdict, latestPerWorkflow } from "./rules.mjs";
 import { type Change, type EventKind, type Snapshot, allDoneChange, carry, diff, needsAttention } from "./state.ts";
 import type { HookRequest } from "./hookrequests.ts";
 import { AUTO_EVENTS, type Entry, MAX_HOOK_SUBSCRIPTIONS, MAX_SUBSCRIPTIONS, type Subscriptions, wants } from "./subscriptions.ts";
@@ -94,6 +94,12 @@ export interface PollerDeps {
    * Asked only for PRs in the session's own repository.
    */
   readonly inOwnHistory?: (sha: string) => Promise<boolean | null>;
+  /**
+   * The clone's `refs/remotes/origin/<b>` for each branch (git.ts `readPushed`), in one local git read: a change is the
+   * session's own push to that PR, from its folder or any git worktree of it. Asked only for open watched PRs in the
+   * session's own repository; never a GitHub request.
+   */
+  readonly readPushed?: (branches: readonly string[]) => Promise<ReadonlyMap<string, string | null> | null>;
   /** How often each watched base branch is read while one of its PRs is busy; a minute by default. */
   readonly baseEveryMs?: number;
   /** How often a base branch is read while all its PRs have settled; ten minutes by default. */
@@ -298,8 +304,8 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       throw error;
     }
   }
-  const baseEveryMs = deps.baseEveryMs ?? 60_000;
-  const baseIdleMs = Math.max(baseEveryMs, deps.baseIdleMs ?? 600_000);
+  const baseEveryMs = deps.baseEveryMs ?? BASE_EVERY_MS;
+  const baseIdleMs = Math.max(baseEveryMs, deps.baseIdleMs ?? BASE_IDLE_MS);
   const now = deps.now ?? Date.now;
   const lookEvery = deps.lookEveryMs ?? lookEveryMs;
   /** Per watched PR: when it is next looked at, and what the cadence needs to know. */
@@ -313,8 +319,11 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
   const atJobFloor = () => gh.rateRemaining !== null && gh.rateRemaining <= JOB_READS_FLOOR;
   let rateLevel: "normal" | "slowed" | "paused" = "normal";
   const looks = new Map<string, { next: number; quiet: number; phase: Phase; headSha: string; headSeenAt: number; runsReadAt: number }>();
-  /** The clone's `origin/<branch>` at the last pass (git.ts `pushed`), to tell the session's own push. */
-  const lastPushed: { label: string; sha: string | null } = { label: "", sha: null };
+  /**
+   * Per watched PR in the folder's repository: the clone's `origin/<headRef>` at the last pass (git.ts `readPushed`,
+   * and `pushed` for the folder's own branch), to tell the session's own push from any worktree of the clone.
+   */
+  const lastPushed = new Map<string, string | null>();
   /** Per watched PR: until when it is looked at every pass, after the session's own push to its branch. */
   const fastUntil = new Map<string, number>();
   let findLabel = "";
@@ -606,23 +615,41 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       }
     }
 
-    // THE SESSION'S OWN PUSH: `git push` from this folder moves origin/<branch> in the clone. The pull
-    // request for that branch is then looked at this pass, and every pass for OWN_PUSH_FAST_MS, so the push is seen
-    // within a pass and its CI's first result at the poll interval, not after a settled PR's five-minute wait.
-    if (scope?.repo && scope.branch && scope.pushed !== undefined) {
-      const label = `${scope.repo.toLowerCase()}@${scope.branch}`;
+    // THE SESSION'S OWN PUSH: `git push` moves origin/<branch> in the clone, from the session's folder or from any git
+    // worktree of it (worktrees share refs/remotes). Each open watched PR in the folder's repository has its
+    // origin/<headRef> read at every pass, all in one local git read and never a GitHub request; the PR whose ref
+    // moved is then looked at this pass, and every pass for OWN_PUSH_FAST_MS, so the push is seen within a pass and
+    // its CI's first result at the poll interval, not after a settled PR's five-minute wait. Only that PR: one PR's
+    // push does not quicken the others. A `git fetch` that moves a ref counts too (it is cheap, and usually means
+    // someone just pushed). The first reading of each PR's ref is a baseline; a ref that appears is a push.
+    if (scope?.repo) {
+      const repo = scope.repo.toLowerCase();
       const t = now();
       for (const [key, until] of fastUntil) if (until <= t) fastUntil.delete(key);
-      if (lastPushed.label === label && scope.pushed && scope.pushed !== lastPushed.sha) {
-        for (const e of subs.list()) {
-          if (e.repo.toLowerCase() !== scope.repo.toLowerCase() || e.last?.state !== "open" || e.last.headRef !== scope.branch) continue;
+      const open = subs.list().filter((e) => e.repo.toLowerCase() === repo && e.last?.state === "open" && e.last.headRef);
+      const refs = deps.readPushed && open.length > 0 ? await deps.readPushed([...new Set(open.map((e) => e.last?.headRef ?? ""))]) : null;
+      const reading = (headRef: string): string | null | undefined => {
+        // The folder's own branch, as readScope read it this pass; any other branch, as readPushed did. undefined: no
+        // reading this pass (git did not answer, or nothing reads it), which leaves the baseline as it was.
+        if (scope.branch === headRef && scope.pushed !== undefined) return scope.pushed;
+        return refs?.has(headRef) ? (refs.get(headRef) ?? null) : undefined;
+      };
+      const seen = new Set<string>();
+      for (const e of open) {
+        seen.add(e.key);
+        const sha = reading(e.last?.headRef ?? "");
+        if (sha === undefined) continue;
+        const was = lastPushed.get(e.key);
+        if (was !== undefined && sha && sha !== was) {
           fastUntil.set(e.key, t + OWN_PUSH_FAST_MS);
           const look = looks.get(e.key);
           if (look) look.next = t;
         }
+        lastPushed.set(e.key, sha);
       }
-      lastPushed.label = label;
-      lastPushed.sha = scope.pushed;
+      // A PR no longer watched, closed or in another repository loses its baseline: watched again, its first reading
+      // is a baseline again.
+      for (const key of lastPushed.keys()) if (!seen.has(key)) lastPushed.delete(key);
     }
 
     for (const req of deps.takeHookRequests?.() ?? []) {
@@ -672,10 +699,17 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
         events.write("api_error", { repo: entry.repo, pr: entry.pr, result: "not_found", misses: missed });
         if (missed < NOT_FOUND_LIMIT) continue;
         misses.delete(entry.key);
-        if (subs.get(entry.repo, entry.pr)) {
-          unsubscribe(entry, "not_visible");
-          await send(notVisible(entry), null);
+        const live = subs.get(entry.repo, entry.pr);
+        if (!live) continue;
+        // A URL the hook lifted from tool output that GitHub has never shown is not a PR this session lost: a test
+        // fixture or a plan can name a PR number that does not exist, and every read of it handed the same URL over
+        // again, each time ending in a "no longer shows" notice. Never watched, so dropped as the hook's other screens drop.
+        if (live.source === "hook" && live.last === null) {
+          unsubscribe(live, "hook_not_found");
+          continue;
         }
+        unsubscribe(live, "not_visible");
+        await send(notVisible(live), null);
         continue;
       }
       saidProblem = null;

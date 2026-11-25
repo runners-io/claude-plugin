@@ -6,6 +6,11 @@
 // stretches it. The summary script uses it to tell a change no look could have seen.
 export const FINISHED_MAX_MS = 300_000;
 
+// ---- How often a watched base branch is read (poller.ts checkBases): every BASE_EVERY_MS while one of its PRs is busy,
+// every BASE_IDLE_MS once all have settled. The summary script uses them to tell a base flip no read could have seen.
+export const BASE_EVERY_MS = 60_000;
+export const BASE_IDLE_MS = 600_000;
+
 // ---- The base branch: red when the latest completed run of any workflow on it failed.
 
 const FAILED = new Set(["failure", "timed_out", "startup_failure"]);

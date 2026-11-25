@@ -12,7 +12,7 @@
 import { removeRequests, resetRequests, takeRequests } from "./hookrequests.ts";
 import { SharedStore, defaultSharedRoot } from "./shared.ts";
 import { loadConfig } from "./config.ts";
-import { inOwnHistory, readGitScope } from "./git.ts";
+import { inOwnHistory, readGitScope, readPushed } from "./git.ts";
 import { GitHubClient, readGhAuth } from "./github.ts";
 import { log } from "./log.ts";
 import { startMcp } from "./mcp.ts";
@@ -23,7 +23,7 @@ import { makeTools } from "./tools.ts";
 import { NO_EVENT_LOG, openEventLog } from "./eventlog.ts";
 import { findLaunch, pollsIn } from "../../hooks/launch.mjs";
 
-export const VERSION = "0.3.9";
+export const VERSION = "0.3.12";
 
 function serve(): void {
   const config = loadConfig();
@@ -75,6 +75,7 @@ function serve(): void {
         signal: stop.signal,
         eventLog,
         inOwnHistory: (sha) => inOwnHistory(config.projectDir, sha),
+        readPushed: (branches) => readPushed(config.projectDir, branches),
         // The PostToolUse hook's hand-over; this process's parent is the Claude process the hook finds.
         takeHookRequests: () => takeRequests(defaultSharedRoot(), process.ppid),
       }).catch((error) => {

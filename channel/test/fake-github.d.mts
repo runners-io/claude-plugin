@@ -10,6 +10,8 @@ export interface FakeGitHub {
   readonly requests: { path: string; status: number }[];
   setPull(repo: string, number: number, fields?: Record<string, unknown>): Record<string, unknown>;
   deletePull(repo: string, number: number): void;
+  /** The PR numbers the `involves:@me` search answers for a repository. */
+  setInvolved(repo: string, numbers: number[]): void;
   setRuns(repo: string, sha: string, runs: Record<string, unknown>[]): void;
   setCommits(repo: string, number: number, shas: string[]): void;
   setBaseRuns(repo: string, branch: string, runs: Record<string, unknown>[]): void;

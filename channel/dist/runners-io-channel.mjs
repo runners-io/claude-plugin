@@ -344,6 +344,26 @@ async function readGitScope(dir) {
     pushed: pushed && /^[0-9a-f]{40}$/.test(pushed) ? pushed : null
   };
 }
+function safeBranch(b) {
+  if (b.length === 0 || b.length > 255 || b.startsWith("/") || b.endsWith("/") || b.includes("..")) return false;
+  for (const c of b) {
+    const code = c.codePointAt(0) ?? 0;
+    if (code <= 32 || code === 127 || "*?[\\^~:".includes(c) || /\s/.test(c)) return false;
+  }
+  return true;
+}
+async function readPushed(dir, branches) {
+  const wanted = [...new Set(branches)].filter(safeBranch);
+  const out = new Map(wanted.map((b) => [b, null]));
+  if (wanted.length === 0) return out;
+  const listed = await git(dir, ["for-each-ref", "--format=%(objectname) %(refname)", ...wanted.map((b) => `refs/remotes/origin/${b}`)]);
+  if (listed === null) return null;
+  for (const line of listed.split("\n")) {
+    const m = /^([0-9a-f]{40}) refs\/remotes\/origin\/(.+)$/.exec(line);
+    if (m && out.has(m[2])) out.set(m[2], m[1]);
+  }
+  return out;
+}
 async function inOwnHistory(dir, sha) {
   if (!/^[0-9a-f]{40}$/.test(sha)) return null;
   const inside = await git(dir, ["rev-parse", "--is-inside-work-tree"]);
@@ -1715,6 +1735,8 @@ function startMcp(opts) {
 
 // src/rules.mjs
 var FINISHED_MAX_MS = 3e5;
+var BASE_EVERY_MS = 6e4;
+var BASE_IDLE_MS = 6e5;
 var FAILED3 = /* @__PURE__ */ new Set(["failure", "timed_out", "startup_failure"]);
 var COUNTED = /* @__PURE__ */ new Set(["success", "neutral", "failure", "timed_out", "startup_failure"]);
 function latestPerWorkflow(runs) {
@@ -1881,7 +1903,7 @@ var Mutes = class {
     return this.entries.has(muteKey({ repo, pr }));
   }
 };
-var RANK = { tool: 2, hook: 1, auto: 0 };
+var RANK = { tool: 2, hook: 1, auto: 0, scope: -1 };
 function keyOf(repo, pr) {
   return `${repo.toLowerCase()}#${pr}`;
 }
@@ -1892,7 +1914,7 @@ var Subscriptions = class {
   entries = /* @__PURE__ */ new Map();
   /** This session's mutes: held beside the subscriptions so the tools and the poller share them. */
   mutes = new Mutes();
-  /** Adds or replaces, never with a lower-ranked source: Claude's own beats the hook's, which beats the branch's. */
+  /** Adds or replaces, never with a lower-ranked source: Claude's own beats the hook's, then the branch's, then a scope's. */
   add(input) {
     const key = keyOf(input.repo, input.pr);
     const existing = this.entries.get(key);
@@ -2084,15 +2106,15 @@ async function runPoller(deps) {
       throw error;
     }
   }
-  const baseEveryMs = deps.baseEveryMs ?? 6e4;
-  const baseIdleMs = Math.max(baseEveryMs, deps.baseIdleMs ?? 6e5);
+  const baseEveryMs = deps.baseEveryMs ?? BASE_EVERY_MS;
+  const baseIdleMs = Math.max(baseEveryMs, deps.baseIdleMs ?? BASE_IDLE_MS);
   const now = deps.now ?? Date.now;
   const lookEvery = deps.lookEveryMs ?? lookEveryMs;
   const pressure = () => ratePressure(gh.rateRemaining, gh.rateLimit);
   const atJobFloor = () => gh.rateRemaining !== null && gh.rateRemaining <= JOB_READS_FLOOR;
   let rateLevel = "normal";
   const looks = /* @__PURE__ */ new Map();
-  const lastPushed = { label: "", sha: null };
+  const lastPushed = /* @__PURE__ */ new Map();
   const fastUntil = /* @__PURE__ */ new Map();
   let findLabel = "";
   let findSince = 0;
@@ -2327,20 +2349,30 @@ async function runPoller(deps) {
         }
       }
     }
-    if (scope?.repo && scope.branch && scope.pushed !== void 0) {
-      const label2 = `${scope.repo.toLowerCase()}@${scope.branch}`;
+    if (scope?.repo) {
+      const repo = scope.repo.toLowerCase();
       const t = now();
       for (const [key, until] of fastUntil) if (until <= t) fastUntil.delete(key);
-      if (lastPushed.label === label2 && scope.pushed && scope.pushed !== lastPushed.sha) {
-        for (const e of subs.list()) {
-          if (e.repo.toLowerCase() !== scope.repo.toLowerCase() || e.last?.state !== "open" || e.last.headRef !== scope.branch) continue;
+      const open = subs.list().filter((e) => e.repo.toLowerCase() === repo && e.last?.state === "open" && e.last.headRef);
+      const refs = deps.readPushed && open.length > 0 ? await deps.readPushed([...new Set(open.map((e) => e.last?.headRef ?? ""))]) : null;
+      const reading = (headRef) => {
+        if (scope.branch === headRef && scope.pushed !== void 0) return scope.pushed;
+        return refs?.has(headRef) ? refs.get(headRef) ?? null : void 0;
+      };
+      const seen = /* @__PURE__ */ new Set();
+      for (const e of open) {
+        seen.add(e.key);
+        const sha = reading(e.last?.headRef ?? "");
+        if (sha === void 0) continue;
+        const was = lastPushed.get(e.key);
+        if (was !== void 0 && sha && sha !== was) {
           fastUntil.set(e.key, t + OWN_PUSH_FAST_MS);
           const look = looks.get(e.key);
           if (look) look.next = t;
         }
+        lastPushed.set(e.key, sha);
       }
-      lastPushed.label = label2;
-      lastPushed.sha = scope.pushed;
+      for (const key of lastPushed.keys()) if (!seen.has(key)) lastPushed.delete(key);
     }
     for (const req of deps.takeHookRequests?.() ?? []) {
       if (subs.get(req.repo, req.pr)) continue;
@@ -2386,10 +2418,14 @@ async function runPoller(deps) {
         events.write("api_error", { repo: entry.repo, pr: entry.pr, result: "not_found", misses: missed });
         if (missed < NOT_FOUND_LIMIT) continue;
         misses.delete(entry.key);
-        if (subs.get(entry.repo, entry.pr)) {
-          unsubscribe(entry, "not_visible");
-          await send(notVisible(entry), null);
+        const live2 = subs.get(entry.repo, entry.pr);
+        if (!live2) continue;
+        if (live2.source === "hook" && live2.last === null) {
+          unsubscribe(live2, "hook_not_found");
+          continue;
         }
+        unsubscribe(live2, "not_visible");
+        await send(notVisible(live2), null);
         continue;
       }
       saidProblem = null;
@@ -2654,6 +2690,17 @@ function findLaunch(pid = process.ppid, ps = psRow) {
   return { state: "unknown" };
 }
 
+// src/scopes.ts
+var OWNER2 = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/;
+var NAME2 = /^[A-Za-z0-9._-]{1,100}$/;
+function isRepoName(repo) {
+  if (typeof repo !== "string") return false;
+  const parts = repo.split("/");
+  if (parts.length !== 2) return false;
+  const [owner, name] = parts;
+  return OWNER2.test(owner) && NAME2.test(name) && name !== "." && name !== "..";
+}
+
 // src/tools.ts
 var CHANNEL_NOTE = 'Results arrive as <channel source="runners-io"> events if this session was started with the runners-io channel; if none arrive, call ci_status to check.';
 var WATCH_COST = `Each watch reads GitHub on the user's own GitHub login and its hourly limit, shared with gh: about 24 GitHub requests an hour while the pull request is quiet, more while its CI runs, and about 60 GraphQL points an hour for the review kinds (a watch whose events name no review kind costs no review reads). A session watches at most ${MAX_SUBSCRIPTIONS} pull requests.`;
@@ -2677,36 +2724,57 @@ function def(name, title, description, properties) {
     annotations: { title, readOnlyHint: true, openWorldHint: true }
   };
 }
-var DEFS = [
-  def(
-    "subscribe",
-    "Watch a pull request's CI",
-    `Push this pull request's CI results and merge-conflict changes into the session as they happen. Call it after you open a pull request, or when the user asks you to watch one. Answers the PR's current state; after that only changes are pushed. events limits what is pushed (default: all of ${EVENT_KINDS.join(", ")}). ` + WATCH_COST,
-    { ...target, events: { type: "array", items: { type: "string", enum: [...EVENT_KINDS] }, description: "Kinds to push. Omit for all." } }
-  ),
-  def(
-    "unsubscribe",
-    "Stop watching CI",
-    "Stop pushing one pull request's CI results: pr, or with no arguments the current branch's pull request, as subscribe takes it. whole_repo: true stops every pull request of a repository (repo, default this session's), and all: true stops everything.",
-    {
-      ...target,
-      whole_repo: { type: "boolean", description: "Stop watching every pull request of the repository (repo, default this session's), not just one." },
-      all: { type: "boolean", description: "Stop watching everything." }
-    }
-  ),
-  def("list_subscriptions", "List watched pull requests", "The pull requests this session is watching, which events each pushes, and this session's mutes.", {}),
-  def("ci_status", "Read a pull request's CI now", "The pull request's current CI and merge-conflict state, read from GitHub now. Does not subscribe.", target),
-  def(
-    "mute",
-    "Stop hearing some events",
-    `In this session only, stop pushing events that match: a pull request (repo and pr), some kinds on every pull request (kinds), kinds on one pull request (repo, pr and kinds), or one workflow by its name (workflow). Other sessions are not affected. A pull request muted on its own is never watched automatically. At most ${MAX_MUTES}; they end with the session.`,
-    muteFields
-  ),
-  def("unmute", "Hear muted events again", "Remove one mute (the same fields it was made with), or every mute (all: true).", {
-    ...muteFields,
-    all: { type: "boolean", description: "Remove every mute." }
-  })
-];
+var scopeArg = {
+  type: "string",
+  enum: ["repo"],
+  description: "repo: the whole repository (repo, default this session's), kept for this project across restarts. Takes no pr."
+};
+function defs(withScopes) {
+  const scoped = (extra) => withScopes ? extra : {};
+  return [
+    def(
+      "subscribe",
+      "Watch a pull request's CI",
+      `Push this pull request's CI results and merge-conflict changes into the session as they happen. Call it after you open a pull request, or when the user asks you to watch one. Answers the PR's current state; after that only changes are pushed. events limits what is pushed (default: all of ${EVENT_KINDS.join(", ")}). ` + WATCH_COST + (withScopes ? ' With scope: "repo", it watches every open pull request in the repository instead, new ones included, with no further subscribe call; involves: "me" narrows that to the pull requests that involve the signed-in GitHub login.' : ""),
+      {
+        ...target,
+        events: { type: "array", items: { type: "string", enum: [...EVENT_KINDS] }, description: "Kinds to push. Omit for all." },
+        ...scoped({
+          scope: scopeArg,
+          involves: { type: "string", enum: ["all", "me"], description: "With scope: all (default) or only those that involve you." }
+        })
+      }
+    ),
+    def(
+      "unsubscribe",
+      "Stop watching CI",
+      "Stop pushing one pull request's CI results: pr, or with no arguments the current branch's pull request, as subscribe takes it. whole_repo: true stops every pull request of a repository (repo, default this session's), and all: true stops everything." + (withScopes ? ` With scope: "repo", end the repository's scope.` : ""),
+      {
+        ...target,
+        whole_repo: { type: "boolean", description: "Stop watching every pull request of the repository (repo, default this session's), not just one." },
+        all: { type: "boolean", description: "Stop watching everything." },
+        ...scoped({ scope: scopeArg })
+      }
+    ),
+    def(
+      "list_subscriptions",
+      "List watched pull requests",
+      `${withScopes ? "The scopes set for this project, and the" : "The"} pull requests this session is watching, which events each pushes, and this session's mutes.`,
+      {}
+    ),
+    def("ci_status", "Read a pull request's CI now", "The pull request's current CI and merge-conflict state, read from GitHub now. Does not subscribe.", target),
+    def(
+      "mute",
+      "Stop hearing some events",
+      `In this session only, stop pushing events that match: a pull request (repo and pr), some kinds on every pull request (kinds), kinds on one pull request (repo, pr and kinds), or one workflow by its name (workflow). Other sessions are not affected. A pull request muted on its own is never watched automatically. At most ${MAX_MUTES}; they end with the session.`,
+      muteFields
+    ),
+    def("unmute", "Hear muted events again", "Remove one mute (the same fields it was made with), or every mute (all: true).", {
+      ...muteFields,
+      all: { type: "boolean", description: "Remove every mute." }
+    })
+  ];
+}
 var EVENTS_OFF_NOTE = `But live CI events are OFF in this session: it was started without the channel flag, so nothing will be pushed. To turn them on, ${relaunchSentence(null)}; /runners-io:setup-github sets claude-gh up. ci_status still reads a PR's state on request.`;
 async function resolveTarget(deps, args) {
   let repo;
@@ -2789,8 +2857,22 @@ var label = (events) => {
   const left = EVENT_KINDS.filter((k) => !list.includes(k));
   return list.length > left.length ? `all events but ${left.join(", ")}` : list.join(", ");
 };
+var REPO_TEXT = "repo must be owner/name as GitHub allows it, for example acme/widgets.";
+var covers = (repo, involves, joiner = " in ") => `every open pull request${joiner}${repo}${involves === "me" ? " that involves you" : ""}`;
+async function scopeRepo(deps, args) {
+  if (args.repo !== void 0) return isRepoName(args.repo) ? { ok: true, repo: args.repo } : { ok: false, text: REPO_TEXT };
+  const repo = (await deps.readScope()).repo;
+  if (!repo) return { ok: false, text: "This session's folder has no GitHub origin remote: pass repo (owner/name)." };
+  return isRepoName(repo) ? { ok: true, repo } : { ok: false, text: REPO_TEXT };
+}
+function scopeStore(deps, args) {
+  if (args.scope !== "repo") return { ok: false, text: 'Only a repository scope (scope: "repo") is available.' };
+  if (!deps.scopes) return { ok: false, text: "Scopes are not available in this session." };
+  return { ok: true, store: deps.scopes };
+}
 function makeTools(deps) {
   const err = (text) => ({ text, isError: true });
+  const listed = defs(deps.scopes !== void 0);
   const read = async (repo, pr) => {
     const r = await fetchSnapshot(deps.gh, repo, pr);
     if (r.kind === "auth") return err(setupText(r.auth));
@@ -2803,10 +2885,29 @@ function makeTools(deps) {
     return r.value;
   };
   return {
-    list: () => DEFS,
+    list: () => listed,
     async call(name, args) {
       switch (name) {
         case "subscribe": {
+          if (args.scope !== void 0) {
+            const scopes = scopeStore(deps, args);
+            if (!scopes.ok) return err(scopes.text);
+            if (args.pr !== void 0) return err("A scope takes no pr: it covers every open pull request in the repository.");
+            if (args.events !== void 0) return err("A scope takes no events: every kind is pushed for its pull requests.");
+            const involves = args.involves ?? "all";
+            if (involves !== "all" && involves !== "me") return err('involves must be "all" or "me".');
+            const r = await scopeRepo(deps, args);
+            if (!r.ok) return err(r.text);
+            const added = scopes.store.add({ kind: "repo", repo: r.repo, involves, events: "all" });
+            if (!added.ok) return err(added.text);
+            (deps.eventLog ?? NO_EVENT_LOG).write("scope_set", { repo: r.repo, kind: "repo", involves, saved: added.saved });
+            const kept = added.saved ? "It is kept for this project, so a restarted session goes on watching." : `It holds for this session only. ${scopes.store.problem ?? ""}`.trim();
+            return {
+              text: `Watching ${covers(r.repo, involves)}. A pull request opened there later is watched with no subscribe call. ${kept}
+` + (deps.liveEvents === false ? EVENTS_OFF_NOTE : CHANNEL_NOTE)
+            };
+          }
+          if (args.involves !== void 0) return err('involves goes with scope: "repo".');
           const events = parseEvents(args.events);
           if (!events.ok) return err(events.text);
           const t = await resolveTarget(deps, args);
@@ -2835,6 +2936,21 @@ ${deps.liveEvents === false ? EVENTS_OFF_NOTE : CHANNEL_NOTE}` };
         }
         case "unsubscribe": {
           const record = (repo, pr, count2) => (deps.eventLog ?? NO_EVENT_LOG).write("unsubscribe", { repo, pr, source: "tool", reason: "tool", count: count2 });
+          if (args.scope !== void 0) {
+            const scopes = scopeStore(deps, args);
+            if (!scopes.ok) return err(scopes.text);
+            if (args.pr !== void 0 || args.all !== void 0 || args.whole_repo !== void 0)
+              return err("A scope is ended by its repository alone: pass scope and repo.");
+            const r = await scopeRepo(deps, args);
+            if (!r.ok) return err(r.text);
+            if (scopes.store.remove(r.repo) === 0) return { text: `No scope is set for ${r.repo}.` };
+            let held = 0;
+            for (const e of deps.subs.list()) {
+              if (e.source === "scope" && e.repo.toLowerCase() === r.repo.toLowerCase()) held += deps.subs.remove(e.repo, e.pr);
+            }
+            (deps.eventLog ?? NO_EVENT_LOG).write("scope_unset", { repo: r.repo, kind: "repo", count: held });
+            return { text: `Stopped watching ${r.repo} as a scope (${held} pull request(s) it held).` };
+          }
           const muteBranchPr = async (repo, pr) => {
             const scope = await deps.readScope();
             const branchPr = (e) => e.source === "auto" || !!scope.branch && !!scope.repo && e.repo.toLowerCase() === scope.repo.toLowerCase() && e.last?.headRef === scope.branch;
@@ -2886,13 +3002,17 @@ ${deps.liveEvents === false ? EVENTS_OFF_NOTE : CHANNEL_NOTE}` };
           return { text: count ? `Stopped watching ${one2.repo} PR #${one2.pr}.${note}` : `${one2.repo} PR #${one2.pr} was not watched.${note}` };
         }
         case "list_subscriptions": {
+          const scopes = deps.scopes?.list() ?? [];
           const all = deps.subs.list();
+          const problem = deps.scopes?.problem ? [deps.scopes.problem] : [];
           const mutes = deps.subs.mutes.list();
-          const watched = all.length ? all.map((e) => `- ${e.repo} PR #${e.pr}: ${label(e.events)}${e.source === "auto" ? " (automatic: the current branch's PR)" : ""}`).join("\n") : "No subscriptions in this session.";
-          if (!mutes.length) return { text: watched };
-          return { text: `${watched}
-Muted in this session only (${mutes.length} of ${MAX_MUTES}):
-${mutes.map((m) => `- ${muteText(m)}`).join("\n")}` };
+          const why = (source) => source === "auto" ? " (automatic: the current branch's PR)" : source === "scope" ? " (held by the scope)" : "";
+          const watched = all.length || scopes.length ? [
+            ...scopes.map((s) => `- ${s.repo}: ${covers("", s.involves, "")} (scope)`),
+            ...all.map((e) => `- ${e.repo} PR #${e.pr}: ${label(e.events)}${why(e.source)}`)
+          ].join("\n") : "No subscriptions in this session.";
+          const muted = mutes.length ? [`Muted in this session only (${mutes.length} of ${MAX_MUTES}):`, ...mutes.map((m) => `- ${muteText(m)}`)] : [];
+          return { text: [watched, ...muted, ...problem].join("\n") };
         }
         case "mute": {
           const m = await parseMute(deps, args);
@@ -2936,7 +3056,7 @@ ${note}` };
 }
 
 // src/main.ts
-var VERSION = "0.3.9";
+var VERSION = "0.3.12";
 function serve() {
   const config = loadConfig();
   const gh = new GitHubClient(config.githubApi, () => readGhAuth(process.env, void 0, config.githubApi), fetch, {
@@ -2980,6 +3100,7 @@ function serve() {
         signal: stop.signal,
         eventLog,
         inOwnHistory: (sha) => inOwnHistory(config.projectDir, sha),
+        readPushed: (branches) => readPushed(config.projectDir, branches),
         // The PostToolUse hook's hand-over; this process's parent is the Claude process the hook finds.
         takeHookRequests: () => takeRequests(defaultSharedRoot(), process.ppid)
       }).catch((error) => {

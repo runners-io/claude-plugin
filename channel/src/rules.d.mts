@@ -1,4 +1,6 @@
 export const FINISHED_MAX_MS: number;
+export const BASE_EVERY_MS: number;
+export const BASE_IDLE_MS: number;
 
 export interface BaseRun {
   readonly name: string;

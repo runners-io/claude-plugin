@@ -75,3 +75,32 @@ test("inOwnHistory: a commit is this work tree's own only when it is HEAD or beh
   assert.equal(await inOwnHistory(root, one), null, "not a work tree: cannot tell");
   assert.equal(await inOwnHistory(main, "not-a-sha"), null);
 });
+
+test("readPushed reads origin/<b> for every branch asked in one go, and a worktree's push moves it in the session's folder", async () => {
+  const { readPushed } = await import("../src/git.ts");
+  const root = mkdtempSync(join(tmpdir(), "rio-pushed-"));
+  const main = join(root, "main");
+  const tree = join(root, "tree");
+  try {
+    const g = (dir: string, ...args: string[]) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }).trim();
+    execFileSync("git", ["init", "-q", "-b", "main", main]);
+    g(main, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "one");
+    const one = g(main, "rev-parse", "HEAD");
+    g(main, "update-ref", "refs/remotes/origin/feat-a", one);
+    g(main, "update-ref", "refs/remotes/origin/feat-c/nested", one); // below the pattern origin/feat-c: not origin/feat-c
+    assert.deepEqual(await readPushed(main, ["feat-a", "feat-b", "feat-c"]), new Map([["feat-a", one], ["feat-b", null], ["feat-c", null]]));
+    // A worktree of the clone: a push from it (here, the ref update git push makes) is seen from the session's folder.
+    g(main, "worktree", "add", "-q", "-b", "feat-b", tree);
+    g(tree, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "two");
+    const two = g(tree, "rev-parse", "HEAD");
+    g(tree, "update-ref", "refs/remotes/origin/feat-b", two);
+    assert.deepEqual(await readPushed(main, ["feat-a", "feat-b"]), new Map([["feat-a", one], ["feat-b", two]]));
+    // A name git would never make a ref of is not read and not passed to git; it has no reading.
+    assert.deepEqual(await readPushed(main, ["a b", "tab\tname", "f*", "x/../y", "/lead", "feat-b"]), new Map([["feat-b", two]]));
+    assert.deepEqual(await readPushed(main, []), new Map());
+    // No repository: no reading at all, which is not "no ref".
+    assert.equal(await readPushed(root, ["feat-a"]), null);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

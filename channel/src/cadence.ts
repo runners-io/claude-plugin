@@ -28,8 +28,9 @@ export { FINISHED_MAX_MS };
 /** A head with no runs is pending this long after it was first seen, then finished (a PR with no CI). */
 export const PENDING_WINDOW_MS = 5 * 60_000;
 /**
- * After the session's own push (git.ts `pushed` moved), the pull request for that branch is looked at at once and then
- * every pass for this long, whatever its phase. Without it a push to a settled pull request waited up to
+ * After the session's own push (the clone's origin/<headRef> moved, git.ts `pushed` or `readPushed`: from the session's
+ * folder or any git worktree of it), the pull request for that branch is looked at at once and then every pass for this
+ * long, whatever its phase. Without it a push to a settled pull request waited up to
  * FINISHED_MAX_MS to be seen, and only then did the fast beat start. Five minutes of looks at the poll interval is
  * 15 conditional requests, most answered 304, once per push.
  */

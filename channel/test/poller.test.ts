@@ -8,7 +8,7 @@ import { type GhAuth, GitHubClient } from "../src/github.ts";
 import { setQuiet } from "../src/log.ts";
 import type { EventLog } from "../src/eventlog.ts";
 import { JOB_READS_FLOOR } from "../src/cadence.ts";
-import { runPoller } from "../src/poller.ts";
+import { NOT_FOUND_LIMIT, runPoller } from "../src/poller.ts";
 import { Subscriptions } from "../src/subscriptions.ts";
 import { makeTools } from "../src/tools.ts";
 import { type FakeGitHub, startFakeGitHub } from "./fake-github.mjs";
@@ -941,6 +941,45 @@ test("a PR the hook saw that is not new (a gh pr view of an old PR) is dropped a
     await settle();
     assert.equal(t.subs.get("acme/widgets", 9), undefined);
     assert.deepEqual(t.kinds(), []);
+  } finally {
+    await t.stop();
+  }
+});
+
+// A PR URL the hook saw that GitHub has never shown: a test fixture or a plan naming a PR number past the repository's
+// newest. Each read of the file handed it over again, and each time the session was told "GitHub no longer shows PR
+// #n ... needs the repo scope", which was wrong on both counts. It was never watched, so it is dropped without a word,
+// after the same NOT_FOUND_LIMIT looks that cover GitHub's lag on a PR opened a moment ago.
+test("a PR the hook saw that GitHub has never shown is dropped, and says nothing", async () => {
+  const hookRequests: { repo: string; pr: number; at: number }[] = [];
+  const t = await setup({ scope: HOOK_SCOPE, hookRequests });
+  try {
+    hookRequests.push({ repo: "acme/widgets", pr: 2701, at: Date.now() });
+    await until("dropped", () => t.records.some((r) => r.type === "unsubscribe" && r.pr === 2701 && r.reason === "hook_not_found"));
+    await settle();
+    assert.equal(t.subs.get("acme/widgets", 2701), undefined);
+    assert.equal(
+      t.records.filter((r) => r.type === "api_error" && r.pr === 2701 && r.result === "not_found").length,
+      NOT_FOUND_LIMIT,
+      "looked at as often as a watched PR before it is given up",
+    );
+    assert.deepEqual(t.kinds(), []);
+  } finally {
+    await t.stop();
+  }
+});
+
+test("a PR the hook saw that GitHub showed once and then lost is still said, as any watched PR is", async () => {
+  const hookRequests: { repo: string; pr: number; at: number }[] = [];
+  const t = await setup({ scope: HOOK_SCOPE, hookRequests });
+  try {
+    t.gh.setPull("acme/widgets", 9, { head: { ref: "scripted", sha: SHA9 }, created_at: new Date(Date.now() - 60_000).toISOString() });
+    t.gh.setRuns("acme/widgets", SHA9, [{ id: 91, name: "CI", status: "queued" }]);
+    hookRequests.push({ repo: "acme/widgets", pr: 9, at: Date.now() });
+    await until("PR 9 watched", () => t.subs.get("acme/widgets", 9)?.last != null);
+    t.gh.deletePull("acme/widgets", 9);
+    await until("dropped", () => t.subs.get("acme/widgets", 9) === undefined);
+    assert.ok(t.kinds().includes("channel_pr_not_visible"));
   } finally {
     await t.stop();
   }

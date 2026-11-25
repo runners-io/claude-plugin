@@ -29,8 +29,19 @@ async function until(what: string, fn: () => boolean, ms = 10_000) {
   }
 }
 
+/**
+ * The clone's git, as the poller reads it: the folder's branch, its `origin/<branch>` (git.ts `pushed`), and, when
+ * `remotes` is given, `refs/remotes/origin/<b>` for any branch (git.ts `readPushed`), which a push from a worktree
+ * of the clone moves.
+ */
+interface Clone {
+  branch?: string;
+  pushed?: string | null;
+  remotes?: Record<string, string | null>;
+}
+
 /** One session on a simulated clock; `step(n, before)` runs n passes, calling `before(pass)` ahead of each. */
-async function session(gh: FakeGitHub, scope: { pushed?: string | null } = {}) {
+async function session(gh: FakeGitHub, scope: Clone = {}) {
   let t = 1_700_000_000_000;
   let asleep = false;
   let wake: () => void = () => {};
@@ -44,7 +55,10 @@ async function session(gh: FakeGitHub, scope: { pushed?: string | null } = {}) {
     config,
     gh: client,
     subs,
-    readScope: async () => ({ repo: "octo-org/example", branch: "feat", ...scope }),
+    readScope: async () => ({ repo: "octo-org/example", branch: scope.branch ?? "feat", ...(scope.pushed !== undefined ? { pushed: scope.pushed } : {}) }),
+    ...(scope.remotes
+      ? { readPushed: async (branches: readonly string[]) => new Map(branches.map((b) => [b, scope.remotes?.[b] ?? null] as const)) }
+      : {}),
     notify: async (m) => void inbox.push(m),
     signal: stop.signal,
     now: () => t,
@@ -162,6 +176,69 @@ test("the session's own push to a settled PR is seen at once, and its failure wi
   await s.step(5);
   await s.stop();
   assert.ok(pulls() - quiet <= 1, `${pulls() - quiet} looks in 100 s after the fast beat ended`);
+});
+
+test("a push from a worktree of the session's clone to a settled PR is seen at once, and only that PR goes fast", async () => {
+  const gh = await startFakeGitHub({ token: TOKEN });
+  fakes.push(gh);
+  const C = "c".repeat(40);
+  gh.setPull("octo-org/example", 7, { head: { ref: "feat-a", sha: A }, base: { ref: "main" }, updated_at: "2026-01-01T00:00:00Z" });
+  gh.setPull("octo-org/example", 8, { head: { ref: "feat-b", sha: C }, base: { ref: "main" }, updated_at: "2026-01-01T00:00:00Z" });
+  gh.setRuns("octo-org/example", A, [{ id: 41, name: "CI", status: "completed", conclusion: "success" }]);
+  gh.setRuns("octo-org/example", C, [{ id: 43, name: "CI", status: "completed", conclusion: "success" }]);
+  gh.setBaseRuns("octo-org/example", "main", [{ id: 1, name: "CI", status: "completed", conclusion: "success" }]);
+  // The folder is on a third branch, with no pull request; both PRs were subscribed by Claude. Worktrees share
+  // refs/remotes with their clone, so a push from a worktree moves origin/feat-a here.
+  const clone: Clone = { branch: "chore", pushed: null, remotes: { "feat-a": A, "feat-b": C } };
+  const s = await session(gh, clone);
+  s.subs.add({ repo: "octo-org/example", pr: 7, source: "tool" });
+  s.subs.add({ repo: "octo-org/example", pr: 8, source: "tool" });
+  await s.step(90); // half an hour of quiet: the slowest cadence, a look every five minutes
+  const pulls = (n: number) => gh.requests.filter((r) => r.path === `/repos/octo-org/example/pulls/${n}`).length;
+  const pr7 = () => s.subs.list().find((e) => e.pr === 7);
+  let pushedAt = -1;
+  await s.step(1, (p) => {
+    pushedAt = p;
+    if (clone.remotes) clone.remotes["feat-a"] = B;
+    gh.setPull("octo-org/example", 7, { head: { ref: "feat-a", sha: B }, base: { ref: "main" }, updated_at: "2026-01-01T00:30:00Z" });
+    gh.setRuns("octo-org/example", B, []); // CI has not registered yet
+  });
+  assert.equal(pr7()?.last?.headSha, B, `the worktree push was not seen at the pass after it (pass ${pushedAt})`);
+  const before7 = pulls(7);
+  const before8 = pulls(8);
+  await s.step(3);
+  assert.equal(pulls(7) - before7, 3, "the pushed PR is looked at every pass after the push");
+  assert.ok(pulls(8) - before8 <= 1, `the PR nobody pushed to stayed on its slow beat (${pulls(8) - before8} looks in 60 s)`);
+  await s.step(1, () => gh.setRuns("octo-org/example", B, [{ id: 42, name: "CI", status: "completed", conclusion: "failure" }]));
+  assert.ok(s.inbox.some((m) => m.meta.kind === "ci.workflow_failed" && m.meta.pr === "7"), "the failure was sent at the next pass");
+  // Five minutes after the push the fast beat ends.
+  await s.step(15);
+  const quiet = pulls(7);
+  await s.step(5);
+  await s.stop();
+  assert.ok(pulls(7) - quiet <= 1, `${pulls(7) - quiet} looks in 100 s after the fast beat ended`);
+});
+
+test("a ref the clone first reads for a PR is a baseline, not a push, and reading every pass costs no GitHub request", async () => {
+  // Two identical sessions with the folder on a branch of its own; only the first reads each watched PR's origin/<headRef>.
+  const hour = async (clone: Clone) => {
+    const gh = await quietPr();
+    const s = await session(gh, clone);
+    s.subs.add({ repo: "octo-org/example", pr: 7, source: "tool" });
+    await s.step(90);
+    const pulls = () => gh.requests.filter((r) => r.path === "/repos/octo-org/example/pulls/7").length;
+    const before = pulls();
+    await s.step(10); // a clone that already had origin/feat: its first reading must not put the PR on the fast beat
+    const looks = pulls() - before;
+    const from = gh.requests.length;
+    await s.step(180);
+    await s.stop();
+    return { looks, requests: gh.requests.length - from };
+  };
+  const reading = await hour({ branch: "chore", pushed: null, remotes: { feat: A } });
+  const without = await hour({ branch: "chore", pushed: null });
+  assert.ok(reading.looks <= 1, `${reading.looks} looks in 200 s of quiet`);
+  assert.equal(reading.requests, without.requests, "the refs are read from git, so a quiet hour costs what it did without them");
 });
 
 test("a push the session did not make does not change the cadence; the first reading of origin/<branch> is a baseline", async () => {

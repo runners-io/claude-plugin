@@ -5,6 +5,7 @@ import { test } from "node:test";
 
 import { FINISHED_MAX_MS, FINISHED_MS, PENDING_MS, PENDING_WINDOW_MS, RUNS_EVERY_MS, lookEveryMs, passSleepMs, phaseOf, ratePressure } from "../src/cadence.ts";
 import type { RunInfo } from "../src/github.ts";
+import { BASE_EVERY_MS, BASE_IDLE_MS } from "../src/rules.mjs";
 import type { Snapshot } from "../src/state.ts";
 
 const run = (status: string, conclusion: string | null = null): RunInfo => ({ id: 1, name: "CI", status, conclusion, htmlUrl: "", runAttempt: 1 });
@@ -77,4 +78,10 @@ test("a pass never sleeps past GitHub's reset for a back-off, and never multipli
   assert.equal(passSleepMs({ pollMs: 20_000, factor: 4, retryMs: 0, msToReset: null }), 80_000);
   assert.equal(passSleepMs({ pollMs: 20_000, factor: 4, retryMs: 120_000, msToReset: null }), 121_000);
   assert.equal(passSleepMs({ pollMs: 20_000, factor: 1, retryMs: 0, msToReset: 5_000 }), 20_000);
+});
+
+// The poller's base-read defaults live in rules.mjs, so the event-log check reads the same values.
+test("a base branch is read every minute while a PR on it is busy, every ten minutes once all have settled", () => {
+  assert.equal(BASE_EVERY_MS, 60_000);
+  assert.equal(BASE_IDLE_MS, 600_000);
 });
