@@ -69,6 +69,18 @@ export const REVIEW_EVERY_MS = 60_000;
 export const REQUESTS_EVERY_MS = 180_000;
 
 /**
+ * A repository scope's list of open pull requests (scopes.ts) is read this often: one conditional request, a 304
+ * (free) while nothing in the list changed, and shared between sessions. It stretches with the rate back-off and
+ * waits out a pause, like a finished pull request.
+ */
+export const SCOPE_EVERY_MS = 60_000;
+/**
+ * A pull request a scope holds that is no longer in the open list is looked at every pass for this long, so its
+ * merge or close is reported; one GitHub still calls open after that (past the list's first page) is dropped.
+ */
+export const SCOPE_LEAVE_MS = 120_000;
+
+/**
  * Below this share of the hourly rate limit left, every interval stretches in proportion. The limit belongs to the
  * GitHub login, which other sessions, gh and scripts share: at 20% several sessions were still polling at full
  * speed while the login ran out, so the channel now gives way from 30%.

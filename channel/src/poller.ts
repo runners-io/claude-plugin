@@ -16,9 +16,12 @@
  *   up to five minutes once it has settled. The branch's PR is looked for only
  *   while none is watched, and a base branch is read every minute only while
  *   one of its PRs is busy.
+ * - A REPOSITORY SCOPE (scopes.ts) IS A LIST, NOT A SECOND LOOP: once a minute the repository's open pull requests are
+ *   read (one conditional request), and each one the scope covers is held as an ordinary subscription, source
+ *   `scope`, within the session's cap. From there it is looked at, filtered and reported like any other.
  */
 import type { Config } from "./config.ts";
-import { JOB_READS_FLOOR, OWN_PUSH_FAST_MS, PENDING_WINDOW_MS, type Phase, REQUESTS_EVERY_MS, REVIEW_EVERY_MS, RUNS_EVERY_MS, lookEveryMs, passSleepMs, phaseOf, ratePressure } from "./cadence.ts";
+import { JOB_READS_FLOOR, OWN_PUSH_FAST_MS, PENDING_WINDOW_MS, type Phase, REQUESTS_EVERY_MS, REVIEW_EVERY_MS, RUNS_EVERY_MS, SCOPE_EVERY_MS, SCOPE_LEAVE_MS, lookEveryMs, passSleepMs, phaseOf, ratePressure } from "./cadence.ts";
 import { type JobsSeen, jobChanges } from "./jobs.ts";
 import { type RequestsSeen, requestChanges, requestMessage } from "./requests.ts";
 import { type ReviewState, reviewChanges } from "./reviews.ts";
@@ -30,6 +33,7 @@ import { log } from "./log.ts";
 import { BASE_EVERY_MS, BASE_IDLE_MS, baseVerdict, latestPerWorkflow } from "./rules.mjs";
 import { type Change, type EventKind, type Snapshot, allDoneChange, carry, diff, needsAttention } from "./state.ts";
 import type { HookRequest } from "./hookrequests.ts";
+import type { OpenPull, Scope, ScopeStore } from "./scopes.ts";
 import { AUTO_EVENTS, type Entry, MAX_HOOK_SUBSCRIPTIONS, MAX_SUBSCRIPTIONS, type Subscriptions, wants } from "./subscriptions.ts";
 
 /**
@@ -112,6 +116,12 @@ export interface PollerDeps {
   readonly reviewEveryMs?: number;
   /** How often this login's review requests are searched, when on (cadence.ts REQUESTS_EVERY_MS); tests set 0. */
   readonly requestsEveryMs?: number;
+  /** This project's scopes (scopes.ts); none: no repository is watched as a whole. */
+  readonly scopes?: ScopeStore;
+  /** How often a scope's list of open pull requests is read (cadence.ts SCOPE_EVERY_MS); tests set 0. */
+  readonly scopeEveryMs?: number;
+  /** How long a held pull request that left the open list is kept to report its end (cadence.ts SCOPE_LEAVE_MS); tests set 0. */
+  readonly scopeLeaveMs?: number;
   /** PRs the PostToolUse hook handed over since the last pass (hookrequests.ts takeRequests); none by default. */
   readonly takeHookRequests?: () => readonly HookRequest[];
   readonly limits?: Partial<typeof DEFAULT_LIMITS>;
@@ -222,6 +232,38 @@ function heldBack(windowMs: number): ChannelMessage {
       `This session has been told about as many CI and pull-request events as it is told about in ${Math.round(windowMs / 60_000)} minutes, ` +
       "so further events, on every watched pull request, are being held back for now. Call ci_status for a pull request's current state.",
     meta: { kind: "channel_held_back" },
+  };
+}
+
+/** How many pull request numbers a scope's notice names before it says "and n more". */
+const SCOPE_NAMED = 20;
+
+const numbered = (prs: readonly number[]) =>
+  prs.slice(0, SCOPE_NAMED).map((n) => `#${n}`).join(", ") + (prs.length > SCOPE_NAMED ? ` and ${prs.length - SCOPE_NAMED} more` : "");
+
+/**
+ * Said once when a scope covers more open pull requests than the session has places for, and again only after it has
+ * fitted in between: which are watched, and how many are not. Numbers and the repository's name only.
+ */
+function scopeCapped(repo: string, held: readonly number[], leftOut: number, total: number): ChannelMessage {
+  return {
+    content:
+      `The scope on ${repo} covers ${held.length + leftOut} open pull requests that nothing else here watches, but a session watches at most ${total} in all, ` +
+      `so it holds the newest ${held.length} (${held.length ? numbered(held) : "none"}) and leaves out the ${leftOut} older. ` +
+      `Nothing is pushed for those ${leftOut}: narrow the scope with involves: "me", unsubscribe pull requests this session no longer needs, ` +
+      "or call subscribe for one you need (it takes the place of the scope's oldest). list_subscriptions shows what is held; ci_status reads any pull request now. " +
+      "Tell the user in one line that the scope is over the cap and how many pull requests are left out.",
+    meta: { kind: "channel_scope_capped", repo, held: String(held.length), left_out: String(leftOut) },
+  };
+}
+
+/** Said once when GitHub does not show a scoped repository to this login: the scope holds nothing until it does. */
+function scopeNotVisible(repo: string): ChannelMessage {
+  return {
+    content:
+      `runners.io CI channel: GitHub does not show ${repo} to this GitHub login, so the scope on it holds no pull requests. ` +
+      'A private repository needs a gh login with the repo scope; end the scope with unsubscribe scope: "repo" if the name is wrong. Tell the user in one line.',
+    meta: { kind: "channel_scope_not_visible", repo },
   };
 }
 
@@ -353,6 +395,126 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
   };
   /** Per PR the hook handed over and not yet looked at: when the hook saw it (HOOK_NEW_MS). */
   const hookSeenAt = new Map<string, number>();
+
+  const scopeEveryMs = deps.scopeEveryMs ?? SCOPE_EVERY_MS;
+  const scopeLeaveMs = deps.scopeLeaveMs ?? SCOPE_LEAVE_MS;
+  /** Per scoped repository: its open pull requests as last read (null before the first answer), and when to read again. */
+  const discovered = new Map<string, { pulls: readonly OpenPull[] | null; full: boolean; next: number; saidCap: boolean; saidHidden: boolean }>();
+  /** Per pull request a scope holds that left the open list: since when. Looked at every pass until its end is reported. */
+  const leaving = new Map<string, number>();
+
+  /**
+   * THE SCOPES: for each repository scope, the repository's open pull requests (read at most every scopeEveryMs,
+   * through the shared store, so several sessions of a project ask once), and from them the subscriptions the scope
+   * holds. Three rules keep a scope from costing or saying more than the user chose:
+   *
+   * - IT NEVER UNDOES AN UNSUBSCRIBE. A pull request muted on its own (the mute tool, or the mute an unsubscribe
+   *   leaves while a scope covers the repository) is not held. That mute ends when the pull request leaves the open
+   *   list or the scope ends, so the list of mutes does not grow with every pull request ever unsubscribed.
+   * - IT STAYS WITHIN THE SESSION'S CAP. Each held pull request is a watch like any other, with the same requests
+   *   an hour, so a scope takes only the places nothing else has: the newest open pull requests first. What does
+   *   not fit is counted, shown by list_subscriptions and said once (scopeCapped), never dropped without a word.
+   * - A PULL REQUEST THAT LEAVES THE OPEN LIST IS LOOKED AT, NOT DROPPED: the look reports its merge or close once,
+   *   like any watched pull request's, and that ends the subscription.
+   *
+   * The store is read again first: another session of the project may have set or ended a scope.
+   */
+  const checkScopes = async () => {
+    const store = deps.scopes;
+    if (!store) return;
+    store.reload();
+    const scopes = store.list();
+    const scoped = new Set(scopes.map((s) => s.repo.toLowerCase()));
+    for (const e of subs.list()) if (e.source === "scope" && !scoped.has(e.repo.toLowerCase())) unsubscribe(e, "scope_ended");
+    for (const key of discovered.keys()) if (!scoped.has(key)) discovered.delete(key);
+    for (const key of subs.scopeHoldings.keys()) if (!scoped.has(key)) subs.scopeHoldings.delete(key);
+    subs.mutes.endScopeMutes((repo) => !scoped.has(repo.toLowerCase()));
+    for (const scope of scopes) {
+      if (signal.aborted) return;
+      const key = scope.repo.toLowerCase();
+      const p = pressure();
+      let d = discovered.get(key) ?? { pulls: null, full: false, next: 0, saidCap: false, saidHidden: false };
+      if (now() >= d.next && !p.pause) {
+        const r = await gh.openPulls(scope.repo, scopeEveryMs > 0 ? scopeEveryMs - 1_000 : 0);
+        if (r.kind === "auth") {
+          await problem(r.auth);
+          return;
+        }
+        if (r.kind === "ok") {
+          d = { ...d, pulls: r.value.pulls, full: r.value.full, next: now() + scopeEveryMs * p.stretch, saidHidden: false };
+        } else {
+          events.write("api_error", { repo: scope.repo, result: r.kind, what: "scope", ...(r.kind === "retry" ? { reason: r.reason } : {}) });
+          d = { ...d, next: now() + Math.max(scopeEveryMs, r.kind === "retry" ? (r.afterMs ?? 0) : 0) };
+          if (r.kind === "not_found" && d.pulls === null) {
+            subs.scopeHoldings.set(key, { held: [], leftOut: 0, more: false, problem: "GitHub does not show this repository to this GitHub login" });
+            if (!d.saidHidden) {
+              d = { ...d, saidHidden: true };
+              discovered.set(key, d);
+              await send(scopeNotVisible(scope.repo), null);
+            }
+          }
+        }
+        discovered.set(key, d);
+      }
+      if (d.pulls === null) continue;
+      d = await holdScope(scope, key, { ...d, pulls: d.pulls });
+      discovered.set(key, d);
+    }
+  };
+
+  /** Makes the subscriptions a scope holds match its repository's open pull requests, as the rules above say. */
+  const holdScope = async <D extends { pulls: readonly OpenPull[]; full: boolean; saidCap: boolean }>(scope: Scope, key: string, d: D): Promise<D> => {
+    const mine = (e: Entry) => e.source === "scope" && e.repo.toLowerCase() === key;
+    let me: string | null = null;
+    if (scope.involves === "me") {
+      // Not known (GitHub did not say) is not a yes: nothing new is held, and what is held stays, until the login is known.
+      const login = await gh.viewerLogin();
+      me = login.kind === "ok" && login.value ? login.value.toLowerCase() : null;
+      if (me === null) {
+        subs.scopeHoldings.set(key, { held: subs.list().filter(mine).map((e) => e.pr), leftOut: 0, more: d.full, problem: "GitHub did not say which login is signed in, so the scope could not tell which pull requests involve you" });
+        return d;
+      }
+    }
+    const open = new Set(d.pulls.map((p) => p.number));
+    subs.mutes.endScopeMutes((repo, pr) => repo.toLowerCase() === key && !open.has(pr));
+    const covered = d.pulls.filter((p) => (me === null || p.involved.includes(me)) && !subs.mutes.mutesPr(scope.repo, p.number));
+    const coveredNumbers = new Set(covered.map((p) => p.number));
+    for (const e of subs.list().filter(mine)) {
+      if (coveredNumbers.has(e.pr)) {
+        leaving.delete(e.key);
+      } else if (!open.has(e.pr) && e.last !== null) {
+        if (!leaving.has(e.key)) leaving.set(e.key, now());
+        const look = looks.get(e.key);
+        if (look) look.next = now();
+      } else {
+        unsubscribe(e, open.has(e.pr) ? (subs.mutes.mutesPr(e.repo, e.pr) ? "muted" : "scope_not_involved") : "scope_left");
+      }
+    }
+    // The pull requests only the scope would watch: one Claude, the hook or the branch already watches keeps its own
+    // subscription and takes no second place.
+    const unowned = covered.filter((p) => {
+      const e = subs.get(scope.repo, p.number);
+      return !e || e.source === "scope";
+    });
+    const unownedNumbers = new Set(unowned.map((p) => p.number));
+    const taken = subs.list().filter((e) => !(mine(e) && unownedNumbers.has(e.pr))).length;
+    const hold = unowned.slice(0, Math.max(0, limits.total - taken));
+    const holdNumbers = new Set(hold.map((p) => p.number));
+    for (const e of subs.list().filter(mine)) if (unownedNumbers.has(e.pr) && !holdNumbers.has(e.pr)) unsubscribe(e, "scope_cap");
+    for (const p of hold) {
+      if (subs.get(scope.repo, p.number)) continue;
+      subs.add({ repo: scope.repo, pr: p.number, source: "scope" });
+      events.write("subscribe", { repo: scope.repo, pr: p.number, source: "scope", events: [...AUTO_EVENTS] });
+    }
+    const held = hold.map((p) => p.number);
+    const leftOut = unowned.length - hold.length;
+    subs.scopeHoldings.set(key, { held, leftOut, more: d.full, problem: null });
+    if (leftOut === 0) return { ...d, saidCap: false };
+    if (d.saidCap) return d;
+    events.write("scope_capped", { repo: scope.repo, held: held.length, left_out: leftOut, total: limits.total });
+    await send(scopeCapped(scope.repo, held, leftOut, limits.total), null);
+    return { ...d, saidCap: true };
+  };
 
   const problem = async (p: GhProblem) => {
     if (saidProblem !== p.kind) {
@@ -513,7 +675,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
    */
   function forgetEnded(): void {
     const watched = new Set(subs.list().map((e) => e.key));
-    const perPr: Map<string, unknown>[] = [startedFor, sentAt, throttledPrs, firstFailureFor, misses, looks, reviews, jobsSeen, hookSeenAt, held];
+    const perPr: Map<string, unknown>[] = [startedFor, sentAt, throttledPrs, firstFailureFor, misses, looks, reviews, jobsSeen, hookSeenAt, held, leaving];
     for (const map of perPr) for (const key of map.keys()) if (!watched.has(key)) map.delete(key);
     // A hook's hand-over time matters only while the hook's own subscription stands (Claude's subscribe outranks it).
     for (const key of hookSeenAt.keys()) if (!subs.list().some((e) => e.key === key && e.source === "hook")) hookSeenAt.delete(key);
@@ -529,6 +691,8 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
     jobsSeen: jobsSeen.size,
     hookSeenAt: hookSeenAt.size,
     held: held.size,
+    leaving: leaving.size,
+    discovered: discovered.size,
     bases: bases.size,
     requestIds: requests.seen?.ids.size ?? 0,
     etagEntries: gh.etagEntries,
@@ -666,14 +830,18 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
         continue;
       }
       const all = subs.list();
-      if (all.length >= limits.total || all.filter((x) => x.source === "hook").length >= limits.hook) {
+      // A scope only fills the places nobody asked for: at the cap, its oldest pull request makes room for the hook's.
+      const room = all.length < limits.total ? null : subs.oldestScopeEntry();
+      if ((all.length >= limits.total && !room) || all.filter((x) => x.source === "hook").length >= limits.hook) {
         refuse("cap");
         continue;
       }
+      if (room) unsubscribe(room, "scope_cap");
       const e = subs.add({ repo: req.repo, pr: req.pr, source: "hook" });
       hookSeenAt.set(e.key, req.at);
       events.write("subscribe", { repo: req.repo, pr: req.pr, source: "hook", events: [...AUTO_EVENTS] });
     }
+    await checkScopes();
     forgetEnded();
     for (const entry of subs.list()) {
       if (signal.aborted) break;
@@ -802,6 +970,8 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
       }
       live.last = carry(live.last, snap);
       if (snap.state !== "open") unsubscribe(live, snap.state);
+      // Gone from its scope's open list, and GitHub still calls it open after the wait: past the list's first page.
+      else if (live.source === "scope" && leaving.has(live.key) && now() - (leaving.get(live.key) ?? 0) >= scopeLeaveMs) unsubscribe(live, "scope_left");
     }
 
     await checkBases();

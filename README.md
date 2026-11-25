@@ -28,11 +28,11 @@ in to github.com. If you don't have `gh`, the plugin's `setup-github` skill walk
 your agreement, and you sign in with `! gh auth login --web --scopes repo`.
 
 ```bash
-claude plugin marketplace add runners-io/claude-plugin#v0.3.12
+claude plugin marketplace add runners-io/claude-plugin#v0.3.13
 claude plugin install runners-io@runners-io
 ```
 
-This installs exactly one release: every release has a new version and a tag of its own (`v0.3.12` is this one), and
+This installs exactly one release: every release has a new version and a tag of its own (`v0.3.13` is this one), and
 the `#` and tag pin the marketplace to it. We do not move a release tag once it is published, so updating that
 marketplace never takes you past the release you chose. To move to a newer release, run
 `claude plugin marketplace remove runners-io` (which uninstalls the plugin), then the two commands above with the newer
@@ -60,7 +60,7 @@ Or from inside a session: `/plugin marketplace add runners-io/claude-plugin`, th
 To install from a copy you have checked out and read yourself:
 
 ```bash
-git clone --branch v0.3.12 --depth 1 https://github.com/runners-io/claude-plugin.git
+git clone --branch v0.3.13 --depth 1 https://github.com/runners-io/claude-plugin.git
 claude plugin marketplace add ./claude-plugin
 claude plugin install runners-io@runners-io
 ```
@@ -149,18 +149,56 @@ option on hears every request, which is why it is off by default.
 
 | tool | what it does |
 |---|---|
-| `subscribe` | watch a pull request (`repo` and `pr`; by default the current branch's), optionally only some `events`. It answers the PR's state now; after that only changes are pushed |
-| `unsubscribe` | stop watching one pull request (with no arguments, the current branch's), every one in a repository (`whole_repo: true`), or everything (`all: true`) |
-| `list_subscriptions` | what this session watches |
+| `subscribe` | watch a pull request (`repo` and `pr`; by default the current branch's), optionally only some `events`. It answers the PR's state now; after that only changes are pushed. With `scope: "repo"`, watch a whole repository (below) |
+| `unsubscribe` | stop watching one pull request (with no arguments, the current branch's), every one in a repository (`whole_repo: true`), or everything (`all: true`). With `scope: "repo"`, end a repository's scope |
+| `list_subscriptions` | what this session watches: the scopes set for the project, what each holds and leaves out, the pull requests, and the mutes |
 | `ci_status` | a pull request's state now, without subscribing |
 | `mute` | stop hearing, in this session only, a pull request (`repo` and `pr`), some `kinds` on every pull request, kinds on one pull request, or one `workflow` by name. At most 50 |
 | `unmute` | remove a mute (the same fields it was made with), or every one (`all: true`) |
 
 Subscriptions and mutes live in the channel's process, so each session has its own, other sessions are not affected,
-and they end with the session; nothing is written to disk. A merged or closed pull request ends its own subscription.
+and they end with the session; nothing is written to disk but a repository scope (below). A merged or closed pull request ends its own subscription.
 Unsubscribing the current branch's pull request mutes it until the branch changes, so the automatic watch does not
 add it back, whichever way it was being watched; a pull request muted on its own is never watched automatically. A
 moment when git reads no branch (mid-rebase, or a timeout) is not a branch change. `list_subscriptions` shows the mutes.
+
+### A whole repository (a scope)
+
+`subscribe` with `scope: "repo"` watches the open pull requests of a repository (`repo`, by default the session's own),
+ones opened later included, with no further `subscribe` call. So Claude no longer subscribes to each pull request it
+opens there: the server's instructions and the watch-this-pr skill tell it to subscribe after `gh pr create` only when
+no scope covers the repository.
+
+- **Kept for the project.** A scope is the one choice written to disk: one file per project, `0600` in a `0700` folder,
+  under the plugin's data folder (`CLAUDE_PLUGIN_DATA`, else `$XDG_STATE_HOME/runners-io`, else
+  `~/.local/state/runners-io`), in `scopes/<hash of the project folder>.json`. It holds repository names and the choices
+  made: nothing GitHub sent, and no token. A restarted session goes on watching, and every session of the project
+  shares it. A file that is a symlink, belongs to another user or cannot be read is never used or replaced: the scope
+  then holds for the session only, and `list_subscriptions` says why.
+- **`involves`.** `all` (the default for a repository) is every open pull request. `me` is those your GitHub login
+  opened, is assigned to or is asked to review. That is read from the list of open pull requests itself, with no
+  further request, so a pull request you only commented on, and a review asked of a team you are in, are not counted.
+- **What it sends.** What the current branch's pull request sends: every kind but `ci.workflow_succeeded`,
+  `ci.workflow_started` and `ci.job_stuck_queued`, each as it happens, with the same filters and budgets as any watched
+  pull request. A pull request opened by somebody else is reported as theirs: Claude tells you, and reads its log only
+  if you ask. A pull request that merges or closes is reported once and dropped.
+- **What it costs.** One request a minute for the repository's list of open pull requests, free while the list is
+  unchanged and shared between sessions; the newest 100 open pull requests are read. Each pull request the scope
+  holds is then a watch like any other: about 24 GitHub requests an hour while it is quiet, more while its CI runs,
+  and about 60 GraphQL points an hour for the review kinds. Twenty quiet pull requests are about 480 requests an hour
+  of your login's limit; the back-off under "What you get" applies to a scope's reads as to the rest.
+- **The cap.** A scope's pull requests count towards the 20 a session watches. A scope takes only the places nothing
+  else has, the newest open pull requests first, and when more are open than fit, the channel says so once
+  (`channel_scope_capped`: which are held, how many are left out) and `list_subscriptions` shows it. A pull request
+  Claude subscribes to by name, the hook's and the branch's keep their places, and at the cap a `subscribe` by name
+  takes the place of the scope's oldest. On a busy repository, `involves: "me"` is the scope that fits.
+- **Unsubscribing under a scope.** Unsubscribing one pull request of a scoped repository mutes it in this session, so
+  the scope does not add it back; the mute ends when the pull request closes or the scope ends, or with `unmute` or a
+  `subscribe` by name. `unsubscribe` with `scope: "repo"` ends the scope, for the project. `whole_repo: true` and
+  `all: true` end the scopes they cover as well, and say so, because a scope left standing would watch everything again
+  within a minute.
+
+Only a repository can be a scope: an organisation or a whole account is refused.
 
 **A pull request just opened in this repository** is watched without a subscribe call when a tool's output names it,
 whether Claude ran `gh pr create` or a script opened it, but only when all of these hold: it is in the repository your
@@ -279,7 +317,8 @@ reset, and when GitHub refuses a request for the limit, the channel waits until 
 ## What is sent, and what is never sent
 
 **From your machine to GitHub, with your own `gh` login:** requests to read the signed-in login's name (`/user`), the
-open pull request for the current branch, the watched pull requests, the workflow runs on each one's head commit, the
+open pull request for the current branch, the open pull requests of each repository a scope covers, the watched pull
+requests, the workflow runs on each one's head commit, the
 jobs of each run that has not finished and of a failed run, a failed job's annotations (file, line and level only),
 the latest push runs on each watched pull request's base branch, and, through GraphQL, each watched pull request's
 reviews, review threads and merge state; with review requests on (`RUNNERS_IO_REVIEW_REQUESTS=on`), also a GraphQL
@@ -300,7 +339,8 @@ connecting to it.
 **Never sent, by the channel, to anyone:** your code, diffs or files, your prompts, the conversation, Claude's replies,
 or anything else about the session.
 
-**No reply path, no permission relay.** The channel's tools change only which pull requests this session watches.
+**No reply path, no permission relay.** The channel's tools change only which pull requests this session watches (and
+the project's scope file, on your own disk).
 The channel does **not** declare Claude Code's permission relay, so a CI event can never approve a tool call: approvals
 stay in your terminal.
 

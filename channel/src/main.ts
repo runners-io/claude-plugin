@@ -17,13 +17,14 @@ import { GitHubClient, readGhAuth } from "./github.ts";
 import { log } from "./log.ts";
 import { startMcp } from "./mcp.ts";
 import { runPoller } from "./poller.ts";
+import { ScopeStore, defaultScopeRoot, scopeFile } from "./scopes.ts";
 import { Subscriptions } from "./subscriptions.ts";
 import { INSTRUCTIONS } from "./instructions.ts";
 import { makeTools } from "./tools.ts";
 import { NO_EVENT_LOG, openEventLog } from "./eventlog.ts";
 import { findLaunch, pollsIn } from "../../hooks/launch.mjs";
 
-export const VERSION = "0.3.12";
+export const VERSION = "0.3.13";
 
 function serve(): void {
   const config = loadConfig();
@@ -31,6 +32,9 @@ function serve(): void {
     shared: new SharedStore(defaultSharedRoot()),
   });
   const subs = new Subscriptions();
+  // This project's repository scopes (scopes.ts): the one choice kept beyond the session, in the plugin's own data
+  // folder. The tools set and end them; the poller holds their pull requests.
+  const scopes = new ScopeStore(scopeFile(defaultScopeRoot(), config.projectDir));
   const readScope = () => readGitScope(config.projectDir);
   const stop = new AbortController();
   const eventLog = config.eventLogDir
@@ -59,7 +63,7 @@ function serve(): void {
     name: "runners-io",
     version: VERSION,
     instructions: INSTRUCTIONS,
-    tools: makeTools({ subs, gh, readScope, eventLog, liveEvents }),
+    tools: makeTools({ subs, gh, readScope, eventLog, liveEvents, scopes }),
     onReady: () => {
       if (!liveEvents) {
         if (launch === "off") eventLog.write("channel_inactive", { launch });
@@ -70,6 +74,7 @@ function serve(): void {
         config,
         gh,
         subs,
+        scopes,
         readScope,
         notify: (m) => server.notify(m),
         signal: stop.signal,

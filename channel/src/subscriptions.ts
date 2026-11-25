@@ -56,6 +56,11 @@ export interface Mute {
   readonly workflow?: string;
   /** Made by unsubscribing the branch's automatic watch: it ends when the session's branch changes. */
   readonly untilBranchChange?: boolean;
+  /**
+   * Made by unsubscribing a pull request while a scope covers its repository: the scope's next look at the repository
+   * must not add it back. It ends when the pull request leaves the repository's open list or the scope ends.
+   */
+  readonly whileScoped?: boolean;
 }
 
 /** What one change is, for matching against the mutes. */
@@ -100,6 +105,18 @@ export class Mutes {
     for (const [key, m] of this.entries) if (m.untilBranchChange) this.entries.delete(key);
   }
 
+  /** Ends the mutes an unsubscribe left under a scope (`whileScoped`) that `over` says are over. Answers how many. */
+  endScopeMutes(over: (repo: string, pr: number) => boolean): number {
+    let n = 0;
+    for (const [key, m] of this.entries) {
+      if (m.whileScoped && m.repo !== undefined && m.pr !== undefined && over(m.repo, m.pr)) {
+        this.entries.delete(key);
+        n++;
+      }
+    }
+    return n;
+  }
+
   list(): Mute[] {
     return [...this.entries.values()];
   }
@@ -132,10 +149,36 @@ export function wants(entry: Entry, kind: EventKind): boolean {
   return entry.events === "all" || entry.events.has(kind);
 }
 
+/**
+ * What a scope holds now, as the poller last worked it out, for list_subscriptions: the pull requests it watches, how
+ * many more it would watch but for the session's cap, and whether GitHub's list was cut at its first page.
+ */
+export interface ScopeHolding {
+  readonly held: readonly number[];
+  /** Open pull requests the scope covers that are not watched, because the session watches MAX_SUBSCRIPTIONS already. */
+  readonly leftOut: number;
+  /** GitHub's list came back full: the repository may hold more open pull requests than the scope has seen. */
+  readonly more: boolean;
+  /** Why the scope holds nothing new just now (GitHub does not show the repository, or the login is not known), or null. */
+  readonly problem: string | null;
+}
+
 export class Subscriptions {
   private readonly entries = new Map<string, Entry>();
   /** This session's mutes: held beside the subscriptions so the tools and the poller share them. */
   readonly mutes = new Mutes();
+  /** Per scoped repository (lower-cased): what its scope holds, written by the poller and read by list_subscriptions. */
+  readonly scopeHoldings = new Map<string, ScopeHolding>();
+
+  /**
+   * The pull request a scope holds that goes first when the session is full and somebody who outranks a scope (Claude,
+   * the hook) wants a place: the lowest-numbered, so the oldest. None when no scope holds any.
+   */
+  oldestScopeEntry(): Entry | undefined {
+    let oldest: Entry | undefined;
+    for (const e of this.entries.values()) if (e.source === "scope" && (!oldest || e.pr < oldest.pr)) oldest = e;
+    return oldest;
+  }
 
   /** Adds or replaces, never with a lower-ranked source: Claude's own beats the hook's, then the branch's, then a scope's. */
   add(input: { repo: string; pr: number; events?: readonly EventKind[] | "all"; source: Source; last?: Snapshot | null }): Entry {

@@ -162,7 +162,10 @@ test("discovery reads the repository's open pull requests, newest first, and an 
   const first = await discoverRepoPulls(get, "acme/widgets", null);
   assert.equal(first.kind, "ok");
   if (first.kind !== "ok") return;
-  assert.deepEqual(first.pulls, [{ number: 9, headSha: "9".repeat(40) }, { number: 7, headSha: "7".repeat(40) }]);
+  assert.deepEqual(first.pulls, [
+    { number: 9, headSha: "9".repeat(40), involved: ["octocat"] },
+    { number: 7, headSha: "7".repeat(40), involved: ["octocat"] },
+  ]);
   assert.equal(first.changed, true);
   assert.equal(first.full, false);
   const path = "/repos/acme/widgets/pulls?state=open&per_page=100";
@@ -191,5 +194,5 @@ test("discovery keeps only well-formed entries: a number and a full head commit,
     "junk",
   ];
   const r = await discoverRepoPulls(async () => ({ status: 200, etag: null, body }), "acme/widgets", null);
-  assert.deepEqual(r, { kind: "ok", pulls: [{ number: 5, headSha: "5".repeat(40) }], etag: null, changed: true, full: false });
+  assert.deepEqual(r, { kind: "ok", pulls: [{ number: 5, headSha: "5".repeat(40), involved: [] }], etag: null, changed: true, full: false });
 });

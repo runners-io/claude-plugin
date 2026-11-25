@@ -69,7 +69,8 @@ export function contextFor(input, own) {
   return (
     `You opened ${repo} PR #${pr}. Call the runners-io channel's subscribe tool now ` +
     `(mcp__plugin_runners-io_runners-io__subscribe) with repo="${repo}" pr=${pr}: without it this session is not told ` +
-    "when that PR's CI fails, waits for approval or finishes, or when it gets a merge conflict. " +
+    "when that PR's CI fails, waits for approval or finishes, or when it gets a merge conflict " +
+    `(unless a repository scope already covers ${repo}: list_subscriptions shows the scopes, and then no call is needed). ` +
     'Results arrive as <channel source="runners-io"> events if this session was started with the runners-io channel; ' +
     "if none arrive, call ci_status to check."
   );

@@ -19,6 +19,7 @@ import { log } from "./log.ts";
 import { REVIEW_QUERY, type ReviewState, graphqlRate, parseReviewState } from "./reviews.ts";
 import { type Annotation, type JobInfo, parseAnnotations, parseJobs } from "./jobs.ts";
 import { REQUESTS_QUERY, REQUESTS_SEARCH, type RequestsReading, parseReviewRequests } from "./requests.ts";
+import { type OpenPull, isOpenPulls, openPullsPath, parseOpenPulls } from "./scopes.ts";
 import type { LoginStore, SharedStore, Stored } from "./shared.ts";
 
 export type GhAuth =
@@ -393,6 +394,19 @@ export class GitHubClient {
       const first = Array.isArray(j) ? (j[0] as { number?: unknown } | undefined) : undefined;
       return first && isId(first.number) ? first.number : null;
     }, STORED.prNumber);
+  }
+
+  /**
+   * A repository's open pull requests, newest first, for a repository scope (scopes.ts): one conditional GET, a 304
+   * while the list is unchanged, shared between sessions for `freshMs`. `full`: the page came back full, so the
+   * repository may hold more than these. A name GitHub would not allow is not_found, without a request.
+   */
+  async openPulls(repo: string, freshMs = this.freshMs): Promise<ApiResult<{ pulls: OpenPull[]; full: boolean }>> {
+    const path = openPullsPath(repo);
+    if (path === null) return { kind: "not_found" };
+    const r = await this.get(path, freshMs, parseOpenPulls, (v) => v === null || isOpenPulls(v));
+    if (r.kind !== "ok") return r;
+    return r.value === null ? { kind: "retry", reason: "GitHub answered something that is not a list of pull requests" } : { kind: "ok", value: r.value };
   }
 
   /**

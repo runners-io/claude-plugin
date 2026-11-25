@@ -36,7 +36,10 @@ export interface RepoScope {
   readonly repo: string;
   /** `all`: every open pull request. `me`: those that involve the signed-in GitHub login. */
   readonly involves: Involves;
-  /** Every event kind is pushed for a scope's pull requests. */
+  /**
+   * Always "all": a scope's pull requests are not narrowed by kind. What they push is what the branch's own pull
+   * request pushes (subscriptions.ts AUTO_EVENTS): every kind but the per-workflow successes and starts.
+   */
   readonly events: "all";
 }
 
@@ -223,10 +226,19 @@ export class ScopeStore {
 /** One conditional JSON GET: the poller passes its GitHub client's; a test passes its own. `etag` null: unconditional. */
 export type JsonGet = (path: string, etag: string | null) => Promise<{ status: number; etag: string | null; body: unknown }>;
 
-/** An open pull request, as discovery keeps it: its number and head commit, and none of GitHub's text. */
+/**
+ * An open pull request, as discovery keeps it: its number, its head commit and the logins it involves. None of
+ * GitHub's free text (title, body, branch or label names) is kept.
+ */
 export interface OpenPull {
   readonly number: number;
   readonly headSha: string;
+  /**
+   * The logins the list itself names for it, lower-cased: who opened it, who is assigned to it and who is asked to
+   * review it. A scope with `involves: "me"` is decided from these alone, with no further request, so somebody who
+   * only commented, and a review asked of a team, are not counted.
+   */
+  readonly involved: readonly string[];
 }
 
 export type Discovered =
@@ -246,15 +258,68 @@ export type Discovered =
 
 export const DISCOVERY_PAGE = 100;
 const SHA = /^[0-9a-f]{40}$/;
+/** A GitHub login as discovery keeps one: a user's, or an app's (`name[bot]`). Anything else is dropped. */
+const LOGIN = /^[a-z0-9][a-z0-9-]{0,38}(\[bot\])?$/;
+
+/** The one request discovery makes, or null for a repository name GitHub would not allow. */
+export function openPullsPath(repo: string): string | null {
+  if (!isRepoName(repo)) return null;
+  const [owner, name] = repo.split("/") as [string, string];
+  return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/pulls?state=open&per_page=${DISCOVERY_PAGE}`;
+}
+
+/** What the list's answer holds, or null when it is not a list: the well-formed open pull requests, newest first. */
+export function parseOpenPulls(body: unknown): { pulls: OpenPull[]; full: boolean } | null {
+  if (!Array.isArray(body)) return null;
+  const pulls: OpenPull[] = [];
+  for (const item of body as unknown[]) {
+    if (typeof item !== "object" || item === null) continue;
+    const p = item as { number?: unknown; state?: unknown; head?: { sha?: unknown } | null; user?: unknown; assignees?: unknown; requested_reviewers?: unknown };
+    if (typeof p.number !== "number" || !Number.isInteger(p.number) || p.number < 1 || p.state !== "open") continue;
+    const sha = p.head?.sha;
+    if (typeof sha !== "string" || !SHA.test(sha)) continue;
+    const involved = new Set<string>();
+    for (const who of [p.user, ...(Array.isArray(p.assignees) ? p.assignees : []), ...(Array.isArray(p.requested_reviewers) ? p.requested_reviewers : [])]) {
+      const login = typeof who === "object" && who !== null ? (who as { login?: unknown }).login : undefined;
+      if (typeof login === "string" && LOGIN.test(login.toLowerCase())) involved.add(login.toLowerCase());
+    }
+    pulls.push({ number: p.number, headSha: sha, involved: [...involved].sort() });
+  }
+  pulls.sort((a, b) => b.number - a.number);
+  return { pulls, full: body.length >= DISCOVERY_PAGE };
+}
+
+/** Whether a stored list (shared.ts) has the shape parseOpenPulls gives: another process of this user can write the store. */
+export function isOpenPulls(value: unknown): value is { pulls: OpenPull[]; full: boolean } {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as { pulls?: unknown; full?: unknown };
+  return (
+    typeof v.full === "boolean" &&
+    Array.isArray(v.pulls) &&
+    v.pulls.every((p) => {
+      if (typeof p !== "object" || p === null) return false;
+      const x = p as { number?: unknown; headSha?: unknown; involved?: unknown };
+      return (
+        typeof x.number === "number" &&
+        Number.isSafeInteger(x.number) &&
+        x.number > 0 &&
+        typeof x.headSha === "string" &&
+        SHA.test(x.headSha) &&
+        Array.isArray(x.involved) &&
+        x.involved.every((l) => typeof l === "string" && LOGIN.test(l))
+      );
+    })
+  );
+}
 
 /**
  * A repository's open pull requests: `GET /repos/{owner}/{name}/pulls?state=open&per_page=100`, sent with the
- * previous answer's ETag. The repository name is checked before it is put in the path.
+ * previous answer's ETag. The repository name is checked before it is put in the path. The poller makes the same
+ * request through its GitHub client (github.ts `openPulls`), which shares the answer between sessions.
  */
 export async function discoverRepoPulls(get: JsonGet, repo: string, previous: Extract<Discovered, { kind: "ok" }> | null): Promise<Discovered> {
-  if (!isRepoName(repo)) return { kind: "invalid" };
-  const [owner, name] = repo.split("/") as [string, string];
-  const path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/pulls?state=open&per_page=${DISCOVERY_PAGE}`;
+  const path = openPullsPath(repo);
+  if (path === null) return { kind: "invalid" };
   let res: Awaited<ReturnType<JsonGet>>;
   try {
     res = await get(path, previous?.etag ?? null);
@@ -262,16 +327,7 @@ export async function discoverRepoPulls(get: JsonGet, repo: string, previous: Ex
     return { kind: "error", status: 0 };
   }
   if (res.status === 304 && previous) return { ...previous, changed: false };
-  if (res.status !== 200 || !Array.isArray(res.body)) return { kind: "error", status: res.status };
-  const pulls: OpenPull[] = [];
-  for (const item of res.body as unknown[]) {
-    if (typeof item !== "object" || item === null) continue;
-    const p = item as { number?: unknown; state?: unknown; head?: { sha?: unknown } | null };
-    if (typeof p.number !== "number" || !Number.isInteger(p.number) || p.number < 1 || p.state !== "open") continue;
-    const sha = p.head?.sha;
-    if (typeof sha !== "string" || !SHA.test(sha)) continue;
-    pulls.push({ number: p.number, headSha: sha });
-  }
-  pulls.sort((a, b) => b.number - a.number);
-  return { kind: "ok", pulls, etag: res.etag, changed: true, full: res.body.length >= DISCOVERY_PAGE };
+  const parsed = res.status === 200 ? parseOpenPulls(res.body) : null;
+  if (!parsed) return { kind: "error", status: res.status };
+  return { kind: "ok", pulls: parsed.pulls, etag: res.etag, changed: true, full: parsed.full };
 }
