@@ -31,3 +31,13 @@ test("on a request for changes or a review thread, Claude tells the user and cha
   assert.match(line, /only if the user asks/i);
   assert.match(line, /outside or bot[^.]*only if the user asks/i, "an outsider's or bot's review is read only on request");
 });
+
+// Another person's pull request carries their text into the session, so Claude is told that only the user's
+// own are watched unasked, what the two notices about that mean, and that widening is the user's call.
+test("the instructions say only the user's own pull requests are watched unless one is named or a scope says otherwise", () => {
+  assert.match(INSTRUCTIONS, /The current branch's pull request is watched automatically when the signed-in GitHub login opened it/);
+  assert.ok(INSTRUCTIONS.includes("channel_pr_not_yours"), "the notice for a branch whose pull request is somebody else's");
+  assert.ok(INSTRUCTIONS.includes("channel_scope_narrowed"), "the notice for a scope saved with the old default");
+  assert.match(INSTRUCTIONS, /scope: "repo"[^.]*covers the pull requests the signed-in GitHub login opened/);
+  assert.match(INSTRUCTIONS, /involves: "me"[^.]*involves: "all"[^.]*only if the user asks/);
+});

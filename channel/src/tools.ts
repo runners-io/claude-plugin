@@ -17,7 +17,7 @@ import type { GitScope } from "./git.ts";
 import { ForkParents, findBranchPull } from "./forks.ts";
 import type { GitHubClient } from "./github.ts";
 import { fetchSnapshot } from "./poller.ts";
-import { type Involves, type ScopeStore, isRepoName } from "./scopes.ts";
+import { DEFAULT_INVOLVES, INVOLVES, type Involves, type ScopeStore, isRepoName } from "./scopes.ts";
 import { EVENT_KINDS, type EventKind, isEventKind } from "./state.ts";
 import { AUTO_QUIET_KINDS, type Entry, MAX_MUTES, MAX_SUBSCRIPTIONS, type Mute, type Subscriptions } from "./subscriptions.ts";
 
@@ -56,18 +56,26 @@ export const WATCH_COST =
 
 /**
  * What a repository scope is and costs, in the subscribe description, so the choice is made knowing it: a scope's
- * pull requests are watches like any other, inside the same cap, and `involves` is decided from the list alone.
+ * pull requests are watches like any other, inside the same cap, and `involves` is decided from the list alone. By
+ * default a scope covers only the login's own pull requests: other people's are an explicit choice.
  */
 export const SCOPE_COST =
-  ' With scope: "repo", it watches the open pull requests of the whole repository instead, ones opened later included, with no further ' +
+  ' With scope: "repo", it watches the open pull requests the signed-in GitHub login opened in the whole repository instead, ones opened later included, with no further ' +
   "subscribe call, and keeps that for this project across restarts; after gh pr create there, call subscribe only if no scope covers the " +
   "repository (list_subscriptions shows the scopes). Each pull request a scope holds is a watch like any other: it costs the same and " +
   `counts towards the same ${MAX_SUBSCRIPTIONS}, so a scope takes only the places nothing else has, the newest open pull requests first, and ` +
   "says how many it left out (list_subscriptions shows them too); a subscribe for one pull request takes the place of the scope's oldest. " +
   "Reading the repository's list is one more request a minute, free while the list is unchanged; the newest 100 open pull requests are read. " +
   `A scope's pull requests push what the current branch's does: every kind but ${AUTO_QUIET_KINDS.join(", ")}. ` +
-  'involves: "me" narrows the scope to pull requests the signed-in GitHub login opened, is assigned to or is asked to review, read from ' +
-  "that list with no further request: one the login only commented on, or was asked to review as a member of a team, is not counted.";
+  "Other people's pull requests are covered only when asked for by name, so pass these only if the user asks: " +
+  'involves: "me" widens the scope to pull requests the login opened, is assigned to or is asked to review, read from ' +
+  "that list with no further request (one the login only commented on, or was asked to review as a member of a team, is not counted), " +
+  'and involves: "all" to every open pull request in the repository.';
+
+/** Whose pull requests are watched unasked, in the subscribe description: the user's own, and anybody's only by name. */
+export const OWN_ONLY =
+  "Only pull requests the signed-in GitHub login opened are watched without being named: for somebody else's, pass repo and pr, " +
+  "and only if the user asks, since its events carry that person's text into the session. ";
 
 const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
 
@@ -77,7 +85,8 @@ const target = {
     type: "integer",
     minimum: 1,
     description:
-      "Pull request number. Default: the open pull request for the current branch; with no repo named, in a fork that is the one on the repository it was forked from, when there is one.",
+      "Pull request number. Default: the open pull request for the current branch; with no repo named, in a fork that is the one on the repository it was forked from, when there is one. " +
+      "subscribe takes that default only for a pull request the signed-in GitHub login opened: somebody else's must be named.",
   },
 } as const;
 
@@ -114,6 +123,7 @@ function defs(withScopes: boolean): ToolDef[] {
       "Push this pull request's CI results and merge-conflict changes into the session as they happen. Call it after you open a pull request, " +
         "or when the user asks you to watch one. Answers the PR's current state; after that only changes are pushed. " +
         `events limits what is pushed (default: all of ${EVENT_KINDS.join(", ")}). ` +
+        OWN_ONLY +
         WATCH_COST +
         (withScopes ? SCOPE_COST : ""),
       {
@@ -123,8 +133,10 @@ function defs(withScopes: boolean): ToolDef[] {
           scope: scopeArg,
           involves: {
             type: "string",
-            enum: ["all", "me"],
-            description: "With scope: all (default), or me: only pull requests you opened, are assigned to or are asked to review (not ones you only commented on).",
+            enum: [...INVOLVES],
+            description:
+              "With scope: mine (default): only pull requests you opened. Only if the user asks for other people's: me, those you opened, are assigned to or are asked to review " +
+              "(not ones you only commented on), or all, every open pull request.",
           },
         }),
       },
@@ -295,9 +307,9 @@ const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 
 const REPO_TEXT = "repo must be owner/name as GitHub allows it, for example acme/widgets.";
 
-/** What a scope covers, in words: "every open pull request in acme/widgets" (that involves you). */
+/** What a scope covers, in words: "every open pull request you opened in acme/widgets", or (that involves you), or everybody's. */
 const covers = (repo: string, involves: Involves, joiner = " in ") =>
-  `every open pull request${joiner}${repo}${involves === "me" ? " that involves you" : ""}`;
+  `every open pull request${involves === "mine" ? " you opened" : ""}${joiner}${repo}${involves === "me" ? " that involves you" : ""}`;
 
 /** The repository a scope call names: `repo`, else this session's. */
 async function scopeRepo(deps: Deps, args: Record<string, unknown>): Promise<{ ok: true; repo: string } | { ok: false; text: string }> {
@@ -345,11 +357,13 @@ export function makeTools(given: Deps): ToolHost {
             if (args.events !== undefined) {
               return err(`A scope takes no events: its pull requests push every kind but ${AUTO_QUIET_KINDS.join(", ")}. Subscribe to one pull request with events to hear those.`);
             }
-            const involves = args.involves ?? "all";
-            if (involves !== "all" && involves !== "me") return err('involves must be "all" or "me".');
+            // Omitted: the login's own pull requests only. Other people's are covered when asked for by name.
+            const involves = args.involves ?? DEFAULT_INVOLVES;
+            if (!INVOLVES.includes(involves as Involves)) return err('involves must be "mine", "me" or "all".');
+            const chosen = involves as Involves;
             const r = await scopeRepo(deps, args);
             if (!r.ok) return err(r.text);
-            const added = scopes.store.add({ kind: "repo", repo: r.repo, involves, events: "all" });
+            const added = scopes.store.add({ kind: "repo", repo: r.repo, involves: chosen, events: "all" });
             if (!added.ok) return err(added.text);
             (deps.eventLog ?? NO_EVENT_LOG).write("scope_set", { repo: r.repo, kind: "repo", involves, saved: added.saved });
             const kept = added.saved
@@ -357,7 +371,10 @@ export function makeTools(given: Deps): ToolHost {
               : `It holds for this session only. ${scopes.store.problem ?? ""}`.trim();
             return {
               text:
-                `Watching ${covers(r.repo, involves)}. A pull request opened there later is watched with no subscribe call. ${kept} ` +
+                `Watching ${covers(r.repo, chosen)}. A pull request ${chosen === "mine" ? "you open" : "opened"} there later is watched with no subscribe call. ${kept} ` +
+                (chosen === "mine"
+                  ? 'Other people\'s pull requests are not covered: only if the user asks for them, involves: "me" adds those you are assigned to or asked to review, and involves: "all" covers everybody\'s. '
+                  : "") +
                 `Each one held counts towards the ${MAX_SUBSCRIPTIONS} pull requests a session watches: the newest that fit are held, and you are told ` +
                 "how many are left out; list_subscriptions shows what the scope holds, within about a minute.\n" +
                 (deps.liveEvents === false ? EVENTS_OFF_NOTE : CHANNEL_NOTE),
@@ -380,6 +397,26 @@ export function makeTools(given: Deps): ToolHost {
           const snap = await read(t.repo, t.pr);
           if ("text" in snap) return snap;
           if (snap.state !== "open") return { text: `${describe(snap)}\nThe pull request is ${snap.state}, so it is not subscribed.` };
+          // NOT NAMED IS NOT ASKED FOR: the branch can be a colleague's, and their pull request carries their
+          // text into the session. With no pr passed, only one the signed-in login opened is taken; not knowing the
+          // login is not a yes. Naming the pull request is the opt-in, and the refusal says how.
+          if (args.pr === undefined) {
+            const login = await deps.gh.viewerLogin();
+            const me = login.kind === "ok" && login.value ? login.value.toLowerCase() : null;
+            const named = `call subscribe with repo: "${t.repo}" and pr: ${t.pr}`;
+            if (me === null) {
+              return err(
+                `GitHub did not say which login is signed in, so the channel cannot tell whether the current branch's pull request, ${t.repo} PR #${t.pr}, is yours, and it is not subscribed. ` +
+                  `To watch it whoever opened it, ${named}.`,
+              );
+            }
+            if ((snap.author ?? "").toLowerCase() !== me) {
+              return err(
+                `The current branch's pull request, ${t.repo} PR #${t.pr}, was not opened by the signed-in GitHub login, so it is not subscribed: only your own pull requests are watched unless one is named. ` +
+                  `Watch it only if the user asks: ${named}.`,
+              );
+            }
+          }
           let gaveWay = "";
           const room = full && deps.subs.list().length >= MAX_SUBSCRIPTIONS ? deps.subs.oldestScopeEntry() : undefined;
           if (room) {

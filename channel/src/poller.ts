@@ -3,9 +3,10 @@
  * GitHub, push what changed, and keep the new state.
  *
  * - THE CURRENT BRANCH'S PR IS WATCHED WITHOUT BEING ASKED (autoSubscribe
- *   `pr`), and the watch follows a `git switch`. Claude adds others with the
- *   subscribe tool (tools.ts), which is how a PR opened from another worktree
- *   is watched.
+ *   `pr`) WHEN THE SIGNED-IN LOGIN OPENED IT, and the watch follows a `git
+ *   switch`. Somebody else's is said once and left alone. Claude
+ *   adds others with the subscribe tool (tools.ts), which is how a PR opened
+ *   from another worktree, or another person's, is watched.
  * - NO LOGIN IS SAID ONCE, not every poll, and the loop keeps looking: once
  *   the user installs gh or signs in, the channel starts by itself.
  * - RATE LIMITS: an unchanged resource costs nothing (ETags, github.ts); the
@@ -256,12 +257,47 @@ function scopeCapped(repo: string, held: readonly number[], leftOut: number, tot
     content:
       `The scope on ${repo} covers ${held.length + leftOut} open pull requests that nothing else here watches, but a session watches at most ${total} in all, ` +
       `so it holds the newest ${held.length} (${held.length ? numbered(held) : "none"}) and leaves out the ${leftOut} older. ` +
-      `Nothing is pushed for those ${leftOut}: narrow the scope with involves: "me", unsubscribe pull requests this session no longer needs, ` +
+      `Nothing is pushed for those ${leftOut}: narrow the scope with involves: "mine" or "me", unsubscribe pull requests this session no longer needs, ` +
       "or call subscribe for one you need (it takes the place of the scope's oldest). list_subscriptions shows what is held; ci_status reads any pull request now. " +
       "Tell the user in one line that the scope is over the cap and how many pull requests are left out.",
     meta: { kind: "channel_scope_capped", repo, held: String(held.length), left_out: String(leftOut) },
   };
 }
+
+/**
+ * Said once for a pull request found for the session's branch that somebody else opened: it is not watched
+ * unless named. Another person's pull request carries their text (logs, branch and commit names) into the session, so
+ * the opt-in is the user's: the notice names the call and says to make it only if the user asks. It holds the
+ * repository's name and the number, nothing GitHub sent.
+ */
+function notYoursNotice(repo: string, pr: number): ChannelMessage {
+  return {
+    content:
+      `The open pull request for this branch, ${repo} PR #${pr}, was not opened by the signed-in GitHub login, so the channel does not watch it: ` +
+      "only your own pull requests are watched unless one is named. Tell the user in one line that it is not watched. " +
+      `Watch it only if the user asks: call subscribe with repo: "${repo}" and pr: ${pr}.`,
+    meta: { kind: "channel_pr_not_yours", repo, pr: String(pr) },
+  };
+}
+
+/**
+ * Said once for a scope saved before 0.3.16 with involves "all", which an omitted involves also saved (scopes.ts): it
+ * now covers only the login's own pull requests, and the notice says how to cover everybody's again.
+ */
+function scopeNarrowed(repo: string): ChannelMessage {
+  return {
+    content:
+      `The scope on ${repo} was saved by an earlier version of this plugin, when a scope covered every open pull request unless told otherwise. ` +
+      "It now covers only the pull requests the signed-in GitHub login opened: other people's pull requests are watched only when asked for. " +
+      "Tell the user in one line that the scope was narrowed. " +
+      `Widen it only if the user asks: call subscribe with scope: "repo", repo: "${repo}" and involves: "all" (everybody's), or involves: "me" ` +
+      "(those the login opened, is assigned to or is asked to review).",
+    meta: { kind: "channel_scope_narrowed", repo },
+  };
+}
+
+/** The most pull requests found to be somebody else's that one session remembers: a session's branch rarely has more than a few. */
+export const NOT_YOURS_KEPT = 50;
 
 /** Said once when GitHub does not show a scoped repository to this login: the scope holds nothing until it does. */
 function scopeNotVisible(repo: string): ChannelMessage {
@@ -400,6 +436,26 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
     }
     return from;
   };
+  /**
+   * The pull requests found for the session's branch that somebody else opened: never watched automatically,
+   * said once each (notYoursNotice), and not asked about again, since who opened a pull request does not change. At
+   * most NOT_YOURS_KEPT, the oldest forgotten first; one forgotten is asked about, and said, once more.
+   */
+  const notYours = new Set<string>();
+  /**
+   * Whether the signed-in login opened a pull request found for the branch: "unknown" while GitHub does not say who is
+   * signed in or does not show the pull request, which is not a yes and not a no. A pull request GitHub names no
+   * author for is nobody's, so not the login's. One request for the login (kept for hours, github.ts) and one for the
+   * pull request, which the watch's first look would have made anyway.
+   */
+  const openedByMe = async (repo: string, pr: number): Promise<"yes" | "no" | "unknown"> => {
+    const login = await gh.viewerLogin();
+    const me = login.kind === "ok" && login.value ? login.value.toLowerCase() : null;
+    if (me === null) return "unknown";
+    const pull = await gh.getPull(repo, pr);
+    if (pull.kind !== "ok") return "unknown";
+    return (pull.value.author ?? "").toLowerCase() === me ? "yes" : "no";
+  };
   /** Per PR the hook handed over and not yet looked at: when the hook saw it (HOOK_NEW_MS). */
   const hookSeenAt = new Map<string, number>();
 
@@ -430,6 +486,10 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
     const store = deps.scopes;
     if (!store) return;
     store.reload();
+    for (const repo of store.takeNarrowed()) {
+      events.write("scope_narrowed", { repo, from: "all", to: "mine" });
+      await send(scopeNarrowed(repo), null);
+    }
     const scopes = store.list();
     const scoped = new Set(scopes.map((s) => s.repo.toLowerCase()));
     for (const e of subs.list()) if (e.source === "scope" && !scoped.has(e.repo.toLowerCase())) unsubscribe(e, "scope_ended");
@@ -473,18 +533,21 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
   const holdScope = async <D extends { pulls: readonly OpenPull[]; full: boolean; saidCap: boolean }>(scope: Scope, key: string, d: D): Promise<D> => {
     const mine = (e: Entry) => e.source === "scope" && e.repo.toLowerCase() === key;
     let me: string | null = null;
-    if (scope.involves === "me") {
+    if (scope.involves !== "all") {
       // Not known (GitHub did not say) is not a yes: nothing new is held, and what is held stays, until the login is known.
       const login = await gh.viewerLogin();
       me = login.kind === "ok" && login.value ? login.value.toLowerCase() : null;
       if (me === null) {
-        subs.scopeHoldings.set(key, { held: subs.list().filter(mine).map((e) => e.pr), leftOut: 0, more: d.full, problem: "GitHub did not say which login is signed in, so the scope could not tell which pull requests involve you" });
+        const which = scope.involves === "mine" ? "you opened" : "involve you";
+        subs.scopeHoldings.set(key, { held: subs.list().filter(mine).map((e) => e.pr), leftOut: 0, more: d.full, problem: `GitHub did not say which login is signed in, so the scope could not tell which pull requests ${which}` });
         return d;
       }
     }
     const open = new Set(d.pulls.map((p) => p.number));
     subs.mutes.endScopeMutes((repo, pr) => repo.toLowerCase() === key && !open.has(pr));
-    const covered = d.pulls.filter((p) => (me === null || p.involved.includes(me)) && !subs.mutes.mutesPr(scope.repo, p.number));
+    // `mine`: the login opened it. `me`: the list names the login for it at all. `all`: asked for by name, everybody's.
+    const inScope = (p: OpenPull) => scope.involves === "all" || (scope.involves === "mine" ? p.author === me : me !== null && p.involved.includes(me));
+    const covered = d.pulls.filter((p) => inScope(p) && !subs.mutes.mutesPr(scope.repo, p.number));
     const coveredNumbers = new Set(covered.map((p) => p.number));
     for (const e of subs.list().filter(mine)) {
       if (coveredNumbers.has(e.pr)) {
@@ -700,6 +763,7 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
     held: held.size,
     leaving: leaving.size,
     discovered: discovered.size,
+    notYours: notYours.size,
     bases: bases.size,
     requestIds: requests.seen?.ids.size ?? 0,
     etagEntries: gh.etagEntries,
@@ -772,9 +836,33 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
         if (found.kind === "ok" && found.value !== null && subs.mutes.mutesPr(found.value.repo, found.value.pr)) {
           current = null; // muted in this session (the mute tool, or unsubscribed): never added back
         } else if (found.kind === "ok" && found.value !== null) {
-          const isNew = !subs.get(found.value.repo, found.value.pr);
-          current = subs.add({ repo: found.value.repo, pr: found.value.pr, source: "auto" }).key;
-          if (isNew) events.write("subscribe", { repo: found.value.repo, pr: found.value.pr, source: "auto", events: [...AUTO_EVENTS] });
+          // ONLY THE USER'S OWN: the branch can be a colleague's (`gh pr checkout`), and their pull request
+          // carries their text into the session. One already watched because it was asked for (Claude's subscribe, the
+          // hook's hand-over of a pull request this login just opened) or already taken as the branch's own stays as it
+          // is; any other is watched only when the signed-in login opened it.
+          const f = found.value;
+          const key = `${f.repo.toLowerCase()}#${f.pr}`;
+          const existing = subs.get(f.repo, f.pr);
+          const settled = existing !== undefined && existing.source !== "scope";
+          const mine = settled ? "yes" : notYours.has(key) ? "no" : await openedByMe(f.repo, f.pr);
+          if (mine === "yes") {
+            current = subs.add({ repo: f.repo, pr: f.pr, source: "auto" }).key;
+            if (!existing) events.write("subscribe", { repo: f.repo, pr: f.pr, source: "auto", events: [...AUTO_EVENTS] });
+          } else if (mine === "unknown") {
+            current = "keep"; // not a yes and not a no: nothing changes, and it is decided again the next time the branch's PR is looked for
+          } else {
+            current = null;
+            if (!notYours.has(key)) {
+              notYours.add(key);
+              for (const oldest of notYours) {
+                if (notYours.size <= NOT_YOURS_KEPT) break;
+                notYours.delete(oldest);
+              }
+              events.write("auto_skipped", { repo: f.repo, pr: f.pr, reason: "not_mine" });
+              // One an explicit scope already holds is watched because the user asked for everybody's: nothing to say.
+              if (!existing) await send(notYoursNotice(f.repo, f.pr), null);
+            }
+          }
         } else if (found.kind !== "ok") {
           current = "keep"; // GitHub did not answer: leave the automatic subscription as it is
         }

@@ -30,7 +30,7 @@ import { NO_EVENT_LOG, openEventLog } from "./eventlog.ts";
 import { findLaunch, pollsIn } from "../../hooks/launch.mjs";
 import { firstCallRows, launchChecks, liveEventsBlocker, mergeRows, readFirstCall, renderTable } from "../../hooks/readiness.mjs";
 
-export const VERSION = "0.3.15";
+export const VERSION = "0.3.16";
 
 /**
  * Notes what GitHub answers, for the next launch's setup checks (firstcall.ts). Not under the tests' fake GitHub

@@ -37,11 +37,11 @@ test("subscribe with scope repo and involves me sets a scope for the repository'
   assert.match(r.text, /no subscribe call/i);
 });
 
-test("subscribe with scope repo and no repo takes the session's own repository; a repo scope defaults to every open PR", async () => {
+test("subscribe with scope repo and no repo takes the session's own repository; a repo scope defaults to the PRs the login opened", async () => {
   const t = await setup();
   const r = await t.tools.call("subscribe", { scope: "repo" });
-  assert.match(r.text, /every open pull request in acme\/widgets\./);
-  assert.deepEqual(t.scopes.list(), [{ kind: "repo", repo: "acme/widgets", involves: "all", events: "all" }]);
+  assert.match(r.text, /every open pull request you opened in acme\/widgets\./);
+  assert.deepEqual(t.scopes.list(), [{ kind: "repo", repo: "acme/widgets", involves: "mine", events: "all" }]);
 });
 
 test("a scope other than repo, or an involves other than me or all, is refused for now", async () => {
@@ -135,6 +135,6 @@ test("the subscribe and unsubscribe schemas name the scope arguments", async () 
   const defs = t.tools.list();
   const props = (n: string) => defs.find((d) => d.name === n)?.inputSchema.properties ?? {};
   assert.deepEqual((props("subscribe").scope as { enum: string[] }).enum, ["repo"]);
-  assert.deepEqual((props("subscribe").involves as { enum: string[] }).enum, ["all", "me"]);
+  assert.deepEqual((props("subscribe").involves as { enum: string[] }).enum, ["mine", "me", "all"]);
   assert.deepEqual((props("unsubscribe").scope as { enum: string[] }).enum, ["repo"]);
 });

@@ -34,11 +34,11 @@ in to github.com. If you don't have `gh`, the plugin's `setup-github` skill walk
 your agreement, and you sign in with `! gh auth login --web --scopes repo`.
 
 ```bash
-claude plugin marketplace add runners-io/claude-plugin#v0.3.15
+claude plugin marketplace add runners-io/claude-plugin#v0.3.16
 claude plugin install runners-io@runners-io
 ```
 
-This installs exactly one release: every release has a new version and a tag of its own (`v0.3.15` is this one), and
+This installs exactly one release: every release has a new version and a tag of its own (`v0.3.16` is this one), and
 the `#` and tag pin the marketplace to it. We do not move a release tag once it is published, so updating that
 marketplace never takes you past the release you chose. To move to a newer release, run
 `claude plugin marketplace remove runners-io` (which uninstalls the plugin), then the two commands above with the newer
@@ -66,7 +66,7 @@ Or from inside a session: `/plugin marketplace add runners-io/claude-plugin`, th
 To install from a copy you have checked out and read yourself:
 
 ```bash
-git clone --branch v0.3.15 --depth 1 https://github.com/runners-io/claude-plugin.git
+git clone --branch v0.3.16 --depth 1 https://github.com/runners-io/claude-plugin.git
 claude plugin marketplace add ./claude-plugin
 claude plugin install runners-io@runners-io
 ```
@@ -221,8 +221,19 @@ Node.js 24, or 22.21 and later), the channel stands aside and Node's own `fetch`
 
 ## Choosing what to watch
 
-**Automatically:** the pull request for the branch your session's folder is on. The channel reads the repository from
-`git remote get-url origin` and the branch from `git branch --show-current`, and follows you when you switch branch.
+**Automatically:** the pull request for the branch your session's folder is on, when your GitHub login opened it.
+The channel reads the repository from `git remote get-url origin` and the branch from `git branch --show-current`, and
+follows you when you switch branch.
+
+**Only your own pull requests, unless you opt in** (since 0.3.16). Somebody else's pull request carries their text into
+your session: their branch and commit names, and their logs when a failure is read. So when the branch you are on
+belongs to a colleague's pull request (after `gh pr checkout 123`, say), the channel does not watch it: it says so
+once (`channel_pr_not_yours`, with the pull request's number), and Claude watches it only when you ask, by naming it
+to `subscribe` (`repo` and `pr`). `subscribe` with no pull request named takes the branch's only when it is yours. A
+repository scope (below) covers only your own pull requests unless it is told otherwise. While GitHub does not say
+which login is signed in, nothing is taken for yours, and the channel looks again shortly. A pull request you named is
+watched as before, and a failure on it still says it is not yours: Claude tells you and reads its log only when you
+ask.
 
 **In a fork**, that pull request usually lives on the repository you forked from, with your fork's branch as its head
 (`you:fix-login` on `acme/widgets`), so the channel looks there first and in your fork after it. It knows the
@@ -254,7 +265,7 @@ option on hears every request, which is why it is off by default.
 
 | tool | what it does |
 |---|---|
-| `subscribe` | watch a pull request (`repo` and `pr`; by default the current branch's), optionally only some `events`. It answers the PR's state now; after that only changes are pushed. With `scope: "repo"`, watch a whole repository (below) |
+| `subscribe` | watch a pull request (`repo` and `pr`; by default the current branch's, when your login opened it), optionally only some `events`. It answers the PR's state now; after that only changes are pushed. With `scope: "repo"`, watch a whole repository (below) |
 | `unsubscribe` | stop watching one pull request (with no arguments, the current branch's), every one in a repository (`whole_repo: true`), or everything (`all: true`). With `scope: "repo"`, end a repository's scope |
 | `list_subscriptions` | what this session watches: the scopes set for the project, what each holds and leaves out, the pull requests, and the mutes |
 | `ci_status` | a pull request's state now, without subscribing |
@@ -269,8 +280,9 @@ moment when git reads no branch (mid-rebase, or a timeout) is not a branch chang
 
 ### A whole repository (a scope)
 
-`subscribe` with `scope: "repo"` watches the open pull requests of a repository (`repo`, by default the session's own),
-ones opened later included, with no further `subscribe` call. So Claude no longer subscribes to each pull request it
+`subscribe` with `scope: "repo"` watches the open pull requests your GitHub login opened in a repository (`repo`, by
+default the session's own), ones opened later included, with no further `subscribe` call; `involves` (below) widens it
+to other people's, when you ask. So Claude no longer subscribes to each pull request it
 opens there: the server's instructions and the watch-this-pr skill tell it to subscribe after `gh pr create` only when
 no scope covers the repository.
 
@@ -280,9 +292,17 @@ no scope covers the repository.
   made: nothing GitHub sent, and no token. A restarted session goes on watching, and every session of the project
   shares it. A file that is a symlink, belongs to another user or cannot be read is never used or replaced: the scope
   then holds for the session only, and `list_subscriptions` says why.
-- **`involves`.** `all` (the default for a repository) is every open pull request. `me` is those your GitHub login
-  opened, is assigned to or is asked to review. That is read from the list of open pull requests itself, with no
-  further request, so a pull request you only commented on, and a review asked of a team you are in, are not counted.
+- **`involves`.** `mine` (the default since 0.3.16) is the open pull requests your GitHub login opened. The other two
+  cover other people's pull requests, so they are used only when asked for by name: `me` is those your login opened,
+  is assigned to or is asked to review, and `all` is every open pull request. All three are read from the list of open
+  pull requests itself, with no further request, so a pull request you only commented on, and a review asked of a team
+  you are in, are not counted.
+- **A scope saved before 0.3.16.** Until then a scope set without `involves` was saved as `all`, and the file did not
+  say whether `all` was chosen. So the first session of 0.3.16 or later reads a saved `all` as `mine`, says so once
+  (`channel_scope_narrowed`, naming the repository and how to widen it again: `subscribe` with `scope: "repo"` and
+  `involves: "all"`), and rewrites the file in its new format (version 2), in which every `all` was asked for. A saved
+  `me` is kept. A session still running an older version of the plugin does not read the new file: it keeps the scopes
+  it had in memory until it ends, says so in `list_subscriptions`, and writes nothing.
 - **What it sends.** What the current branch's pull request sends: every kind but `ci.workflow_succeeded`,
   `ci.workflow_started` and `ci.job_stuck_queued`, each as it happens, with the same filters and budgets as any watched
   pull request. A pull request opened by somebody else is reported as theirs: Claude tells you, and reads its log only
@@ -296,7 +316,8 @@ no scope covers the repository.
   else has, the newest open pull requests first, and when more are open than fit, the channel says so once
   (`channel_scope_capped`: which are held, how many are left out) and `list_subscriptions` shows it. A pull request
   Claude subscribes to by name, the hook's and the branch's keep their places, and at the cap a `subscribe` by name
-  takes the place of the scope's oldest. On a busy repository, `involves: "me"` is the scope that fits.
+  takes the place of the scope's oldest. On a busy repository, the default (`mine`) or `involves: "me"` is the scope
+  that fits.
 - **Unsubscribing under a scope.** Unsubscribing one pull request of a scoped repository mutes it in this session, so
   the scope does not add it back; the mute ends when the pull request closes or the scope ends, or with `unmute` or a
   `subscribe` by name. `unsubscribe` with `scope: "repo"` ends the scope, for the project. `whole_repo: true` and
@@ -597,6 +618,9 @@ The script exits 0 when it finds nothing, 1 on a miss, a gap or an error, and 2 
 - **A fork, and nothing is watched.** The channel looks for your branch's pull request on the repository you forked
   from, then in your fork. `status` prints the pull request it would watch and on which repository. A pull request
   whose head is another branch than the one you are on is not the branch's: name it to `subscribe`.
+- **A colleague's branch, and nothing is watched.** Since 0.3.16 only pull requests your GitHub login opened are
+  watched without being named. The channel says once which pull request it left alone; ask Claude to watch it and it
+  calls `subscribe` with that `repo` and `pr`. `status` shows the login GitHub sees.
 - **Claude Code on Bedrock, Vertex AI or Foundry.** Claude Code delivers no channel events there, so nothing is pushed
   whatever flag the session is started with. Ask Claude for a pull request's CI (`ci_status`), which works everywhere.
 - **"the GitHub CLI (gh) is not installed / not signed in".** Ask Claude to use the `setup-github` skill.
