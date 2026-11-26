@@ -45,8 +45,11 @@ export async function startFakeProxy({ auth = null, refuse = null } = {}) {
     requests,
     /** Everything clients sent through their tunnels, as text. */
     sent: () => Buffer.concat(sent).toString("latin1"),
+    // Every connection is ended, not only the tunnels: server.close() alone waits for any connection still mid-request,
+    // and that wait has no end (fake-servers-close.test.mjs).
     async close() {
       for (const s of sockets) s.destroy();
+      server.closeAllConnections();
       await new Promise((r) => server.close(r));
     },
   };

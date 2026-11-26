@@ -36,11 +36,11 @@ in to github.com. If you don't have `gh`, the plugin's `setup-github` skill walk
 your agreement, and you sign in with `! gh auth login --web --scopes repo`.
 
 ```bash
-claude plugin marketplace add runners-io/claude-plugin#v0.4.0
+claude plugin marketplace add runners-io/claude-plugin#v0.4.1
 claude plugin install runners-io@runners-io
 ```
 
-This installs exactly one release: every release has a new version and a tag of its own (`v0.4.0` is this one), and
+This installs exactly one release: every release has a new version and a tag of its own (`v0.4.1` is this one), and
 the `#` and tag pin the marketplace to it. We do not move a release tag once it is published, so updating that
 marketplace never takes you past the release you chose. To move to a newer release, run
 `claude plugin marketplace remove runners-io` (which uninstalls the plugin), then the two commands above with the newer
@@ -68,7 +68,7 @@ Or from inside a session: `/plugin marketplace add runners-io/claude-plugin`, th
 To install from a copy you have checked out and read yourself:
 
 ```bash
-git clone --branch v0.4.0 --depth 1 https://github.com/runners-io/claude-plugin.git
+git clone --branch v0.4.1 --depth 1 https://github.com/runners-io/claude-plugin.git
 claude plugin marketplace add ./claude-plugin
 claude plugin install runners-io@runners-io
 ```

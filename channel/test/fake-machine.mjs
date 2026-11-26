@@ -43,6 +43,10 @@ export function fakeMachine({ gh = "signed-in", git = true, hosts, env = {} } = 
       FAKE_GH: gh ?? "",
       FAKE_GH_LOG: join(root, "gh.log"),
       RUNNERS_IO_TEST_MANAGED_SETTINGS_DIR: join(root, "managed"),
+      // This environment is built from nothing, so a hook started in it cannot tell the plugin's own tests are running
+      // (no NODE_TEST_CONTEXT): without this line every run of the suite sent a real install ping to runners.io. A case
+      // that tests sending passes RUNNERS_IO_TELEMETRY: "" with its own test endpoint (fake-machine-sends-nothing.test.mjs).
+      RUNNERS_IO_TELEMETRY: "off",
       ...env,
     },
   };

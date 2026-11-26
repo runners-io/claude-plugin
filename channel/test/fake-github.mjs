@@ -262,6 +262,13 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
       // Every job GitHub returns has an id (a job is a check run); a test that names none gets one per position.
       state.jobs.set(runId, jobs.map((j, i) => ({ id: runId * 1000 + i + 1, ...j })));
     },
-    close: () => new Promise((r) => server.close(r)),
+    // Ends every connection too: server.close() alone waits for any connection still mid-request (a proxy's tunnel that
+    // was cut), and proxy.test.ts closes this server before the proxy, so that wait could last for ever and `npm test`
+    // never finished (fake-servers-close.test.mjs).
+    close: () =>
+      new Promise((r) => {
+        server.close(r);
+        server.closeAllConnections();
+      }),
   };
 }

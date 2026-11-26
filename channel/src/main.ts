@@ -34,7 +34,7 @@ import { findLaunch, pollsIn } from "../../hooks/launch.mjs";
 import { firstCallRows, launchChecks, liveEventsBlocker, mergeRows, readFirstCall, renderTable } from "../../hooks/readiness.mjs";
 import { createTelemetry, needsTunnel, telemetryLine } from "../../hooks/telemetry.mjs";
 
-export const VERSION = "0.4.0";
+export const VERSION = "0.4.1";
 
 /**
  * What the channel sends to runners.io (hooks/telemetry.mjs): reports of its own faults, and the install ping where

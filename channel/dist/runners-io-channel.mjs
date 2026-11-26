@@ -5216,7 +5216,7 @@ function createTelemetry({
 }
 
 // src/main.ts
-var VERSION2 = "0.4.0";
+var VERSION2 = "0.4.1";
 var telemetry2 = createTelemetry({ component: "channel", version: VERSION2, fetch: githubFetch(process.env) });
 setTelemetry(telemetry2);
 var ending = false;
