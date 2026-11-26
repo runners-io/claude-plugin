@@ -1,13 +1,15 @@
-// The README is the user's only account of what installing this plugin does. Two things a reviewer found missing:
-// that every install connects to the runners.io MCP server (and that it has write tools, off by default), and what the
-// development-channels flag actually risks, including for later updates.
+// The README is the user's only account of what installing this plugin does. Each test here holds one thing a reader
+// relies on to the code or the manifest: that nothing of runners.io's is installed and no account is needed, what the
+// development-channels flag risks, every read from GitHub, every file written, and the whole of the telemetry.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-const readme = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "README.md"), "utf8");
+const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const readme = readFileSync(join(root, "README.md"), "utf8");
+const flat = readme.replace(/\s+/g, " ");
 
 /** The text of one `## ` section, by its heading's start. */
 function section(start) {
@@ -17,20 +19,124 @@ function section(start) {
   return readme.slice(at, next < 0 ? undefined : next);
 }
 
-test("'What is sent' says every install connects to mcp.runners.io when a session starts, and what that sends", () => {
-  const sent = section("What is sent");
-  assert.match(sent, /mcp\.runners\.io/);
-  assert.match(sent, /when (a|each) session starts/i);
-  assert.match(sent, /before you sign in|without signing in|not signed in/i, "what it sends before sign-in");
-  assert.match(sent, /disable|turn (it )?off|remove/i, "how to stop it");
+// The plugin installs no server of runners.io's, so no session connects to runners.io unasked. The MCP server is an
+// extra for customers, added by one command after a yes. The README says so, and nowhere says the opposite.
+test("the README says no runners.io account is needed, up front, and that the plugin does not install the MCP server", () => {
+  const manifest = JSON.parse(readFileSync(join(root, ".claude-plugin", "plugin.json"), "utf8"));
+  assert.deepEqual(Object.keys(manifest.mcpServers), ["runners-io"], "the manifest installs the channel only");
+  const top = readme.slice(0, readme.indexOf("\n## Install"));
+  assert.match(top, /\*\*No runners\.io account is needed\.\*\*/);
+  assert.match(top, /any repository\s+that uses GitHub Actions/);
+  const optional = section("For runners.io customers: the MCP server (optional)");
+  assert.match(optional, /\*\*The plugin does not install it, and nothing above needs it\.\*\*/);
+  assert.ok(optional.includes("\nclaude mcp add --transport http --scope user runnersio https://mcp.runners.io/mcp\n"), "the one command that adds it");
+  assert.match(optional, /only with your yes/);
+  assert.match(optional, /at the start of every session/, "what adding it means: a connection at every session start");
+  assert.match(optional, /claude mcp remove runnersio --scope user/, "and how to take it out");
+  assert.match(optional, /`runners-io-mcp`[\s\S]*sign\s+in once more/, "a customer updating from 0.4.1 is told how to get it back");
+  for (const stale of [/the MCP server the plugin also installs/i, /plugin bundles four things/i, /whether or not you use runners\.io\. Before you sign in/i, /turn it off in `\/mcp` \(the server is `runners-io-mcp`\)/i])
+    assert.doesNotMatch(flat, stale, "the README still describes the bundled server");
 });
 
-test("'What is sent' says the MCP server has write tools, and that they do nothing unless switched on", () => {
-  const sent = section("What is sent");
-  assert.match(sent, /cancel_job/);
-  assert.match(sent, /delete_cache_entry/);
-  assert.match(sent, /organisation/i);
-  assert.match(sent, /confirm/);
+test("the optional MCP server's write tools are named, and that they do nothing unless switched on", () => {
+  const optional = section("For runners.io customers: the MCP server (optional)");
+  assert.match(optional, /cancel_job/);
+  assert.match(optional, /delete_cache_entry/);
+  assert.match(optional, /organisation/i);
+  assert.match(optional, /confirm/);
+});
+
+// The badge the open-source programme asks of a project: its image, linked to runners.io, in the title block. The rule
+// is the first 40 lines or before the second heading; this README does both.
+test("the title block carries the runners.io badge with its link, a CI badge, the release and the licence, before the second heading", () => {
+  const BADGE = "[![Runs on runners.io](https://www.runners.io/badge/oss.svg)](https://www.runners.io/?utm_source=github&utm_medium=badge&utm_campaign=oss_badge)";
+  const lines = readme.split("\n");
+  const at = lines.indexOf(BADGE);
+  assert.ok(at >= 0 && at < 40, `the badge is on line ${at + 1}`);
+  const headings = lines.flatMap((l, i) => (/^#{1,6} |<h[1-6]\b/.test(l) ? [i] : []));
+  assert.ok(headings.length >= 2 && at < headings[1], "before the second heading");
+  const block = lines.slice(0, headings[1]).join("\n");
+  assert.ok(block.includes("https://github.com/runners-io/claude-plugin/actions/workflows/ci.yml/badge.svg"), "the repository's CI status");
+  assert.match(block, /img\.shields\.io\/github\/v\/release\/runners-io\/claude-plugin/);
+  assert.match(block, /licence-MIT/);
+  for (const link of ["(#install)", "(#what-it-does)", "(#telemetry)", "(#security)", "(https://www.runners.io/claude-code)"]) assert.ok(block.includes(link), link);
+  // Every in-page link in the README lands on a heading that exists.
+  const anchors = new Set(lines.filter((l) => /^#{1,6} /.test(l)).map((l) => l.replace(/^#+ /, "").toLowerCase().replace(/[^a-z0-9 -]/g, "").replace(/ /g, "-")));
+  for (const m of readme.matchAll(/\]\(#([a-z0-9-]+)\)/g)) assert.ok(anchors.has(m[1]), `#${m[1]} names no heading`);
+  // And both logo files it draws are there.
+  for (const m of block.matchAll(/(?:src|srcset)="(assets\/[^"]+)"/g)) assert.ok(readFileSync(join(root, m[1])).length > 0, m[1]);
+});
+
+// What works with no flag comes first; the development flag is presented as what it is.
+test("the README leads with what works without the channel flag, and calls the flag an opt-in to a research preview", () => {
+  const does = section("What it does");
+  const without = does.indexOf("### Without any flag");
+  const withFlag = does.indexOf("### With live events");
+  assert.ok(without >= 0 && withFlag > without, "what needs no flag is said first");
+  assert.match(does.slice(without, withFlag), /`ci_status`/);
+  assert.match(does.slice(withFlag), /research preview/);
+  assert.match(does.slice(withFlag), /Anthropic has not reviewed this channel/);
+});
+
+// A failure is offered, not fixed: the README's account and its example are the channel's own words.
+test("the README says Claude asks before fixing a failure, and its example event is what the channel sends", async () => {
+  const { toMessage } = await import("../src/format.ts");
+  const does = section("What it does");
+  assert.match(does, /\*\*A failure is never fixed unasked\.\*\*/);
+  assert.match(does, /starts only with your consent/);
+  assert.doesNotMatch(flat, /fix it without being asked|skill now to fix the cause/);
+  const run = { id: 4242, name: "CI", status: "completed", conclusion: "failure", htmlUrl: "https://github.com/acme/widgets/actions/runs/4242", runAttempt: 1, event: "pull_request", triggeringActor: "octocat" };
+  const snapshot = { repo: "acme/widgets", pr: 123, state: "open", headSha: "3f2a9c1e0b7d4c559a516c8e2f0d4b1100000000", headRef: "fix-login", mergeableState: "clean", prUrl: "https://github.com/acme/widgets/pull/123", runs: [run], author: "octocat", headRepo: "acme/widgets" };
+  const sent = toMessage({ kind: "ci.workflow_failed", snapshot, run, failedJobs: ["lint", "test-unit"] }, "octocat").content;
+  assert.ok(readme.includes(`\n${sent}\n`), `the example is not what the channel sends:\n${sent}`);
+});
+
+// Every file the plugin writes is in one table.
+test("'What it writes' lists every file the plugin writes, and where the three folders are", () => {
+  const writes = section("What it writes");
+  for (const file of [
+    "requests/<Claude Code's process id>/<hash>.json",
+    "claude-gh.json",
+    "claude-gh-declined.json",
+    "setup-checks.json",
+    "first-call.json",
+    "telemetry/install-id",
+    "telemetry/ping-<version>",
+    "telemetry/fault-<day>-<version>-<fingerprint>",
+    "telemetry/slot-<day>-<n>",
+    "telemetry/gone-<version>",
+    "scopes/<hash of the project folder>.json",
+    ".writable-<process id>",
+    "<rc file>.before-runners-io",
+    "runners-io-events/<UTC date>.jsonl",
+  ]) assert.ok(writes.includes(`\`${file}\``), `the table leaves out ${file}`);
+  assert.match(writes, /# >>> runners\.io claude channel >>>/);
+  assert.match(writes, /410 Gone/);
+  for (const folder of ["`~/.cache/runners-io`", "`$XDG_CACHE_HOME/runners-io`", "`~/.local/state/runners-io`", "`$XDG_STATE_HOME/runners-io`", "`CLAUDE_PLUGIN_DATA`"]) assert.ok(writes.includes(folder), folder);
+  // The names are the code's own.
+  const sources = ["hooks/telemetry.mjs", "hooks/readiness.mjs", "skills/setup-github/claude-gh.mjs", "hooks/pr-created.mjs", "channel/src/scopes.ts"].map((f) => readFileSync(join(root, f), "utf8")).join("\n");
+  for (const name of ["install-id", "ping-", "gone-", "fault-", "slot-", "claude-gh.json", "claude-gh-declined.json", "setup-checks.json", "first-call.json", ".writable-", ".before-runners-io", '"requests"', '"scopes"']) assert.ok(sources.includes(name), `the code no longer writes ${name}`);
+});
+
+// The hook that runs after every Bash call: said plainly, with what it reads and that it sends nothing.
+test("the README says the hook runs after every Bash call, reads the output for pull-request links only, and sends nothing", () => {
+  const hooks = JSON.parse(readFileSync(join(root, "hooks", "hooks.json"), "utf8"));
+  assert.match(hooks.hooks.PostToolUse[0].matcher, /Bash/);
+  assert.match(flat, /\*\*After every Bash call, and after a `create_pull_request` tool of an MCP server, a hook of the plugin's runs\.\*\*/);
+  assert.match(flat, /reads it for one thing, links to pull requests on github\.com, and sends nothing anywhere: it makes no network request/);
+  const hook = readFileSync(join(root, "hooks", "pr-created.mjs"), "utf8");
+  assert.doesNotMatch(hook, /\bfetch\(|node:https?|node:net/, "the hook makes a network request after all");
+});
+
+test("the licence section ties the copyright holder to runners.io, and Development gives the verify-the-bundle recipe", () => {
+  const licence = section("Licence");
+  const holder = /Copyright \(c\) \d{4}(?:-\d{4})? (.+)/.exec(readFileSync(join(root, "LICENSE"), "utf8"))?.[1]?.trim();
+  assert.ok(holder, "the LICENSE names a copyright holder");
+  assert.ok(licence.includes(holder), `the README does not name ${holder}`);
+  assert.match(licence, /runs \[runners\.io\]\(https:\/\/www\.runners\.io\)/);
+  const dev = section("Development");
+  assert.ok(dev.includes("\nnpm ci --ignore-scripts && npm run build && git diff --exit-code dist/\n"), "the recipe, on a line of its own");
+  assert.doesNotMatch(dev, /\bnpm ci\n/, "an npm ci that would run install scripts");
 });
 
 test("the development-channels flag's risk is said plainly, including that it covers later updates", () => {
@@ -100,9 +206,9 @@ test("Security says how often the shell is started, and that only its own proces
 
 // From version 0.4.0 the plugin itself sends runners.io two kinds of message (hooks/telemetry.mjs). The README is the
 // user's account of them: the address, every field by its name, what is never sent, how often, and how to turn it off.
-test("'What is sent' lists the plugin's two messages to runners.io: every field, the limits, what is never sent and how to turn it off", async () => {
-  const { INTERNAL_CODES, MAX_REPORTS_PER_DAY, TELEMETRY_URL, errorReport, installPing, telemetrySwitch } = await import("../../hooks/telemetry.mjs");
-  const sent = section("What is sent");
+test("'Telemetry' lists the plugin's two messages to runners.io: every field, the limits, what is never sent and how to turn it off", async () => {
+  const { INTERNAL_CODES, MAX_BODY_BYTES, MAX_FRAMES, MAX_REPORTS_PER_DAY, SEND_TIMEOUT_MS, SETTING_ENV, TELEMETRY_URL, errorReport, installPing, telemetryLine, telemetrySwitch } = await import("../../hooks/telemetry.mjs");
+  const sent = section("Telemetry");
   assert.doesNotMatch(readme, /sends nothing to runners\.io|\*\*To runners\.io, by the channel:\*\* nothing/, "the README still says nothing is sent");
   assert.ok(sent.includes(`\`${TELEMETRY_URL}\``), "the one address the messages go to");
   assert.match(sent, /from version 0\.4\.0/i);
@@ -111,7 +217,6 @@ test("'What is sent' lists the plugin's two messages to runners.io: every field,
   const id = "3f2a9c1e-0b7d-4c55-9a51-6c8e2f0d4b11";
   const ping = installPing({ installId: id, version: "0.4.1", previousVersion: "0.4.0", platform: "linux", nodeVersion: "22.1.0" });
   const fault = new TypeError("x");
-  const root = "/plugin";
   fault.stack = `TypeError: x\n    at holdScope (file://${root}/channel/dist/runners-io-channel.mjs:2213:19)`;
   const report = errorReport(fault, { installId: id, version: "0.4.1", component: "channel", code: INTERNAL_CODES[0], root, platform: "linux", nodeVersion: "22.1.0" });
   assert.ok(ping && report, "the builders made both messages");
@@ -134,4 +239,46 @@ test("'What is sent' lists the plugin's two messages to runners.io: every field,
     assert.equal(telemetrySwitch({ [name]: value }).on, false, `${name} does not turn it off`);
   }
   assert.match(section("Settings in the environment"), /\| `RUNNERS_IO_TELEMETRY` \| on \| `off`: the plugin sends runners\.io nothing/);
+
+  // The plugin's own setting: in the manifest, in the section with what Claude Code saves, and obeyed by the switch.
+  const manifest = JSON.parse(readFileSync(join(root, ".claude-plugin", "plugin.json"), "utf8"));
+  assert.deepEqual(manifest.userConfig.telemetry.options, ["on", "off"]);
+  assert.equal(manifest.userConfig.telemetry.default, "on");
+  assert.ok(sent.includes('"runners-io@runners-io": { "options": { "telemetry": "off" } }'), "the setting as it is saved");
+  assert.equal(telemetrySwitch({ [SETTING_ENV]: "off" }).on, false);
+  assert.ok(sent.includes(`\`${telemetryLine({ [SETTING_ENV]: "off" })}\``), "the doctor's line for the setting, word for word");
+  assert.match(sent, /\*\*On by default\. One setting turns it off\.\*\*/);
+  assert.match(sent, /no notice at first launch/);
+
+  // The limits, as the code holds them.
+  assert.equal(MAX_BODY_BYTES, 1024);
+  assert.match(sent, /Under 1 KB/);
+  assert.equal(SEND_TIMEOUT_MS, 2000);
+  assert.match(sent, /\| \*\*Time limit\*\* \| 2 seconds/);
+  assert.match(sent, /\| \*\*Retried\*\* \| Never/);
+  assert.match(sent, new RegExp(`up to ${MAX_FRAMES} lines`));
+  assert.match(sent, /redirect is never followed/i);
+
+  // The two example messages are what the builders make: the same fields, in the same order, with the same values.
+  const examples = [...sent.matchAll(/```json\n(\{\n {2}"kind"[\s\S]*?\n\})\n```/g)].map((m) => JSON.parse(m[1]));
+  assert.equal(examples.length, 2, "one example of each message");
+  const [examplePing, exampleReport] = examples;
+  assert.deepEqual(
+    JSON.stringify(installPing({ installId: examplePing.install_id, version: examplePing.version, previousVersion: examplePing.previous_version, platform: examplePing.os, nodeVersion: `${examplePing.node_major}.11.0` })),
+    JSON.stringify(examplePing),
+  );
+  const shown = new TypeError("x");
+  shown.stack = `TypeError: x\n    at holdScope (file://${root}/channel/dist/runners-io-channel.mjs:2213:19)\n    at async Poller.tick (file://${root}/channel/dist/runners-io-channel.mjs:3050:7)\n    at node:internal/timers:500:1`;
+  const built = errorReport(shown, { installId: exampleReport.install_id, version: exampleReport.version, component: exampleReport.component, root, platform: exampleReport.os, nodeVersion: `${exampleReport.node_major}.11.0` });
+  assert.deepEqual(JSON.stringify(built), JSON.stringify(exampleReport));
+  assert.equal(examplePing.version, manifest.version, "the examples name this release");
+
+  // The install ID is described as what it is: random, made here, stable, and arriving with an IP address.
+  const idPart = sent.slice(sent.indexOf("### The install ID, honestly"), sent.indexOf("### Turning it off"));
+  assert.match(idPart, /random UUID/);
+  assert.match(idPart, /\*\*It stays the same\*\*/);
+  assert.match(idPart, /\*\*it arrives with your IP address\*\*/);
+  assert.match(idPart, /deleted after 13 months/);
+  assert.match(idPart, /for as long as runners\.io\s+supports the plugin/);
+  assert.doesNotMatch(sent, /tied to nothing/, "an ID that arrives with an IP address is not tied to nothing");
 });

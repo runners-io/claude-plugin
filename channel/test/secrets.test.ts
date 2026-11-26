@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { checkTokenUrl, loadConfig } from "../src/config.ts";
+import { apiHost, checkTokenUrl, loadConfig } from "../src/config.ts";
 import { redact } from "../src/log.ts";
 
 test("a log line never carries a bearer token or a GitHub token", () => {
@@ -57,4 +57,54 @@ test("the event log is off unless RUNNERS_IO_EVENT_LOG_DIR is an absolute path, 
   assert.equal(loadConfig({ RUNNERS_IO_RATE_FLOOR: "1500" }).rateFloor, 1500);
   assert.equal(loadConfig({ RUNNERS_IO_RATE_FLOOR: "-3" }).rateFloor, 0);
   assert.equal(loadConfig({ RUNNERS_IO_RATE_FLOOR: "nonsense" }).rateFloor, 200);
+});
+
+test("an API address with a user name or a password in it is refused at start, and the refusal repeats none of it", () => {
+  const secret = "s3cr3t-pa55";
+  for (const raw of [
+    `https://ada:${secret}@ghe.corp.example/api/v3`,
+    `https://${secret}@ghe.corp.example/api/v3`,
+    `https://:${secret}@api.github.com`,
+    `http://ada:${secret}@127.0.0.1:8790`,
+  ]) {
+    for (const env of [{}, { RUNNERS_IO_TEST_FAKE_GITHUB: "1" }]) {
+      let error: Error | null = null;
+      try {
+        loadConfig({ ...env, RUNNERS_IO_GITHUB_API: raw });
+      } catch (e) {
+        error = e as Error;
+      }
+      assert.ok(error, raw);
+      assert.equal(error.name, "MachineError", "a setting the plugin refuses is the machine's, never reported as the plugin's fault");
+      assert.match(error.message, /^RUNNERS_IO_GITHUB_API must not hold a user name or a password/);
+      assert.equal(/s3cr3t|ada|ghe\.corp|127\.0\.0\.1/.test(error.message), false, error.message);
+    }
+  }
+});
+
+test("no refusal of an API address repeats the address: at most the host it names", () => {
+  const secret = "s3cr3t-pa55";
+  const said = (raw: string, env = {}): string => {
+    try {
+      checkTokenUrl(raw, "RUNNERS_IO_GITHUB_API", env);
+    } catch (e) {
+      return (e as Error).message;
+    }
+    return "";
+  };
+  // An address that cannot be read at all can still hold a login: none of it is said.
+  assert.equal(said(`https://ada:${secret}@ghe.corp.example:port/api`), "RUNNERS_IO_GITHUB_API is not a URL");
+  assert.equal(said(`http://ghe.corp.example:8080/api/v3?access_token=${secret}`), "RUNNERS_IO_GITHUB_API must be https (it names ghe.corp.example:8080 over http)");
+  assert.equal(
+    said(`http://127.0.0.1:8790/?access_token=${secret}`),
+    "RUNNERS_IO_GITHUB_API may name this machine only in the plugin's own tests (RUNNERS_IO_TEST_FAKE_GITHUB=1); it names 127.0.0.1:8790",
+  );
+});
+
+test("the API address is shown as its host and port only", () => {
+  assert.equal(apiHost("https://api.github.com"), "api.github.com");
+  assert.equal(apiHost("https://ghe.corp.example:8443/api/v3"), "ghe.corp.example:8443");
+  assert.equal(apiHost("https://ghe.corp.example/api/v3?access_token=s3cr3t"), "ghe.corp.example");
+  assert.equal(apiHost("https://ada:s3cr3t@ghe.corp.example/api/v3"), "ghe.corp.example");
+  assert.equal(apiHost("not an address s3cr3t"), "an address that cannot be read");
 });

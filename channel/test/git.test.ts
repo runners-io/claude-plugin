@@ -104,3 +104,27 @@ test("readPushed reads origin/<b> for every branch asked in one go, and a worktr
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a github.com remote is not read as a repository while the plugin is set to another GitHub host, nor the other way round", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "rio-git-host-"));
+  try {
+    const git = (...args: string[]) => execFileSync("git", ["-C", dir, ...args], { stdio: "ignore" });
+    git("init", "-q", "-b", "main");
+    git("remote", "add", "origin", "git@github.com:acme/widgets.git");
+    git("remote", "add", "upstream", "https://github.com/upstream/widgets.git");
+    // Asked of another server, acme/widgets is another repository: its answer must never be reported as this one's.
+    const enterprise = { RUNNERS_IO_GITHUB_API: "https://ghe.corp.example/api/v3" };
+    assert.deepEqual(await readGitScope(dir, enterprise), { repo: null, branch: "main", pushed: null });
+    // The controls: unset, github.com's own API, and the tests' fake that stands in for it.
+    for (const env of [{}, { RUNNERS_IO_GITHUB_API: "https://api.github.com" }, { RUNNERS_IO_GITHUB_API: "http://127.0.0.1:8790", RUNNERS_IO_TEST_FAKE_GITHUB: "1" }]) {
+      assert.deepEqual(await readGitScope(dir, env), { repo: "acme/widgets", branch: "main", pushed: null, upstream: "upstream/widgets" }, JSON.stringify(env));
+    }
+    // The other way round: a remote on the Enterprise host is never asked of github.com, whatever the plugin is set to.
+    git("remote", "set-url", "origin", "git@ghe.corp.example:acme/widgets.git");
+    git("remote", "remove", "upstream");
+    assert.deepEqual(await readGitScope(dir, {}), { repo: null, branch: "main", pushed: null });
+    assert.deepEqual(await readGitScope(dir, enterprise), { repo: null, branch: "main", pushed: null });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

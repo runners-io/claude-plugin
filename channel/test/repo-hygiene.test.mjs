@@ -80,6 +80,18 @@ function checkJob() {
   return { header: job[1], steps };
 }
 
+// The check runs on a runners.io runner. That is safe only because nothing of a fork's runs here: the refusal below is
+// the job's first step, and the repository asks a maintainer to approve every outside contributor's run.
+test("the check runs on a runners.io runner, and the workflow says why that is safe", () => {
+  const { header } = checkJob();
+  assert.match(`\n${header}\n`, /\n {4}runs-on: runnersio-2vcpu-ubuntu-2404\n/);
+  const ci = ciText();
+  assert.doesNotMatch(ci, /GitHub-hosted runner, never one of our own/, "the old comment says the opposite");
+  assert.match(ci, /^# .*runners\.io runner/m, "the file's own comment says where it runs");
+  assert.match(ci, /approv/i, "and names the approval that outside contributors' runs need");
+  assert.doesNotMatch(ci, new RegExp(["self", "hosted"].join("-")), "never a runner of the repository's own registering");
+});
+
 test("the required check keeps its name, and the job has no if: of its own, so a fork's pull request never skips it", () => {
   const { header } = checkJob();
   assert.match(`\n${header}\n`, /\n {4}name: manifest, bundle and tests\n/, "the ruleset requires the check by this exact name");

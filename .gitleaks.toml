@@ -1,0 +1,13 @@
+# For anybody who scans this repository with gitleaks.
+#
+# The files under channel/test/ hold strings shaped like GitHub tokens (gho_fakeToken123, ghp_..., github_pat_...). Every
+# one is made up for a test: a fake GitHub that the tests start on this machine checks them, and the redaction tests
+# need token shapes to redact. None was ever issued by GitHub. channel/test/README.md says the same.
+title = "runners.io plugin for Claude Code"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "the tests' made-up tokens, which no service ever issued"
+paths = ['''(^|/)channel/test/''']

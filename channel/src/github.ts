@@ -4,7 +4,7 @@
  *
  * THE LOGIN is whatever the GitHub CLI holds (`gh auth token`), or GH_TOKEN /
  * GITHUB_TOKEN when the user has set one. The token is read through execFile
- * (no shell, fixed argv), kept in memory only, and never logged: log.ts masks
+ * (no shell, fixed argv, gh by its absolute path), kept in memory only, and never logged: log.ts masks
  * GitHub token shapes as well as bearer headers.
  *
  * ETAGS: every GET is sent with the previous answer's ETag. GitHub answers an
@@ -14,6 +14,8 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 
+import { findProgram } from "../../hooks/programs.mjs";
+import { sendRefusal } from "../../hooks/proxy.mjs";
 import { fakeGitHubAllowed, isLoopback } from "./config.ts";
 import { log } from "./log.ts";
 import { REVIEW_QUERY, type ReviewState, graphqlRate, parseReviewState } from "./reviews.ts";
@@ -38,9 +40,16 @@ export interface RunResult {
 
 export type Runner = (command: string, args: readonly string[]) => Promise<RunResult>;
 
+/**
+ * Runs a program by its absolute path from PATH (hooks/programs.mjs), never by its bare name: the channel's working
+ * folder is the session's repository, and a file named gh in it must never be the one that is handed the question
+ * "what is the token". A name PATH does not hold is ENOENT, as a missing program always was.
+ */
 const runCommand: Runner = (command, args) =>
   new Promise((resolve) => {
-    execFile(command, [...args], { timeout: 10_000, windowsHide: true }, (error, stdout) => {
+    const program = findProgram(command);
+    if (!program) return resolve({ code: null, stdout: "", errorCode: "ENOENT" });
+    execFile(program, [...args], { timeout: 10_000, windowsHide: true }, (error, stdout) => {
       if (!error) return resolve({ code: 0, stdout });
       const e = error as NodeJS.ErrnoException & { code?: number | string };
       resolve({ code: typeof e.code === "number" ? e.code : null, stdout: stdout ?? "", errorCode: typeof e.code === "string" ? e.code : undefined });
@@ -294,7 +303,12 @@ export interface ClientOptions {
   readonly now?: () => number;
   /** Told what each REST answer says about the login. It must not throw; nothing waits on it. */
   readonly observe?: (o: Observation) => void;
+  /** The environment the refusals are read from (certificate checks off, an unusable proxy); the process's by default. */
+  readonly env?: Env;
 }
+
+/** How long a refused client says to wait: the environment is the process's own, so only a restart changes the answer. */
+const REFUSED_FOR_MS = 5 * 60_000;
 
 /** A TLS failure that is about the certificate GitHub's address presented, as Node names them. */
 const CERT_ERRORS = new Set([
@@ -336,6 +350,7 @@ export class GitHubClient {
   private readonly readAuth: () => Promise<GhAuth>;
   private readonly fetchImpl: Fetch;
   private readonly observe: (o: Observation) => void;
+  private readonly env: Env;
 
   constructor(base: string, readAuth: () => Promise<GhAuth>, fetchImpl: Fetch = fetch, options: ClientOptions = {}) {
     this.base = base.replace(/\/+$/, "");
@@ -344,6 +359,18 @@ export class GitHubClient {
     this.shared = options.shared ?? null;
     this.now = options.now ?? Date.now;
     this.observe = options.observe ?? (() => undefined);
+    this.env = options.env ?? process.env;
+  }
+
+  /**
+   * Why this client makes no request at all, or null (hooks/proxy.mjs sendRefusal): certificate checks are switched
+   * off, so whoever answered as GitHub would be handed the login; or the proxy variable names a proxy the channel
+   * cannot use, and going straight to GitHub would walk around it. Asked before the login is read, so with nowhere to
+   * send it gh is not even run. The reason is one sentence that says what to set.
+   */
+  private refused(): { kind: "retry"; reason: string; afterMs: number } | null {
+    const refusal = sendRefusal(this.env, this.base);
+    return refusal ? { kind: "retry", reason: refusal.reason, afterMs: REFUSED_FOR_MS } : null;
   }
 
   /** How many paths' ETags and answers this client keeps (tests hold it under a bound). */
@@ -576,6 +603,8 @@ export class GitHubClient {
    * REST's (rate-graphql.json), and an answer `parse` finds nothing in is not_found.
    */
   private async graphql<T>(key: string, freshMs: number, query: string, variables: Record<string, unknown>, parse: (body: unknown) => T | null): Promise<ApiResult<T>> {
+    const refused = this.refused();
+    if (refused) return refused;
     const auth = await this.login();
     if (auth.kind !== "ok") return { kind: "auth", auth };
     return this.viaStore<T>(key, freshMs, async (store) => {
@@ -674,6 +703,8 @@ export class GitHubClient {
    * and asks GitHub with the newest ETag any session stored. Without a store: every call asks GitHub.
    */
   private async get<T>(path: string, freshMs: number, map: (json: unknown) => T, valid?: (value: unknown) => boolean): Promise<ApiResult<T>> {
+    const refused = this.refused();
+    if (refused) return refused;
     const auth = await this.login();
     if (auth.kind !== "ok") return { kind: "auth", auth };
     return this.viaStore<T>(path, freshMs, (store, stored) => this.ask(path, auth, map, store, stored), valid);

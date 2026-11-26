@@ -3,7 +3,7 @@
 // without duplicating and taken out exactly. It never overrides `claude`.
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -296,7 +296,7 @@ test("`claude-gh.mjs decline` records the no and says when it will be asked agai
   assert.ok(existsSync(join(home, ".local", "state", "runners-io", "claude-gh-declined.json")));
 });
 
-test("a claude-gh found is remembered for a day, so the shell is not started at every launch; one missing is asked every time", async () => {
+test("the shell's answer is remembered for a day, found or missing, so the login shell is not started at every launch", async () => {
   const { claudeGhForOffer } = await import("../../skills/setup-github/claude-gh.mjs");
   const cacheRoot = join(mkdtempSync(join(tmpdir(), "claude-gh-cache-")), "runners-io");
   const env = { SHELL: "/bin/zsh" };
@@ -307,20 +307,120 @@ test("a claude-gh found is remembered for a day, so the shell is not started at 
     return answer;
   };
   const t0 = 1_700_000_000_000;
+  const hour = 60 * 60_000;
   assert.equal(await claudeGhForOffer(env, present, { now: t0, cacheRoot }), false);
-  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 1000, cacheRoot }), false);
-  assert.equal(asked, 2, "missing: asked at every launch");
-  answer = true;
-  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 2000, cacheRoot }), true);
-  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 60 * 60_000, cacheRoot }), true);
-  assert.equal(asked, 3, "found: not asked again within the day");
+  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 1000, cacheRoot }), false, "the offer is still made");
+  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 23 * hour, cacheRoot }), false);
+  assert.equal(asked, 1, "missing: the shell is asked once, not at every launch");
   assert.equal(statSync(cacheRoot).mode & 0o777, 0o700);
   for (const f of readdirSync(cacheRoot)) assert.equal(statSync(join(cacheRoot, f)).mode & 0o777, 0o600, f);
-  assert.equal(await claudeGhForOffer({ SHELL: "/bin/bash" }, present, { now: t0 + 3000, cacheRoot }), true);
-  assert.equal(asked, 4, "another shell is asked for itself");
+  answer = true;
+  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 24 * hour, cacheRoot }), true, "a day later the shell is asked again");
+  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 25 * hour, cacheRoot }), true);
+  assert.equal(asked, 2, "found: not asked again within the day");
+  for (const f of readdirSync(cacheRoot)) assert.equal(statSync(join(cacheRoot, f)).mode & 0o777, 0o600, f);
   answer = false;
-  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 25 * 60 * 60_000, cacheRoot }), false, "a day later it is asked again");
+  assert.equal(await claudeGhForOffer({ SHELL: "/bin/bash" }, present, { now: t0 + 25 * hour, cacheRoot }), false);
+  assert.equal(asked, 3, "another shell is asked for itself");
+  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 49 * hour, cacheRoot }), false, "a day after it was found it is asked again");
+  assert.equal(asked, 4);
+});
+
+test("no answer from the shell is not remembered: it is asked again at the next launch", async () => {
+  const { claudeGhForOffer } = await import("../../skills/setup-github/claude-gh.mjs");
+  const cacheRoot = join(mkdtempSync(join(tmpdir(), "claude-gh-cache-")), "runners-io");
+  let asked = 0;
+  const present = () => (asked++, null);
+  assert.equal(await claudeGhForOffer({ SHELL: "/bin/zsh" }, present, { now: 1000, cacheRoot }), null);
+  assert.equal(await claudeGhForOffer({ SHELL: "/bin/zsh" }, present, { now: 2000, cacheRoot }), null);
+  assert.equal(asked, 2);
+  assert.equal(existsSync(join(cacheRoot, "claude-gh.json")), false);
+});
+
+test("a remembered `missing` is dropped the moment it may be out of date: the rc file changed, or a claude-gh appeared on PATH", async () => {
+  const { claudeGhForOffer } = await import("../../skills/setup-github/claude-gh.mjs");
+  const home = mkdtempSync(join(tmpdir(), "claude-gh-stale-"));
+  const cacheRoot = join(home, "cache", "runners-io");
+  const env = { HOME: home, ZDOTDIR: home, SHELL: "/bin/zsh", PATH: "/usr/bin:/bin" };
+  let asked = 0;
+  let answer = false;
+  const present = () => (asked++, answer);
+  const t0 = 1_700_000_000_000;
+  assert.equal(await claudeGhForOffer(env, present, { now: t0, cacheRoot }), false);
+  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 1000, cacheRoot }), false);
+  assert.equal(asked, 1);
+  // The user adds it by hand: the rc file is not the file the answer was read for, so the shell is asked again.
+  writeFileSync(join(home, ".zshrc"), "alias claude-gh='claude --channels x'\n");
+  answer = true;
+  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 2000, cacheRoot }), true);
+  assert.equal(asked, 2);
+
+  const home2 = mkdtempSync(join(tmpdir(), "claude-gh-stale-"));
+  const cache2 = join(home2, "cache", "runners-io");
+  const env2 = { HOME: home2, ZDOTDIR: home2, SHELL: "/bin/zsh", PATH: "/usr/bin:/bin" };
+  let asked2 = 0;
+  const missing = () => (asked2++, false);
+  assert.equal(await claudeGhForOffer(env2, missing, { now: t0, cacheRoot: cache2 }), false);
+  const bin = join(home2, "bin");
+  mkdirSync(bin);
+  writeFileSync(join(bin, "claude-gh"), "#!/bin/sh\n", { mode: 0o755 });
+  await claudeGhForOffer({ ...env2, PATH: `${bin}:/usr/bin:/bin` }, missing, { now: t0 + 1000, cacheRoot: cache2 });
+  assert.equal(asked2, 2, "a claude-gh on PATH: the remembered answer is not used");
+});
+
+test("setting claude-gh up through the skill forgets the remembered answer, so the next launch sees it at once; so does taking it out", async () => {
+  const { claudeGhForOffer } = await import("../../skills/setup-github/claude-gh.mjs");
+  const home = mkdtempSync(join(tmpdir(), "claude-gh-forget-"));
+  const rc = join(home, "rc");
+  writeFileSync(rc, "# mine\n");
+  const env = { PATH: process.env.PATH, HOME: home, XDG_CACHE_HOME: join(home, "cache"), SHELL: "/bin/zsh" };
+  const cacheRoot = join(home, "cache", "runners-io");
+  const seen = join(cacheRoot, "claude-gh.json");
+  const cli = (...args) => spawnSync(process.execPath, [SCRIPT, ...args, "--shell", "zsh", "--rc", rc], { env, encoding: "utf8" });
+  let asked = 0;
+  let answer = false;
+  const present = () => (asked++, answer);
+  const t0 = Date.now();
+  assert.equal(await claudeGhForOffer(env, present, { now: t0 }), false, "the launch that makes the offer");
+  assert.ok(existsSync(seen), "missing is remembered, in the cache folder the environment names");
+  assert.equal(cli("show").status, 0);
+  assert.ok(existsSync(seen), "show changes nothing");
+  assert.equal(cli("add").status, 0);
+  assert.equal(existsSync(seen), false, "add forgets it");
+  answer = true;
+  assert.equal(await claudeGhForOffer(env, present, { now: t0 + 1000 }), true, "the next launch asks the shell, and finds it");
+  assert.equal(asked, 2);
+  assert.ok(existsSync(seen));
+  assert.equal(cli("remove").status, 0);
+  assert.equal(existsSync(seen), false, "remove forgets a remembered `found` as well");
+  // An add that changes nothing (the lines are already there) still forgets: the user asked for it to be set up.
+  assert.equal(cli("add").status, 0);
+  await claudeGhForOffer(env, present, { now: t0 + 2000 });
+  assert.equal(cli("add").status, 0);
+  assert.equal(existsSync(seen), false);
+});
+
+test("a remembered answer is believed only from a plain file of this user's: one written by hand, or that is a symlink, is not", async () => {
+  const { claudeGhForOffer } = await import("../../skills/setup-github/claude-gh.mjs");
+  const base = mkdtempSync(join(tmpdir(), "claude-gh-cache-"));
+  const cacheRoot = join(base, "runners-io");
+  mkdirSync(cacheRoot, { mode: 0o700 });
+  let asked = 0;
+  const present = () => (asked++, false);
+  for (const text of ["not json", "[]", JSON.stringify({ shell: "/bin/zsh", at: "yesterday", found: false }), JSON.stringify({ shell: "/bin/zsh", at: 5000, found: false })]) {
+    writeFileSync(join(cacheRoot, "claude-gh.json"), text);
+    assert.equal(await claudeGhForOffer({ SHELL: "/bin/zsh" }, present, { now: 1000, cacheRoot }), false, text);
+  }
+  assert.equal(asked, 4, "none of them was believed: the last is from the future");
+  // A symlink where the file would be: not read, and replaced by a plain file, never written through.
+  const elsewhere = join(base, "elsewhere.json");
+  writeFileSync(elsewhere, JSON.stringify({ shell: "/bin/zsh", at: 900, found: true }));
+  rmSync(join(cacheRoot, "claude-gh.json"));
+  symlinkSync(elsewhere, join(cacheRoot, "claude-gh.json"));
+  assert.equal(await claudeGhForOffer({ SHELL: "/bin/zsh" }, present, { now: 1000, cacheRoot }), false);
   assert.equal(asked, 5);
+  assert.equal(lstatSync(join(cacheRoot, "claude-gh.json")).isSymbolicLink(), false);
+  assert.equal(JSON.parse(readFileSync(elsewhere, "utf8")).found, true, "the link's target was left alone");
 });
 
 test("the remembered answer is ignored in a symlinked cache folder", async () => {
@@ -344,9 +444,12 @@ test("RUNNERS_IO_NO_CLAUDE_GH_OFFER=1 turns the offer off without starting a she
     asked++;
     return false;
   };
-  assert.equal(await claudeGhForOffer({ RUNNERS_IO_NO_CLAUDE_GH_OFFER: "1" }, present), null);
+  // A cache folder of the test's own: an answer is remembered, and must not be written into this user's real one.
+  const cacheRoot = join(mkdtempSync(join(tmpdir(), "claude-gh-cache-")), "runners-io");
+  assert.equal(await claudeGhForOffer({ RUNNERS_IO_NO_CLAUDE_GH_OFFER: "1" }, present, { cacheRoot }), null);
   assert.equal(asked, 0);
-  assert.equal(await claudeGhForOffer({}, present), false);
+  assert.equal(existsSync(cacheRoot), false);
+  assert.equal(await claudeGhForOffer({}, present, { cacheRoot }), false);
 });
 
 test("nothing the shell's startup files start outlives the check: on a timeout, or after a normal exit", async () => {

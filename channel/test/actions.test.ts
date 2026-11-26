@@ -118,13 +118,34 @@ test("no kind tells Claude to push, merge or approve without the user's say-so",
   assert.ok(scanned >= EVENT_KINDS.length * 3 * states.length * 4);
 });
 
-test("a failure on the user's own PR says to use the fix-failing-ci skill now, and push only if the user asked", () => {
+// A failure is never fixed unasked: Claude tells the user and offers, and starts only with the user's consent, which is
+// a yes now or an earlier request in the session to fix CI or keep the pull request green.
+const CONSENT = /do not start unless the user says yes, or asked earlier in this session to fix CI or to keep this pull request green/;
+
+test("a failure on the user's own PR says to tell the user and offer to fix it, and to start only with the user's consent", () => {
   for (const kind of ["ci.workflow_failed", "ci.job_failed"] as const) {
     const text = toMessage({ ...every()[0], kind, conclusion: "failure" } as Change, "octocat").content;
-    assert.match(text, /Use the fix-failing-ci skill now/, text);
-    assert.match(text, /push only if the user asked/, text);
-    assert.match(text, /before changing anything\./, text);
+    assert.match(text, /Tell the user, and offer to fix it; /, text);
+    assert.match(text, CONSENT, text);
+    assert.doesNotMatch(text, /skill now|fix it now|at once/, text);
+    // What follows the consent is unchanged: the skill, the log first, and a push only when asked.
+    assert.match(text, /Then use the fix-failing-ci skill: read /, text);
+    assert.match(text, /before changing anything, fix the cause, and push only if the user asked\./, text);
+    assert.ok(text.indexOf("offer to fix it") < text.indexOf("fix-failing-ci"), "the offer comes before the skill");
   }
+});
+
+test("the instructions, the fix-failing-ci skill and the watch-this-pr skill all ask for the user's consent before a fix starts", async () => {
+  const { readFileSync } = await import("node:fs");
+  const read = (name: string) => readFileSync(new URL(`../../skills/${name}/SKILL.md`, import.meta.url), "utf8");
+  const consent = /(start|begin|go on) only (if|when|with)[^.]*(says yes|consent)[^.]*(asked earlier in (this|the) session to fix CI or to keep (this|the) pull request green)/i;
+  for (const [name, text] of [["instructions", INSTRUCTIONS], ["fix-failing-ci", read("fix-failing-ci")], ["watch-this-pr", read("watch-this-pr")]] as const) {
+    assert.match(text, /offer to fix it/i, name);
+    assert.match(text, consent, name);
+    assert.doesNotMatch(text, /fix-failing-ci skill now|Start fixing at once/, name);
+  }
+  // The skill is also reached by the user asking, which is itself the consent.
+  assert.match(read("fix-failing-ci"), /asking you to fix CI is that yes/i);
 });
 
 test("a failure on someone else's or a fork's PR keeps tell-the-user wording, and never sends Claude to fix it", () => {

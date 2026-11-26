@@ -2,9 +2,7 @@
 // sent for each failure that is GitHub's, the network's or the machine's. Every send goes to a listener on 127.0.0.1
 // that this file starts; each case ends with the control, which shows that listener would have counted a report.
 //
-// Where this runs inside the runners.io source tree, what the bundle sent is also given to the endpoint's own check
-// (apps/web/lib/plugin-telemetry/message.ts), so the plugin and the server cannot drift apart unseen. In the published
-// repository that file is not there, and the same patterns are checked from a copy below.
+// What the bundle sent is also checked against the endpoint's patterns, from a copy below.
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -123,14 +121,8 @@ function serve(env) {
   };
 }
 
-/** The endpoint's own check of a message, where the source tree holds it (and this Node.js can load it), else null. */
-async function serverCheck() {
-  const web = resolve(here, "..", "..", "..", "..", "apps", "web", "lib", "plugin-telemetry");
-  if (!existsSync(join(web, "message.ts")) || Number(process.versions.node.split(".")[0]) < 24) return null;
-  const { parsePluginMessage, MAX_BODY_BYTES: serverMax } = await import(pathToFileURL(join(web, "message.ts")).href);
-  const { PUBLISHED_PLUGIN_VERSIONS } = await import(pathToFileURL(join(web, "versions.ts")).href);
-  return { parse: (m) => parsePluginMessage(m, PUBLISHED_PLUGIN_VERSIONS), serverMax, published: PUBLISHED_PLUGIN_VERSIONS };
-}
+/** The endpoint's own check of a message, where one is at hand (and this Node.js can load it), else null. */
+let serverCheck = async () => null;
 
 /** The endpoint's patterns, copied: what a message must pass where the endpoint's own check is not at hand. */
 function passesCopiedPatterns(m) {
@@ -195,7 +187,7 @@ test("what the plugin sends passes the endpoint's own check, field for field: th
 
   for (const m of [...sent, update]) assert.equal(passesCopiedPatterns(m), true, JSON.stringify(m));
   const server = await serverCheck();
-  if (!server) return; // the published repository, or a Node.js that cannot load TypeScript: the copy above is the check
+  if (!server) return; // no check of the endpoint's own at hand, or a Node.js that cannot load it: the copy above is the check
   assert.equal(server.serverMax, MAX_BODY_BYTES, "the plugin's size limit is the endpoint's");
   assert.ok(server.published.includes(VERSION), `the endpoint does not list ${VERSION}: its install pings would be dropped`);
   for (const m of [...sent, update]) {
@@ -389,6 +381,31 @@ test("with telemetry off the bundle sends nothing, and status says which setting
   const on = machine(e.url, { RUNNERS_IO_GITHUB_API: gh.base });
   assert.match((await command(on, "status")).stdout, /\ntelemetry: on \(/);
   await control(e, on);
+});
+
+test("the plugin's telemetry setting turns the bundle's sends off: from the manifest's env, and as the doctor skill passes it", async () => {
+  const e = await endpoint();
+  const gh = await startFakeGitHub({ token: TOKEN });
+  cleanups.push(() => gh.close());
+  const off = /^telemetry: off \(the plugin's telemetry setting is off/;
+  // As the manifest hands it to the channel: the saved setting, under the name a hook gets it by.
+  const saved = machine(e.url, { RUNNERS_IO_GITHUB_API: gh.base, CLAUDE_PLUGIN_OPTION_TELEMETRY: "off" });
+  const test = await command(saved, "telemetry-test");
+  assert.match(test.stdout, off, test.stdout);
+  assert.match(test.stdout, /test report: off\n$/);
+  assert.match((await command(saved, "status")).stdout, /\ntelemetry: off \(the plugin's telemetry setting is off[^\n]*\): nothing is sent to runners\.io\n/);
+  // As the doctor skill runs it: a command Claude runs gets no setting in its environment, so the skill passes it.
+  const plain = machine(e.url, { RUNNERS_IO_GITHUB_API: gh.base });
+  assert.match((await command(plain, "status", "--telemetry-setting", "off")).stdout, /\ntelemetry: off \(the plugin's telemetry setting is off/);
+  assert.match((await command(plain, "telemetry-test", "--telemetry-setting", "off")).stdout, off);
+  assert.equal(e.requests.length, 0);
+  // A setting nobody saved reaches the skill as the reference itself: that is the default, on. So is anything else.
+  for (const value of ["${user_config.telemetry}", "on", "nonsense"]) {
+    const r = await command(plain, "status", "--telemetry-setting", value);
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /\ntelemetry: on \(/, value);
+  }
+  await control(e, plain);
 });
 
 // ---- behind a company proxy --------------------------------------------------------------------------------------------

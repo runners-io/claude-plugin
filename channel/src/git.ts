@@ -3,12 +3,16 @@
  * project directory every poll, so a `git switch` mid-session moves the
  * channel to the new branch without a restart.
  *
- * git is run with execFile (no shell), a fixed argv and a short timeout.
+ * git is run with execFile (no shell), a fixed argv and a short timeout, by its absolute path from PATH
+ * (hooks/programs.mjs): the folder it reads is a repository, and a file named git in it must never be the one that runs.
  */
 import { execFile } from "node:child_process";
 
+import { findProgram } from "../../hooks/programs.mjs";
+import { readsGitHubCom } from "../../hooks/proxy.mjs";
+
 export interface GitScope {
-  /** `owner/name` on GitHub, or null when origin is not a GitHub remote. */
+  /** `owner/name` on GitHub, or null when origin is not a GitHub remote, or not on the GitHub host the plugin reads. */
   readonly repo: string | null;
   /** The checked-out branch, or null when HEAD is detached or there is no repo. */
   readonly branch: string | null;
@@ -47,21 +51,31 @@ export function parseGitHubRemote(url: string): string | null {
 }
 
 function git(dir: string, args: string[]): Promise<string | null> {
+  // Looked up at every call: cheap, and a git installed mid-session is found without a restart. None: as a git that failed.
+  const program = findProgram("git");
+  if (!program) return Promise.resolve(null);
   return new Promise((resolve) => {
-    execFile("git", ["-C", dir, ...args], { timeout: 5000, windowsHide: true }, (error, stdout) => {
+    execFile(program, ["-C", dir, ...args], { timeout: 5000, windowsHide: true }, (error, stdout) => {
       resolve(error ? null : stdout.trim());
     });
   });
 }
 
-export async function readGitScope(dir: string): Promise<GitScope> {
+/**
+ * `env` says which GitHub host the plugin reads. A remote is read as a repository only when it is on that host: the
+ * remotes understood here are github.com's, so while RUNNERS_IO_GITHUB_API names another host they name no repository
+ * (hooks/proxy.mjs readsGitHubCom). Asked of another server, `owner/name` is somebody else's repository, and its
+ * answer would be reported as this one's. A remote on any other host never names one, whatever the setting.
+ */
+export async function readGitScope(dir: string, env: Record<string, string | undefined> = process.env): Promise<GitScope> {
   const [remote, branch, upstreamUrl] = await Promise.all([
     git(dir, ["remote", "get-url", "origin"]),
     git(dir, ["branch", "--show-current"]),
     git(dir, ["remote", "get-url", "upstream"]),
   ]);
-  const repo = remote ? parseGitHubRemote(remote) : null;
-  const upstream = upstreamUrl ? parseGitHubRemote(upstreamUrl) : null;
+  const here = readsGitHubCom(env);
+  const repo = here && remote ? parseGitHubRemote(remote) : null;
+  const upstream = here && upstreamUrl ? parseGitHubRemote(upstreamUrl) : null;
   // A branch name git itself gave, after `refs/remotes/origin/`, so it cannot be read as an option; no shell runs.
   const pushed = branch ? await git(dir, ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`]) : null;
   return {

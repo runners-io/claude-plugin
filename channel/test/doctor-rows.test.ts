@@ -72,3 +72,23 @@ test("the live call when GitHub cannot be reached is unknown, with the reason, n
   assert.equal(row.state, "unknown");
   assert.match(row.why ?? "", /could not ask GitHub: fetch failed/);
 });
+
+test("the live call where the plugin makes no request (certificate checks off, or a proxy it cannot use): unknown, with the reason and what to set", async () => {
+  const never: typeof fetch = async () => {
+    throw new Error("a request was made");
+  };
+  const tls = new GitHubClient("https://api.github.com", auth, never, { env: { NODE_TLS_REJECT_UNAUTHORIZED: "0" } });
+  assert.deepEqual(await liveRow(tls, "acme/widgets", null), {
+    id: "github_answers",
+    label: "GitHub answers for this repository",
+    state: "unknown",
+    why:
+      "could not ask GitHub: NODE_TLS_REJECT_UNAUTHORIZED=0 turns certificate checks off, so the GitHub login is not sent and no request is made: " +
+      "unset it (NODE_EXTRA_CA_CERTS adds a company's root certificate)",
+  });
+  const proxy = new GitHubClient("https://api.github.com", auth, never, { env: { https_proxy: "socks5://proxy.corp.example:1080" } });
+  assert.equal(
+    (await liveRow(proxy, null, null)).why,
+    "could not ask GitHub: https_proxy names a proxy the plugin cannot use, so no request is made: set it to an http:// or https:// proxy, or name the host in NO_PROXY",
+  );
+});

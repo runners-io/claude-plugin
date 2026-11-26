@@ -424,6 +424,10 @@ const OPT_OUTS = {
   "DISABLE_TELEMETRY=true": { DISABLE_TELEMETRY: "true" },
   "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1": { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" },
   "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=yes": { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "yes" },
+  // The plugin's own telemetry setting (plugin.json userConfig), as Claude Code hands a saved one to a hook and, through
+  // the manifest's env, to the channel.
+  "the plugin's telemetry setting, off": { CLAUDE_PLUGIN_OPTION_TELEMETRY: "off" },
+  "the plugin's telemetry setting, OFF": { CLAUDE_PLUGIN_OPTION_TELEMETRY: " OFF " },
 };
 
 for (const [what, setting] of Object.entries(OPT_OUTS)) {
@@ -448,13 +452,38 @@ for (const [what, setting] of Object.entries(OPT_OUTS)) {
 
 test("a variable that is set to nothing, 0 or false does not turn it off, and status then says it is on, never the install id", async () => {
   const e = await endpoint();
-  const env = machine(e.url, { DO_NOT_TRACK: "0", DISABLE_TELEMETRY: "", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "false", RUNNERS_IO_TELEMETRY: "on" });
+  const env = machine(e.url, { DO_NOT_TRACK: "0", DISABLE_TELEMETRY: "", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "false", RUNNERS_IO_TELEMETRY: "on", CLAUDE_PLUGIN_OPTION_TELEMETRY: "on" });
   assert.deepEqual(telemetrySwitch(env), { on: true });
   assert.equal(await sender(env).ping(), "sent");
   const line = telemetryLine(env);
   assert.match(line, /^telemetry: on /);
   assert.match(line, /RUNNERS_IO_TELEMETRY=off/);
+  assert.match(line, /the plugin's telemetry setting/, "the on line names the setting that turns it off");
   assert.equal(line.includes(e.messages()[0].install_id), false);
+});
+
+test("the plugin's telemetry setting: only a saved off turns it off, and status says the setting did", () => {
+  assert.deepEqual(telemetrySwitch({ CLAUDE_PLUGIN_OPTION_TELEMETRY: "off" }), { on: false, why: "the plugin's telemetry setting is off (CLAUDE_PLUGIN_OPTION_TELEMETRY=off)" });
+  assert.match(telemetryLine({ CLAUDE_PLUGIN_OPTION_TELEMETRY: "off" }), /^telemetry: off \(the plugin's telemetry setting is off/);
+  // A setting nobody saved reaches a hook as no variable at all, and a skill as the reference itself, unreplaced: both
+  // are the default, on. So is anything that is not the word off.
+  for (const value of [undefined, "", "on", "${user_config.telemetry}", "offf", "0"]) {
+    assert.equal(telemetrySwitch({ CLAUDE_PLUGIN_OPTION_TELEMETRY: value }).on, true, String(value));
+  }
+  // An environment variable that says off wins over a setting that says on, and is the one named.
+  assert.equal(telemetrySwitch({ CLAUDE_PLUGIN_OPTION_TELEMETRY: "on", DO_NOT_TRACK: "1" }).why, "DO_NOT_TRACK is set");
+});
+
+test("with a proxy named that the plugin cannot use, status says telemetry is on but that nothing is sent, and why", async () => {
+  const e = await endpoint();
+  const env = machine(e.url, { HTTPS_PROXY: "socks5://proxy.example:1080" });
+  assert.equal(await sender(env).ping(), "blocked");
+  assert.equal(e.requests.length, 0);
+  const line = telemetryLine(env);
+  assert.match(line, /^telemetry: on, but nothing is sent while HTTPS_PROXY names a proxy the plugin cannot use/);
+  assert.equal(line.includes("socks5"), false, "the variable's value is never shown");
+  // The control: with no such proxy the line is the plain one.
+  assert.match(telemetryLine(machine(e.url)), /^telemetry: on \(/);
 });
 
 // ---- the endpoint's answers ------------------------------------------------------------------------------------------
@@ -595,5 +624,28 @@ test("a hook leaves the ping to the channel only where a proxy stands in the way
   assert.equal(needsTunnel({ HTTPS_PROXY: "http://proxy.corp.example:3128" }), true);
   assert.equal(needsTunnel({ https_proxy: "http://proxy.corp.example:3128", NO_PROXY: "www.runners.io" }), false);
   assert.equal(needsTunnel({ HTTPS_PROXY: "http://proxy.corp.example:3128", no_proxy: ".runners.io" }), false);
-  assert.equal(needsTunnel({ HTTPS_PROXY: "socks5://proxy.corp.example:1080" }), false, "a proxy nothing here can use: the request goes as it would without");
+  assert.equal(needsTunnel({ HTTPS_PROXY: "socks5://proxy.corp.example:1080" }), false, "a proxy nothing here can use: there is no tunnel to open, and nothing is sent (below)");
+});
+
+test("behind a proxy the plugin cannot use, nothing is sent: not the ping, not a fault report, and nothing is counted as sent", async () => {
+  const e = await endpoint();
+  for (const variable of ["HTTPS_PROXY", "https_proxy"]) {
+    const env = machine(e.url, { [variable]: "socks5://ada:s3cr3t@proxy.corp.example:1080" });
+    const t = sender(env);
+    assert.equal(await t.ping(), "blocked", variable);
+    assert.equal(await t.report(caught(() => deepFault(3))), "blocked");
+    assert.equal(await t.internalError(INTERNAL_CODES[0]), "blocked");
+    assert.equal(e.requests.length, 0, "a request went around the proxy");
+    // Nothing was claimed, so once the proxy is one that can be used (here: none), the ping still goes, once.
+    const { [variable]: _unusable, ...fixed } = env;
+    assert.equal(await sender(fixed).ping(), "sent");
+    assert.equal(e.requests.length, 1);
+    e.requests.length = 0;
+  }
+  // A host the no_proxy list names is reached directly, as the user said.
+  const named = machine(e.url, { HTTPS_PROXY: "socks5://proxy.corp.example:1080", NO_PROXY: "127.0.0.1" });
+  assert.equal(await sender(named).ping(), "sent");
+  // ALL_PROXY is not read: it does not stop a message either.
+  const all = machine(e.url, { ALL_PROXY: "socks5://proxy.corp.example:1080" });
+  assert.equal(await sender(all).ping(), "sent");
 });

@@ -144,8 +144,22 @@ test("origin is on GitLab, or there is no origin: information that the plugin re
   assert.equal(one(rows, "no_workflows").state, "skipped", "no workflows is not said of a repository that is not on GitHub");
 });
 
-test("origin is a GitHub Enterprise host: it degrades, and the fix names the host's own sign-in and the API setting", async () => {
-  const m = machine();
+test("a host is not GitHub Enterprise because its name says github: the API setting is never offered for a host only the repository names", async () => {
+  // The remote is the repository's own text. Offering to point the plugin's API setting at whatever host it names
+  // would send the user's login for that host, or one they are then asked to make, to an address a stranger chose.
+  for (const origin of ["https://github.evil.example/team/widgets.git", "git@ghe.evil.example:team/widgets.git", "https://evil-github.example/team/widgets.git", "ssh://git@github-ghe.example/team/widgets.git"]) {
+    const m = machine();
+    const rows = await check(m, project(m, { origin }));
+    assert.equal(one(rows, "enterprise_host"), undefined, origin);
+    const r = one(rows, "no_github_remote");
+    assert.equal(r.effect, "info", origin);
+    assert.equal(r.line, "this repository's origin isn't on GitHub, and the plugin reads GitHub Actions only.");
+    assert.equal(/RUNNERS_IO_GITHUB_API|evil|gh auth login/.test(JSON.stringify(rows)), false, `${origin}: neither the host nor the setting is put to Claude`);
+  }
+});
+
+test("origin is a GitHub Enterprise host GH_HOST names: it degrades, and the fix names the host's own sign-in and the API setting", async () => {
+  const m = machine({ env: { GH_HOST: "github.acme.example" } });
   const rows = await check(m, project(m, { origin: "https://github.acme.example/team/widgets.git" }));
   const r = one(rows, "enterprise_host");
   assert.equal(r.effect, "degrades");
@@ -159,6 +173,59 @@ test("origin is a GitHub Enterprise host: it degrades, and the fix names the hos
 test("a host gh is signed in to is an Enterprise host, whatever it is called", async () => {
   const m = machine({ hosts: "git.corp.example:\n    users:\n        ada:\n    user: ada\n" });
   assert.equal(one(await check(m, project(m, { origin: "git@git.corp.example:team/widgets.git" })), "enterprise_host").effect, "degrades");
+  // A host the plugin is already set to read is the user's own choice too: the row says where it stands, and names no new address.
+  const set = machine({ env: { RUNNERS_IO_GITHUB_API: "https://git.corp.example/api/v3" } });
+  assert.equal(one(await check(set, project(set, { origin: "git@git.corp.example:team/widgets.git" })), "enterprise_host").effect, "degrades");
+});
+
+test("a github.com repository while the plugin is set to another host: said once, and its pull requests are not looked up there", async () => {
+  const m = machine({ env: { RUNNERS_IO_GITHUB_API: "https://ghe.corp.example/api/v3" } });
+  const rows = await check(m, project(m));
+  const r = one(rows, "host_mismatch");
+  assert.equal(r.state, "not_ready");
+  assert.equal(r.effect, "degrades");
+  assert.equal(r.once, true);
+  assert.equal(r.label, "the repository's origin is on the GitHub host the plugin reads");
+  assert.equal(
+    r.line,
+    "this repository is on github.com, but the plugin is set to read ghe.corp.example (RUNNERS_IO_GITHUB_API), so its pull requests are not looked up: a repository is only ever asked of its own host.",
+  );
+  assert.match(r.fix, /^Nothing to install\./);
+  assert.match(r.fix, /starts Claude Code without `RUNNERS_IO_GITHUB_API`/);
+  assert.match(r.fix, /Never suggest pointing the variable at another address/);
+  assert.equal(one(rows, "no_github_remote"), undefined, "one row for the remote, not two");
+  assert.equal(one(rows, "no_workflows").state, "skipped");
+  assert.equal(one(rows, "fork").state, "skipped");
+  // The control: the same repository with the setting unset, or naming github.com's own API, is simply ready.
+  for (const env of [{}, { RUNNERS_IO_GITHUB_API: "https://api.github.com" }]) {
+    const plain = machine({ env });
+    const ok = await check(plain, project(plain));
+    assert.equal(one(ok, "host_mismatch"), undefined);
+    assert.equal(one(ok, "no_github_remote").state, "ready");
+  }
+});
+
+test("NODE_TLS_REJECT_UNAUTHORIZED=0: it blocks, since the login is not sent with certificate checks off, and the fix is to unset it", async () => {
+  const m = machine({ env: { NODE_TLS_REJECT_UNAUTHORIZED: "0" } });
+  const rows = await check(m, project(m));
+  const r = one(rows, "tls_checks_off");
+  assert.equal(r.state, "not_ready");
+  assert.equal(r.effect, "blocks");
+  assert.equal(r.label, "certificate checks are on");
+  assert.equal(r.line, "NODE_TLS_REJECT_UNAUTHORIZED=0 turns certificate checks off, so the plugin doesn't send your GitHub login and CI can't be read.");
+  assert.match(r.fix, /^Nothing to install\./);
+  assert.match(r.fix, /unsets `NODE_TLS_REJECT_UNAUTHORIZED`/);
+  assert.match(r.fix, /`NODE_EXTRA_CA_CERTS` set to the company's root certificate file/);
+  assert.match(r.fix, /Never suggest leaving certificate checks off/);
+  assert.match(renderTable(rows), /NOT READY {2}certificate checks are on \[blocks; tls_checks_off\]: NODE_TLS_REJECT_UNAUTHORIZED=0 turns/);
+  // A blocker is shown at every launch, whatever was declined.
+  const notice = setupNotice(rows, { state: { declined: { tls_checks_off: 1000 }, said: {} }, now: 2000 });
+  assert.equal(notice.line, `runners.io: ${r.line}`);
+  // The controls: unset, or any other value, is ready; so is the tests' own fake GitHub, which has no certificate.
+  for (const env of [{}, { NODE_TLS_REJECT_UNAUTHORIZED: "1" }, { NODE_TLS_REJECT_UNAUTHORIZED: "0", RUNNERS_IO_TEST_FAKE_GITHUB: "1", RUNNERS_IO_GITHUB_API: "http://127.0.0.1:8790" }]) {
+    const fine = machine({ env });
+    assert.equal(one(await check(fine, project(fine)), "tls_checks_off").state, "ready", JSON.stringify(env));
+  }
 });
 
 test("GH_TOKEN or GITHUB_TOKEN set over gh's own login: it degrades, names which, and gh is never handed the variable", async () => {
@@ -252,17 +319,22 @@ test("NO_PROXY naming GitHub's host: the doctor says GitHub is asked directly", 
   assert.equal(one(await check(other, project(other)), "proxy").why, "through proxy.corp.example:3128, from https_proxy");
 });
 
-test("a proxy the channel cannot use (SOCKS, or no address at all): it degrades, once per project, and the value is never repeated", async () => {
+test("a proxy the plugin cannot use (SOCKS, or no address at all): it blocks, since no request is made rather than one around the proxy, and the value is never repeated", async () => {
   for (const value of ["socks5://ada:s3cr3t-pa55@proxy.corp.example:1080", "http://"]) {
     const m = machine({ env: { HTTPS_PROXY: value } });
     const r = one(await check(m, project(m)), "proxy");
-    assert.equal(r.effect, "degrades", value);
-    assert.equal(r.once, true);
-    assert.equal(r.line, "HTTPS_PROXY names a proxy the plugin's channel can't use (it uses http:// and https:// proxies only), so it asks GitHub directly; behind that proxy CI may not arrive.");
+    assert.equal(r.effect, "blocks", value);
+    assert.equal(r.once, undefined, "a blocker is said at every launch until it is fixed");
+    assert.equal(r.line, "HTTPS_PROXY names a proxy the plugin can't use (it uses http:// and https:// proxies only), so it makes no request and CI can't be read.");
     assert.match(r.fix, /^Nothing to install\./);
+    assert.match(r.fix, /never goes around a proxy it was told to use/);
+    assert.match(r.fix, /sets the variable to their proxy's http:\/\/ or https:\/\/ address, or names GitHub's host in `NO_PROXY`/);
     assert.match(r.fix, /Never print the variable's value/);
     assert.equal(/s3cr3t|ada|proxy\.corp/.test(JSON.stringify(r)), false);
   }
+  // Named in NO_PROXY, GitHub's host is asked directly: the user's own instruction, and nothing to fix.
+  const named = machine({ env: { HTTPS_PROXY: "socks5://proxy.corp.example:1080", NO_PROXY: "api.github.com" } });
+  assert.equal(one(await check(named, project(named)), "proxy").why, "directly: NO_PROXY names GitHub's host");
 });
 
 test("the plugin's data folder cannot be written: it degrades, names the folder, and says what is off", async () => {

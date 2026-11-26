@@ -47,23 +47,42 @@ export function fakeGitHubAllowed(env: Env): boolean {
 }
 
 /**
+ * An API address as it may be shown: its host and port, and nothing else. The address is a setting somebody typed, so
+ * it can hold a login or a token in its path or query, and a log line or an error message is read by others.
+ */
+export function apiHost(raw: string): string {
+  try {
+    return new URL(raw).host;
+  } catch {
+    return "an address that cannot be read";
+  }
+}
+
+/**
  * A token is only ever sent over https, and never to this machine, where any local process could be listening,
  * unless RUNNERS_IO_TEST_FAKE_GITHUB=1 (the tests' fake GitHub, which may use plain http). Anything else is refused at
  * start, not at the first request, so a typo cannot leak a token in clear text.
+ *
+ * An address with a user name or a password in it is refused too: the login the channel sends is gh's, and a second
+ * one written into the address would travel with every request and into whatever prints the address. No refusal
+ * repeats the address: at most the host it names.
  */
 export function checkTokenUrl(raw: string, what: string, env: Env = process.env): string {
   let url: URL;
   try {
     url = new URL(raw);
   } catch {
-    throw machineError(`${what} is not a URL: ${raw}`);
+    throw machineError(`${what} is not a URL`);
+  }
+  if (url.username || url.password) {
+    throw machineError(`${what} must not hold a user name or a password: the plugin signs in with the GitHub CLI's login, so set it to the address alone`);
   }
   if (isLoopback(url.hostname)) {
     if (fakeGitHubAllowed(env) && (url.protocol === "https:" || url.protocol === "http:")) return raw.replace(/\/+$/, "");
-    throw machineError(`${what} may name this machine only in the plugin's own tests (RUNNERS_IO_TEST_FAKE_GITHUB=1): ${raw}`);
+    throw machineError(`${what} may name this machine only in the plugin's own tests (RUNNERS_IO_TEST_FAKE_GITHUB=1); it names ${url.host}`);
   }
   if (url.protocol === "https:") return raw.replace(/\/+$/, "");
-  throw machineError(`${what} must be https: ${raw}`);
+  throw machineError(`${what} must be https (it names ${url.host} over ${url.protocol.replace(/:$/, "")})`);
 }
 
 function parseAuto(raw: string | undefined): AutoSubscribe {

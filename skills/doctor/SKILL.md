@@ -11,10 +11,12 @@ The plugin needs a few things on this machine: Node.js 20 or later, the GitHub C
 Run this with the Bash tool, in the session's folder. This skill's base directory is `<plugin>/skills/doctor`, so the plugin's folder is two levels up:
 
 ```
-node "<this skill's base directory>/../../channel/dist/runners-io-channel.mjs" status
+node "<this skill's base directory>/../../channel/dist/runners-io-channel.mjs" status --telemetry-setting '${user_config.telemetry}'
 ```
 
-It reads the GitHub login the way the channel does, asks GitHub once whether it shows the folder's repository to that login (and once for the branch's open pull request; in a fork, once more, of the repository it was forked from, where a fork's pull request usually lives), and prints the login, the repository, the branch, the pull request, and then the checks. One line says whether telemetry is on (the install ping and reports of the plugin's own faults: the README's "What is sent"), and when it is off, which setting turned it off. The command itself sends nothing to runners.io unless its own code fails, and prints no token and no install ID.
+Keep the last argument exactly as it is written here, single quotes included. It is the plugin's telemetry setting, which a command you run cannot read for itself: Claude Code writes the saved setting (`on` or `off`) in its place, and leaves it as it is when the user never changed the setting, which the command reads as the default, on.
+
+It reads the GitHub login the way the channel does, asks GitHub once whether it shows the folder's repository to that login (and once for the branch's open pull request; in a fork, once more, of the repository it was forked from, where a fork's pull request usually lives), and prints the login, the repository, the branch, the pull request, and then the checks. One line says whether telemetry is on (the install ping and reports of the plugin's own faults: the README's "Telemetry"), and when it is off, which setting turned it off: the plugin's own `telemetry` setting, or a variable in the environment. To turn it off, the user sets the plugin's `telemetry` option to `off` in `/config` (or `/plugin`, runners-io, configure), or sets `RUNNERS_IO_TELEMETRY=off`; it is their choice, so change it only when they ask. The command itself sends nothing to runners.io unless its own code fails, and prints no token and no install ID.
 
 Three lines are usually `ready` and say more in brackets when there is something to know:
 

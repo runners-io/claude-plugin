@@ -157,7 +157,7 @@ test("the user's own PR's failure still says to read the log first", async () =>
     t.gh.setRuns("acme/widgets", SHA, [{ id: 41, name: "CI", status: "completed", conclusion: "failure" }]);
     await until("the failure", () => t.kinds().includes("ci.workflow_failed"));
     const m = t.messages.find((x) => x.meta.kind === "ci.workflow_failed");
-    assert.match(m?.content ?? "", /Read the failed job's log .*before changing anything\./);
+    assert.match(m?.content ?? "", /offer to fix it; .* read the failed job's log .*before changing anything, fix the cause/);
   } finally {
     await t.stop();
   }

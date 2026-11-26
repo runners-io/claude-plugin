@@ -245,3 +245,13 @@ test("the upstream remote is read from the clone: a fork's gh pr create is answe
   execFileSync("git", ["-C", clone, "remote", "remove", "upstream"]);
   assert.equal(run(input).stdout, "");
 });
+
+test("with the plugin set to another GitHub host, a github.com pull request is neither handed over nor put to Claude: it would be asked of the wrong server", () => {
+  const root = scratch();
+  const env = { RUNNERS_IO_GITHUB_API: "https://ghe.corp.example/api/v3" };
+  assert.equal(handle(bash("gh pr create --fill", "https://github.com/acme/widgets/pull/7\n"), opts(root, { env })), null);
+  assert.equal(handle(bash("./tools/open-pr.sh", "opened https://github.com/acme/widgets/pull/42\n"), opts(root, { env })), null);
+  assert.deepEqual(readdirSync(root), [], "nothing was written for the channel");
+  // The control: with github.com's own API named, the same output is handed over.
+  assert.match(handle(bash("gh pr create --fill", "https://github.com/acme/widgets/pull/7\n"), opts(root, { env: { RUNNERS_IO_GITHUB_API: "https://api.github.com" } })), /now watching acme\/widgets PR #7/);
+});

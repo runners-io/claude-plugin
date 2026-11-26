@@ -22,8 +22,9 @@
  * a minute, so it pays the handshake and never meets a dead tunnel.
  *
  * No dependency does this: the plugin installs nothing, and its bundle holds only its own code. What that leaves out:
- * a SOCKS proxy, a proxy found by a PAC file, and a proxy that wants NTLM or Kerberos. For those the request goes as
- * it did before (directly), and the setup checks say that the proxy is one the channel cannot use.
+ * a SOCKS proxy, a proxy found by a PAC file, and a proxy that wants NTLM or Kerberos. A variable that names one of the
+ * first two is a proxy the channel cannot use, and then NO REQUEST IS MADE: going straight to GitHub would walk around
+ * the proxy the user was told to use. The setup checks say so, and what to set (hooks/proxy.mjs sendRefusal).
  */
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -32,7 +33,7 @@ import type { Duplex } from "node:stream";
 import { connect as tlsConnect } from "node:tls";
 
 import { machineError } from "./errors.ts";
-import { type Proxy, nodeProxiesItself, proxyFor, proxyVariable } from "../../hooks/proxy.mjs";
+import { type Proxy, nodeProxiesItself, proxyFor, proxyVariable, sendRefusal } from "../../hooks/proxy.mjs";
 
 type Env = Record<string, string | undefined>;
 type Fetch = typeof fetch;
@@ -48,14 +49,31 @@ const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 
 /**
  * The `fetch` the GitHub client uses: `direct` itself (Node's `fetch`) when no proxy variable is set, otherwise one
- * that sends each request through the proxy, or directly when the no_proxy list names its host or the proxy is of a
- * kind the channel cannot use. Also `direct` itself when Node.js was told to read the proxy variables and can
- * (NODE_USE_ENV_PROXY=1 on a Node.js that knows it): its `fetch` then goes through the proxy by itself.
+ * that sends each request through the proxy, or directly when the no_proxy list names its host. When the variable
+ * names a proxy the channel cannot use, the request is refused (a MachineError with the sentence to show) and nothing
+ * is sent: never around the proxy. Also `direct` itself when Node.js was told to read the proxy variables and can
+ * (NODE_USE_ENV_PROXY=1 on a Node.js that knows it) and the variable names a proxy: its `fetch` then goes through the
+ * proxy by itself.
  */
 export function githubFetch(env: Env, direct: Fetch = fetch, nodeVersion: string = process.versions.node): Fetch {
-  if (!proxyVariable(env) || nodeProxiesItself(env, nodeVersion)) return direct;
+  if (!proxyVariable(env)) return direct;
+  const refuse = (target: string): void => {
+    // Whether the request carries the login is the client's to know (github.ts); here only the proxy rule is held.
+    const refusal = sendRefusal(env, target, { login: false });
+    if (refusal) throw machineError(refusal.reason);
+  };
+  const targetOf = (input: Parameters<Fetch>[0]): string => (typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+  if (nodeProxiesItself(env, nodeVersion)) {
+    // Node.js does the proxying, but only knows the kinds the channel knows: the same refusal, before it is asked.
+    if (proxyFor(env).kind !== "unusable") return direct;
+    return async (input, init) => {
+      refuse(targetOf(input));
+      return direct(input, init);
+    };
+  }
   return async (input, init) => {
-    const target = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const target = targetOf(input);
+    refuse(target);
     const route = proxyFor(env, target);
     if (route.kind !== "proxy") return direct(input, init);
     return throughProxy(route.proxy, new URL(target), init ?? {});
@@ -72,7 +90,7 @@ export function proxyNote(env: Env, target: string, nodeVersion: string = proces
     return `GitHub is reached through the proxy ${route.proxy.display} (${route.variable}), by Node.js itself (NODE_USE_ENV_PROXY=1)`;
   }
   if (route.kind === "proxy") return `GitHub is reached through the proxy ${route.proxy.display} (${route.variable})`;
-  if (route.kind === "unusable") return `${route.variable} names a proxy the channel cannot use (only http:// and https:// proxies): GitHub is asked directly`;
+  if (route.kind === "unusable") return `${route.variable} names a proxy the channel cannot use (only http:// and https:// proxies): no request is made`;
   return route.why === "no_proxy" ? `GitHub is asked directly: ${route.variable} names its host` : null;
 }
 

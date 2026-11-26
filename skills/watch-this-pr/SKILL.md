@@ -15,7 +15,7 @@ description: Watch a pull request's CI and merge conflicts through the runners-i
    The answer is the PR's state now. Tell the user in one line what you are watching and where it stands.
 2. **Know what is coming.** Each change arrives as a `<channel source="runners-io" kind="...">` event. If none arrive and the user expected some, the session was probably started without the channel: tell the user to relaunch with `claude-gh --resume <this session's id>` (the launch notice gives the id; `claude-gh --continue` only when it is not known, since with several sessions open it can reopen another one). Call `ci_status` to read the state meanwhile.
 3. **Report each event briefly:**
-   - `ci.workflow_failed`, `ci.job_failed` (one job failed while the rest of the run goes on): which workflow and which jobs failed, with the link. Offer to fix it with the fix-failing-ci skill. Start fixing at once only if the user asked you to keep the pull request green.
+   - `ci.workflow_failed`, `ci.job_failed` (one job failed while the rest of the run goes on): which workflow and which jobs failed, with the link. Offer to fix it with the fix-failing-ci skill. Start only if the user says yes, or asked earlier in this session to fix CI or to keep the pull request green.
    - `ci.approval_waiting`: a deployment is held for review. A person approves it on GitHub; never try to approve it yourself.
    - `pr.conflict`: the PR conflicts with its base branch. Offer to rebase or merge the base branch in.
    - `ci.workflow_started`, `ci.workflow_succeeded`, `ci.workflow_cancelled`, `pr.conflict_resolved`: one line each, or none if the user only wants failures.

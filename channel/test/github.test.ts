@@ -425,3 +425,40 @@ test("reviewRequests asks GraphQL's search for this login's open review requests
   assert.match(asked[0].variables.q, /review-requested:@me/);
   assert.equal(client.graphqlRemaining, 4000);
 });
+
+test("with certificate checks switched off (NODE_TLS_REJECT_UNAUTHORIZED=0) no request carries the login: none is made, and the login is not read", async () => {
+  const sent: string[] = [];
+  const spy: typeof fetch = async (input) => {
+    sent.push(String(input));
+    return new Response("{}", { status: 200 });
+  };
+  let logins = 0;
+  const auth = async (): Promise<GhAuth> => {
+    logins++;
+    return { kind: "ok", token: "gho_fakeToken123", source: "gh" };
+  };
+  const reason =
+    "NODE_TLS_REJECT_UNAUTHORIZED=0 turns certificate checks off, so the GitHub login is not sent and no request is made: unset it (NODE_EXTRA_CA_CERTS adds a company's root certificate)";
+  for (const base of ["https://api.github.com", "https://ghe.corp.example/api/v3"]) {
+    const client = new GitHubClient(base, auth, spy, { env: { NODE_TLS_REJECT_UNAUTHORIZED: "0" } });
+    assert.deepEqual(await client.getPull("acme/widgets", 7), { kind: "retry", reason, afterMs: 5 * 60_000 }, base);
+    assert.deepEqual(await client.viewerLogin(), { kind: "retry", reason, afterMs: 5 * 60_000 });
+    assert.deepEqual(await client.reviewState("acme/widgets", 7), { kind: "retry", reason, afterMs: 5 * 60_000 });
+    assert.deepEqual(await client.reviewRequests(), { kind: "retry", reason, afterMs: 5 * 60_000 });
+  }
+  assert.deepEqual(sent, []);
+  assert.equal(logins, 0);
+  // The control: the same client with the checks on asks GitHub.
+  const on = new GitHubClient("https://api.github.com", auth, spy, { env: {} });
+  await on.viewerLogin();
+  assert.equal(sent.length, 1);
+});
+
+test("the tests' fake GitHub is still asked with certificate checks off: plain http on this machine has no certificate, and no real login", async () => {
+  const gh = await fake();
+  gh.setPull("acme/widgets", 7, { head: { ref: "feat", sha: "c".repeat(40) } });
+  const env = { NODE_TLS_REJECT_UNAUTHORIZED: "0", RUNNERS_IO_TEST_FAKE_GITHUB: "1" };
+  assert.equal((await new GitHubClient(gh.base, ok(), fetch, { env }).getPull("acme/widgets", 7)).kind, "ok");
+  // Without the tests' switch the same address is refused: the exception is the switch, not the address.
+  assert.equal((await new GitHubClient(gh.base, ok(), fetch, { env: { NODE_TLS_REJECT_UNAUTHORIZED: "0" } }).getPull("acme/widgets", 7)).kind, "retry");
+});

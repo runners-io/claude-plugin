@@ -30,7 +30,8 @@
 // started together cannot both send. Where the plugin's state folder cannot be written nothing is sent at all, rather
 // than something at every launch.
 //
-// TO TURN IT OFF: RUNNERS_IO_TELEMETRY=off or DO_NOT_TRACK=1 in the environment Claude Code runs in. Claude Code's own
+// TO TURN IT OFF: the plugin's own `telemetry` setting (plugin.json userConfig: on, the default, or off), or
+// RUNNERS_IO_TELEMETRY=off or DO_NOT_TRACK=1 in the environment Claude Code runs in. Claude Code's own
 // DISABLE_TELEMETRY and CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC are honoured too, where they reach the plugin.
 //
 // THE ADDRESS CANNOT BE REPOINTED. It is the constant below. The plugin's own tests name a listener of their own with
@@ -46,7 +47,7 @@ import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, r
 import { basename, dirname, isAbsolute, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { nodeProxiesItself, proxyFor } from "./proxy.mjs";
+import { nodeProxiesItself, proxyFor, sendRefusal } from "./proxy.mjs";
 import { stateRoot } from "./readiness.mjs";
 
 /** The one address a message is sent to. */
@@ -92,6 +93,14 @@ const truthy = (value) => {
 };
 
 /**
+ * The plugin's own `telemetry` setting as it reaches a process. Claude Code hands a hook every saved plugin setting as
+ * CLAUDE_PLUGIN_OPTION_<NAME>, and the manifest passes the same value to the channel under the same name. A setting
+ * nobody saved reaches a hook as no variable at all, and the manifest's reference can arrive unreplaced: both are the
+ * default, on. Only the word `off` turns it off.
+ */
+export const SETTING_ENV = "CLAUDE_PLUGIN_OPTION_TELEMETRY";
+
+/**
  * Whether the plugin may send, and when not, which setting says so: { on: true } or { on: false, why }. `why` names a
  * variable and never a value that could be private.
  */
@@ -101,6 +110,7 @@ export function telemetrySwitch(env = process.env) {
   if (truthy(env.DO_NOT_TRACK)) return { on: false, why: "DO_NOT_TRACK is set" };
   if (truthy(env.DISABLE_TELEMETRY)) return { on: false, why: "DISABLE_TELEMETRY is set" };
   if (truthy(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC)) return { on: false, why: "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set" };
+  if (String(env[SETTING_ENV] ?? "").trim().toLowerCase() === "off") return { on: false, why: `the plugin's telemetry setting is off (${SETTING_ENV}=off)` };
   const test = env[TEST_URL_ENV];
   if (test !== undefined && test !== "") {
     return testEndpoint(test) ? { on: true } : { on: false, why: `${TEST_URL_ENV} is not a listener on 127.0.0.1` };
@@ -138,8 +148,13 @@ export function needsTunnel(env = process.env) {
 /** One line for `status` and the doctor skill: on, or off and which setting turned it off. Never the install id. */
 export function telemetryLine(env = process.env) {
   const s = telemetrySwitch(env);
+  // On, but a proxy is named that the plugin cannot use: nothing is sent round it (proxy.mjs sendRefusal). The
+  // variable is named, never its value.
+  const endpoint = s.on ? telemetryEndpoint(env) : null;
+  const refused = endpoint ? sendRefusal(env, endpoint, { login: false }) : null;
+  if (refused) return `telemetry: on, but nothing is sent while ${refused.variable} names a proxy the plugin cannot use`;
   return s.on
-    ? "telemetry: on (an install ping and reports of the plugin's own faults; RUNNERS_IO_TELEMETRY=off turns it off)"
+    ? "telemetry: on (an install ping and reports of the plugin's own faults; the plugin's telemetry setting, or RUNNERS_IO_TELEMETRY=off, turns it off)"
     : `telemetry: off (${s.why}): nothing is sent to runners.io`;
 }
 
@@ -537,6 +552,9 @@ export function createTelemetry({
     const endpoint = telemetryEndpoint(env);
     if (!endpoint) return "off";
     if (!VERSION.test(String(version)) || typeof send !== "function") return "off";
+    // A proxy is named that the plugin cannot use (proxy.mjs sendRefusal): a message sent straight out would go around
+    // it, so none is sent, and nothing is claimed, so the ping still goes once the proxy is one that can be used.
+    if (sendRefusal(env, endpoint, { login: false })) return "blocked";
     const dir = claimFolder(env);
     if (!dir) return "no_state";
     const until = Number(readOwn(dir, `gone-${version}`));

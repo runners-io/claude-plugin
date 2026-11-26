@@ -2,6 +2,8 @@ type Env = Record<string, string | undefined>;
 
 export const TELEMETRY_URL: string;
 export const TEST_URL_ENV: string;
+/** The variable the plugin's own `telemetry` setting reaches a hook and the channel in. */
+export const SETTING_ENV: string;
 export const SEND_TIMEOUT_MS: number;
 export const MAX_BODY_BYTES: number;
 export const MAX_FRAMES: number;
@@ -13,7 +15,7 @@ export const PLUGIN_ROOT: string | null;
 export type TelemetrySwitch = { readonly on: true } | { readonly on: false; readonly why: string };
 
 /** What a send came to: "sent", or the word for why nothing was sent or counted. */
-export type Outcome = "sent" | "off" | "no_state" | "gone" | "already" | "denied" | "duplicate" | "capped" | "limited" | "failed";
+export type Outcome = "sent" | "off" | "blocked" | "no_state" | "gone" | "already" | "denied" | "duplicate" | "capped" | "limited" | "failed";
 
 export interface InstallPing {
   kind: "install" | "update";

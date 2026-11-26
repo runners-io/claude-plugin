@@ -107,3 +107,14 @@ test("status with a refused login: NOT READY from the live call, and the sign-in
   assert.equal(r.code, 0, r.stderr);
   assert.match(r.stdout, /NOT READY {2}GitHub accepts the login \[blocks; token_rejected\]/);
 });
+
+// A command Claude runs for a skill gets none of the plugin's settings in its environment, so the doctor skill hands
+// status the telemetry setting itself. Claude Code replaces the reference in the skill's text with a saved setting, and
+// leaves it as it is when nobody saved one. In single quotes, so that a shell never reads an unreplaced ${...}.
+test("the doctor skill passes the plugin's telemetry setting to status, quoted so an unreplaced reference is harmless", async () => {
+  const { readFileSync } = await import("node:fs");
+  const skill = readFileSync(new URL("../../skills/doctor/SKILL.md", import.meta.url), "utf8");
+  const line = skill.split("\n").find((l) => /runners-io-channel\.mjs" status/.test(l)) ?? "";
+  assert.ok(line.endsWith(` status --telemetry-setting '\${user_config.telemetry}'`), `the status command is: ${line}`);
+  assert.match(skill.replace(/\s+/g, " "), /the plugin's telemetry setting/);
+});

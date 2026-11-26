@@ -9,7 +9,7 @@
     {
       "name": "runners-io",
       "source": "./",
-      "description": "CI results and merge conflicts for your pull requests pushed into your Claude Code session, read from GitHub with your own login; plus the runners.io MCP server."
+      "description": "GitHub Actions results and merge conflicts for your pull requests pushed into your Claude Code session, read from GitHub with your own login. No runners.io account needed."
     }
   ]
 }

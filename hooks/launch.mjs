@@ -11,6 +11,8 @@
 // Shared by hooks/session-start.mjs and the channel (bundled). Dependency-free plain JavaScript.
 import { execFileSync } from "node:child_process";
 
+import { findProgram } from "./programs.mjs";
+
 const CHANNEL_FLAGS = new Set(["--channels", "--dangerously-load-development-channels"]);
 const OURS = /^(plugin:runners-io@[A-Za-z0-9._-]+|server:runners-io)$/;
 const HEADLESS = new Set(["-p", "--print"]);
@@ -109,14 +111,22 @@ function isShell(args) {
   return SHELLS.has(first.replace(/^-/, "").split("/").at(-1));
 }
 
-function psRow(pid) {
-  const out = execFileSync("ps", ["-o", "ppid=,args=", "-p", String(pid)], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
+/**
+ * One process's parent and command line, from ps, or null when ps says nothing of it. ps is started by its absolute
+ * path from PATH (programs.mjs), never by a bare name: the working folder is the session's repository, and a file
+ * named ps in it must not run. Throws when there is no ps on PATH. On Windows there is none to look for: null.
+ */
+export function psRow(pid, { platform = process.platform, env = process.env } = {}) {
+  if (platform === "win32") return null;
+  const ps = findProgram("ps", env, platform);
+  if (!ps) throw new Error("ps is not on PATH");
+  const out = execFileSync(ps, ["-o", "ppid=,args=", "-p", String(pid)], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
   const m = /^\s*(\d+)\s+(.*)$/.exec(out.trim());
   return m ? { ppid: Number(m[1]), args: m[2] } : null;
 }
 
 /** Walks up from `pid` (the caller's parent), through shells only, to the claude process. */
-export function findLaunch(pid = process.ppid, ps = psRow) {
+export function findLaunch(pid = process.ppid, ps = (p) => psRow(p)) {
   try {
     let current = pid;
     for (let hops = 0; hops < 8 && current > 1; hops++) {

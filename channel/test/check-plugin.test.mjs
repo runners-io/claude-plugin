@@ -253,6 +253,57 @@ test("the check refuses a hook that does not run through the Node.js wrapper, a 
   });
 });
 
+// The plugin works with no runners.io account, so what it installs connects to nothing of runners.io's: the one server
+// in the manifest is the channel, which is a local process. The runners.io MCP server is added by the sign-in skill,
+// with the user's yes. And the telemetry setting must reach both the hooks and the channel, or it turns off half.
+test("the check refuses a manifest that installs a remote server, loses the telemetry setting, or leaves the hook's matcher open", () => {
+  withTemp((root) => {
+    const plugin = join(root, "plugin");
+    cpSync(PLUGIN, plugin, { recursive: true, filter: (src) => basename(src) !== "node_modules" });
+    const run = () => spawnSync(process.execPath, [CHECK, plugin], { encoding: "utf8" });
+    assert.equal(run().status, 0, "the copy passes as it is");
+    const manifest = readJson(plugin, ".claude-plugin/plugin.json");
+    assert.deepEqual(Object.keys(manifest.mcpServers), ["runners-io"], "this tree's manifest installs the channel and nothing else");
+
+    const remote = structuredClone(manifest);
+    remote.mcpServers["runners-io-mcp"] = { type: "http", url: "https://mcp.runners.io/mcp" };
+    writeJson(plugin, ".claude-plugin/plugin.json", remote);
+    let r = run();
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /installs a server other than the channel: runners-io-mcp/);
+
+    const noSetting = structuredClone(manifest);
+    delete noSetting.userConfig;
+    writeJson(plugin, ".claude-plugin/plugin.json", noSetting);
+    r = run();
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /no telemetry setting that is on\|off with default on/);
+
+    const notPassed = structuredClone(manifest);
+    delete notPassed.mcpServers["runners-io"].env.CLAUDE_PLUGIN_OPTION_TELEMETRY;
+    writeJson(plugin, ".claude-plugin/plugin.json", notPassed);
+    r = run();
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /does not pass the telemetry setting to the channel/);
+
+    writeJson(plugin, ".claude-plugin/plugin.json", manifest);
+    const hooks = readJson(plugin, "hooks/hooks.json");
+    hooks.hooks.PostToolUse[0].matcher = "Bash|mcp__.*create_pull_request";
+    writeJson(plugin, "hooks/hooks.json", hooks);
+    r = run();
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /the PR hook's matcher is not anchored/);
+  });
+});
+
+// The matcher is a regular expression tested anywhere in a tool's name, so an open one also fires for any tool whose
+// name merely contains "Bash" or ends with more after create_pull_request.
+test("the PR hook's matcher takes Bash and a create_pull_request tool of any server, whole names only", () => {
+  const matcher = new RegExp(readJson(PLUGIN, "hooks/hooks.json").hooks.PostToolUse[0].matcher);
+  for (const tool of ["Bash", "mcp__github__create_pull_request", "mcp__plugin_github_github__create_pull_request"]) assert.equal(matcher.test(tool), true, tool);
+  for (const tool of ["BashOutput", "NotBash", "mcp__x__create_pull_request_review", "mcp____create_pull_request", "xmcp__a__create_pull_request", "Edit"]) assert.equal(matcher.test(tool), false, tool);
+});
+
 // The bundle may name one runners.io address, the telemetry endpoint, and holds no Sentry key: a public key is one
 // anybody can post events against. Each way of turning telemetry off must be in the bundle that ships.
 test("the check refuses a bundle that names another runners.io API, repoints the telemetry endpoint, mentions Sentry, or drops an opt-out", () => {
@@ -268,9 +319,9 @@ test("the check refuses a bundle that names another runners.io API, repoints the
     assert.equal(withBundle(bundle).status, 0, "the copy passes as it is");
     assert.ok(bundle.includes('"https://www.runners.io/api/plugin/telemetry"'), "the bundle holds the endpoint");
 
-    let r = withBundle(`${bundle}\nfetch("https://www.runners.io/api/billing/usage");\n`);
+    let r = withBundle(`${bundle}\nfetch("https://www.runners.io/api/another/path");\n`);
     assert.equal(r.status, 1);
-    assert.match(r.stderr, /names a runners\.io API other than its telemetry endpoint: https:\/\/www\.runners\.io\/api\/billing\/usage/);
+    assert.match(r.stderr, /names a runners\.io API other than its telemetry endpoint: https:\/\/www\.runners\.io\/api\/another\/path/);
 
     r = withBundle(bundle.replace('"https://www.runners.io/api/plugin/telemetry"', '"https://evil.runners.io/api/plugin/telemetry"'));
     assert.equal(r.status, 1);

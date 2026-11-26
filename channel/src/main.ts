@@ -6,6 +6,7 @@
  *                                 setup check as ready or NOT READY, with one live GitHub call (the doctor skill)
  *   runners-io-channel version
  *   runners-io-channel telemetry-test   sends one report of a fault made on purpose, and says whether it was sent
+ *   (status and telemetry-test take --telemetry-setting <on|off>: the plugin's own setting, as the doctor skill passes it)
  *
  * It reads GitHub directly with the user's own `gh` login, so it needs no runners.io account. Two things are sent to
  * runners.io and nothing else: a ping when the plugin is installed or updated, and a report when the plugin's own code
@@ -14,7 +15,7 @@
  */
 import { removeRequests, resetRequests, takeRequests } from "./hookrequests.ts";
 import { SharedStore, defaultSharedRoot } from "./shared.ts";
-import { fakeGitHubAllowed, loadConfig } from "./config.ts";
+import { apiHost, fakeGitHubAllowed, loadConfig } from "./config.ts";
 import { channelRow, liveRow } from "./doctor.ts";
 import { setTelemetry } from "./faults.ts";
 import { FirstCallRecorder } from "./firstcall.ts";
@@ -32,9 +33,9 @@ import { TOOL_NAMES, makeTools } from "./tools.ts";
 import { NO_EVENT_LOG, openEventLog } from "./eventlog.ts";
 import { findLaunch, pollsIn } from "../../hooks/launch.mjs";
 import { firstCallRows, launchChecks, liveEventsBlocker, mergeRows, readFirstCall, renderTable } from "../../hooks/readiness.mjs";
-import { createTelemetry, needsTunnel, telemetryLine } from "../../hooks/telemetry.mjs";
+import { SETTING_ENV, createTelemetry, needsTunnel, telemetryLine } from "../../hooks/telemetry.mjs";
 
-export const VERSION = "0.4.1";
+export const VERSION = "0.4.2";
 
 /**
  * What the channel sends to runners.io (hooks/telemetry.mjs): reports of its own faults, and the install ping where
@@ -156,7 +157,7 @@ function serve(): void {
     },
   });
   log(
-    `started ${VERSION}; GitHub API ${config.githubApi}; automatic subscription: ${config.autoSubscribe}; ` +
+    `started ${VERSION}; GitHub API host ${apiHost(config.githubApi)}; automatic subscription: ${config.autoSubscribe}; ` +
       `event log: ${config.eventLogDir ?? "off"}`,
   );
   const proxy = proxyNote(process.env, config.githubApi);
@@ -201,7 +202,22 @@ async function status(): Promise<void> {
   );
 }
 
-async function main(argv: string[]): Promise<void> {
+/**
+ * `--telemetry-setting <on|off>`, taken out of a command's arguments: the plugin's own telemetry setting, as the doctor
+ * skill passes it. A command Claude runs for a skill gets none of the plugin's settings in its environment, so without
+ * this `status` would say telemetry is on in a session whose hooks and channel have it off. The skill's reference
+ * arrives unreplaced when nobody saved the setting: that, and any other word, changes nothing.
+ */
+export function takeTelemetrySetting(argv: string[], env: Record<string, string | undefined> = process.env): string[] {
+  const at = argv.indexOf("--telemetry-setting");
+  if (at < 0) return argv;
+  const value = (argv[at + 1] ?? "").trim().toLowerCase();
+  if (value === "on" || value === "off") env[SETTING_ENV] = value;
+  return [...argv.slice(0, at), ...argv.slice(at + 2)];
+}
+
+async function main(args: string[]): Promise<void> {
+  const argv = takeTelemetrySetting(args);
   const command = argv[0] ?? "serve";
   switch (command) {
     case "serve":

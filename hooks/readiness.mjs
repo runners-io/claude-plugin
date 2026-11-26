@@ -19,12 +19,13 @@
 // Dependency-free plain JavaScript, Node 20.
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { accessSync, constants, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { nodeProxiesItself, proxyFor } from "./proxy.mjs";
+import { findProgram } from "./programs.mjs";
+import { nodeProxiesItself, proxyFor, readsGitHubCom, sendRefusal } from "./proxy.mjs";
 
 /** `1` turns the offers off: nothing is offered, and only a blocker's one-line notice is still shown. */
 export const OPT_OUT = "RUNNERS_IO_NO_SETUP_CHECKS";
@@ -90,23 +91,8 @@ export function tokenVariable(env = process.env, host = loginHost(env)) {
   return names.find((n) => (env[n] ?? "").trim()) ?? null;
 }
 
-/** A program's absolute path from PATH, or null. Nothing is run. */
-export function which(command, env = process.env, platform = process.platform) {
-  const win = platform === "win32";
-  const exts = win ? (env.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean) : [""];
-  for (const dir of (env.PATH ?? env.Path ?? "").split(win ? ";" : ":")) {
-    if (!dir || !isAbsolute(dir)) continue;
-    for (const ext of exts) {
-      const file = join(dir, command + ext);
-      try {
-        if (!statSync(file).isFile()) continue;
-        accessSync(file, win ? constants.F_OK : constants.X_OK);
-        return file;
-      } catch {}
-    }
-  }
-  return null;
-}
+/** A program's absolute path from PATH's absolute folders, or null (programs.mjs). Nothing is run. */
+export const which = findProgram;
 
 /** One command, no shell, a fixed argv and a short limit. `said`: whether it printed anything; the text is not kept. */
 function run(file, args, { env, timeoutMs = 2500, keep = true } = {}) {
@@ -140,10 +126,15 @@ export function remoteHost(url) {
 
 const NOT_GITHUB = /gitlab|bitbucket|gitea|codeberg|azure|visualstudio\.com|sourceforge|(^|\.)sr\.ht$/;
 
-/** Whether a host that is not github.com is a GitHub Enterprise one: gh or the plugin is set up for it, or it says so. */
+/**
+ * Whether a host that is not github.com is a GitHub Enterprise one the USER has set up: gh is signed in to it, GH_HOST
+ * names it, or the plugin is already set to read it. Never because the host's own name says so. The remote is text
+ * the repository chose, and this answer decides whether Claude offers to point the plugin's API setting, and a
+ * `gh auth login`, at that host: a clone of a stranger's repository must not be able to ask for that.
+ */
 function looksEnterprise(host, env, ghHosts) {
   if (NOT_GITHUB.test(host)) return false;
-  return ghHosts.includes(host) || (env.GH_HOST ?? "").trim().toLowerCase() === host || loginHost(env).toLowerCase() === host || /(^|[.-])(github|ghe)([.-]|$)/.test(host);
+  return ghHosts.includes(host) || (env.GH_HOST ?? "").trim().toLowerCase() === host || loginHost(env).toLowerCase() === host;
 }
 
 // ---- gh's own list of accounts ------------------------------------------------------------------------------------
@@ -632,7 +623,9 @@ export async function launchChecks({ env = process.env, projectDir = env.CLAUDE_
     }
   } else {
     rows.push(ready("git_missing", gitLabel));
-    const repo = origin?.ok ? githubRepo(origin.stdout) : null;
+    const onGitHubCom = origin?.ok ? githubRepo(origin.stdout) : null;
+    // A github.com repository is looked up only while the plugin reads github.com (proxy.mjs readsGitHubCom).
+    const repo = readsGitHubCom(env) ? onGitHubCom : null;
     if (!top?.ok) {
       rows.push(
         top?.timedOut
@@ -650,7 +643,20 @@ export async function launchChecks({ env = process.env, projectDir = env.CLAUDE_
       rows.push(ready("not_a_repo", repoLabel));
       const originHost = origin?.ok ? remoteHost(origin.stdout) : null;
       if (repo) rows.push(ready("no_github_remote", remoteLabel));
-      else if (originHost && looksEnterprise(originHost, env, Object.keys(gho.hosts))) {
+      else if (onGitHubCom) {
+        rows.push(
+          found(
+            "host_mismatch",
+            "the repository's origin is on the GitHub host the plugin reads",
+            "degrades",
+            `this repository is on github.com, but the plugin is set to read ${sayable(host)} (RUNNERS_IO_GITHUB_API), so its pull requests are not looked up: a repository is only ever asked of its own host.`,
+            "Nothing to install. To watch this repository, the user starts Claude Code without `RUNNERS_IO_GITHUB_API` in its environment, so that the plugin reads github.com. " +
+              `While the variable is set, the plugin reads ${sayable(host)} and nothing else: a repository and pull request there are named to the runners-io subscribe and ci_status tools. ` +
+              "Never suggest pointing the variable at another address.",
+            { once: true },
+          ),
+        );
+      } else if (originHost && looksEnterprise(originHost, env, Object.keys(gho.hosts))) {
         rows.push(
           found(
             "enterprise_host",
@@ -676,7 +682,8 @@ export async function launchChecks({ env = process.env, projectDir = env.CLAUDE_
         );
       }
       if (!repo) {
-        rows.push(skipped("no_workflows", workflowsLabel, "no github.com origin"), skipped("fork", forkLabel, "no github.com origin"));
+        const why = onGitHubCom ? "the plugin is set to read another GitHub host" : "no github.com origin";
+        rows.push(skipped("no_workflows", workflowsLabel, why), skipped("fork", forkLabel, why));
       } else {
         let workflows = 0;
         try {
@@ -707,18 +714,19 @@ export async function launchChecks({ env = process.env, projectDir = env.CLAUDE_
 
   // 6. a proxy between this machine and GitHub: the channel goes through it, as gh does (proxy.mjs)
   const proxyLabel = "GitHub is reached directly, or through a proxy the channel can use";
-  const route = proxyFor(env, env.RUNNERS_IO_GITHUB_API || "https://api.github.com");
+  const api = env.RUNNERS_IO_GITHUB_API || "https://api.github.com";
+  const route = proxyFor(env, api);
   if (route.kind === "unusable") {
+    // Fail closed: with a proxy named that cannot be used, a request sent straight to GitHub would go around it.
     rows.push(
       found(
         "proxy",
         proxyLabel,
-        "degrades",
-        `${route.variable} names a proxy the plugin's channel can't use (it uses http:// and https:// proxies only), so it asks GitHub directly; behind that proxy CI may not arrive.`,
-        "Nothing to install. The channel sends its GitHub requests through the http:// or https:// proxy named in `HTTPS_PROXY` (or `https_proxy`) and asks the hosts in `NO_PROXY` directly, " +
-          "as gh does; it cannot use a SOCKS proxy or a proxy configuration (PAC) file. If CI results do not arrive or ci_status cannot reach GitHub, that is why: the user sets the variable to " +
-          "their proxy's http:// address in the environment Claude Code starts from, then restarts Claude Code. Never print the variable's value: it can hold a password.",
-        { once: true },
+        "blocks",
+        `${route.variable} names a proxy the plugin can't use (it uses http:// and https:// proxies only), so it makes no request and CI can't be read.`,
+        "Nothing to install. The plugin sends its requests through the http:// or https:// proxy named in `HTTPS_PROXY` (or `https_proxy`), as gh does; it cannot use a SOCKS proxy or a " +
+          "proxy configuration (PAC) file, and it never goes around a proxy it was told to use. The user sets the variable to their proxy's http:// or https:// address, or names GitHub's host in " +
+          "`NO_PROXY` to reach it directly, in the environment Claude Code starts from, then restarts Claude Code. Never print the variable's value: it can hold a password.",
       ),
     );
   } else if (route.kind === "proxy") {
@@ -728,6 +736,22 @@ export async function launchChecks({ env = process.env, projectDir = env.CLAUDE_
   } else if (route.why === "no_proxy") {
     rows.push({ ...ready("proxy", proxyLabel), why: `directly: ${route.variable} names GitHub's host` });
   } else rows.push(ready("proxy", proxyLabel));
+
+  // 6b. certificate checks: with them off, whoever answers as GitHub would be handed the login, so it is not sent
+  const tlsLabel = "certificate checks are on";
+  if (sendRefusal(env, api)?.why === "tls_checks_off") {
+    rows.push(
+      found(
+        "tls_checks_off",
+        tlsLabel,
+        "blocks",
+        "NODE_TLS_REJECT_UNAUTHORIZED=0 turns certificate checks off, so the plugin doesn't send your GitHub login and CI can't be read.",
+        "Nothing to install. With certificate checks off, anything on the network could answer as GitHub and be handed the login, so the plugin makes no GitHub request. " +
+          "The user unsets `NODE_TLS_REJECT_UNAUTHORIZED` in the environment Claude Code starts from, then restarts Claude Code. If it was set because a company network inspects HTTPS, " +
+          "the fix that keeps the checks on is `NODE_EXTRA_CA_CERTS` set to the company's root certificate file (PEM; their IT team has it). Never suggest leaving certificate checks off.",
+      ),
+    );
+  } else rows.push(ready("tls_checks_off", tlsLabel));
 
   // 7. the plugin's own folders
   const dataLabel = "the plugin's data folders can be written";

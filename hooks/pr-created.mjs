@@ -26,6 +26,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { findLaunch } from "./launch.mjs";
+import { findProgram } from "./programs.mjs";
+import { readsGitHubCom } from "./proxy.mjs";
 
 const PR_URL_ALL = /https:\/\/github\.com\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100}?)\/pull\/(\d{1,9})(?![\d])/g;
 /** At most this many PRs are handed over from one tool call's output (a long log can name dozens). */
@@ -191,11 +193,16 @@ export function repoOfRemote(url) {
   return m && m[2] !== "." && m[2] !== ".." ? `${m[1]}/${m[2]}` : null;
 }
 
-/** The GitHub repository a remote of the session's folder names, or null. */
-function repoOfFolder(cwd, remote = "origin") {
+/**
+ * The GitHub repository a remote of the session's folder names, or null. git is started by its absolute path from
+ * PATH (programs.mjs): the folder is a repository, and a file named git in it must never be the one that runs.
+ */
+export function repoOfFolder(cwd, remote = "origin", env = process.env) {
   if (typeof cwd !== "string" || !cwd) return null;
+  const git = findProgram("git", env);
+  if (!git) return null;
   try {
-    return repoOfRemote(execFileSync("git", ["-C", cwd, "remote", "get-url", remote], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }));
+    return repoOfRemote(execFileSync(git, ["-C", cwd, "remote", "get-url", remote], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }));
   } catch {
     return null;
   }
@@ -218,6 +225,9 @@ function parentOfFolder(cwd) {
 export function handle(input, { launch, root, now, env = process.env, repoOf = repoOfFolder, parentOf = parentOfFolder }) {
   const prs = prsIn(input);
   if (!prs.length) return null;
+  // The addresses read here are github.com's. With the plugin set to another GitHub host (RUNNERS_IO_GITHUB_API), the
+  // channel would ask that server about them, where the same name is another repository: nothing is handed over or said.
+  if (!readsGitHubCom(env)) return null;
   const origin = repoOf(input?.cwd);
   // The session's own repositories: the folder's, and for a fork the one its pull requests are opened on.
   const own = origin ? [origin, parentOf(input?.cwd)].filter(Boolean) : [];

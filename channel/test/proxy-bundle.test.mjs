@@ -129,6 +129,46 @@ test("status with no proxy variable: nothing goes near a proxy, and the check is
   assert.match(line(r.stdout, "through a proxy the channel can use"), /^ {2}ready {6}GitHub is reached directly, or through a proxy the channel can use$/);
 });
 
+test("status with a proxy the plugin cannot use: GitHub is not asked at all, not around the proxy either, and the checks say what to set", async () => {
+  const w = await world();
+  const r = await status(w, { HTTPS_PROXY: `socks5://ada:${SECRET}@127.0.0.1:${w.proxy.port}` });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(w.gh.requests.length, 0, "a request went straight to GitHub, around the proxy");
+  assert.equal(w.proxy.connects.length + w.proxy.requests.length, 0);
+  assert.match(
+    line(r.stdout, "through a proxy the channel can use"),
+    /^ {2}NOT READY {2}GitHub is reached directly, or through a proxy the channel can use \[blocks; proxy\]: HTTPS_PROXY names a proxy the plugin can't use \(it uses http:\/\/ and https:\/\/ proxies only\), so it makes no request and CI can't be read\. Fix: /,
+  );
+  assert.match(
+    line(r.stdout, "GitHub answers for this repository"),
+    /^ {2}unknown .*could not ask GitHub: HTTPS_PROXY names a proxy the plugin cannot use, so no request is made: set it to an http:\/\/ or https:\/\/ proxy, or name the host in NO_PROXY\)$/,
+  );
+  assert.match(r.stdout, /pull request: could not ask GitHub \(retry\)/);
+  for (const [where, text] of [["stdout", r.stdout], ["stderr", r.stderr], ["the plugin's files", everythingWritten(w.m.root)]]) {
+    assert.equal(text.includes(SECRET) || text.includes("ada:"), false, `${where} holds the proxy's login`);
+  }
+});
+
+test("status with NODE_TLS_REJECT_UNAUTHORIZED=0: the login is not sent anywhere, and the checks say to unset it", async () => {
+  const w = await world();
+  // A host that is not this machine and does not exist: were a request made, the answer would be a failed lookup.
+  const r = await status(w, { NODE_TLS_REJECT_UNAUTHORIZED: "0", RUNNERS_IO_GITHUB_API: "https://ghe.invalid/api/v3", RUNNERS_IO_TEST_FAKE_GITHUB: "" });
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(
+    line(r.stdout, "certificate checks are on"),
+    /^ {2}NOT READY {2}certificate checks are on \[blocks; tls_checks_off\]: NODE_TLS_REJECT_UNAUTHORIZED=0 turns certificate checks off, so the plugin doesn't send your GitHub login and CI can't be read\. Fix: /,
+  );
+  assert.match(
+    line(r.stdout, "GitHub answers for this login"),
+    /^ {2}unknown .*could not ask GitHub: NODE_TLS_REJECT_UNAUTHORIZED=0 turns certificate checks off, so the GitHub login is not sent and no request is made: unset it \(NODE_EXTRA_CA_CERTS adds a company's root certificate\)\)$/,
+  );
+  assert.equal(w.gh.requests.length, 0);
+  // The control, and the tests' own exception: the fake GitHub on this machine is still asked with the variable set.
+  const fake = await status(w, { NODE_TLS_REJECT_UNAUTHORIZED: "0" });
+  assert.match(line(fake.stdout, "GitHub answers for this repository"), /^ {2}ready .*asked just now/);
+  assert.match(line(fake.stdout, "certificate checks are on"), /^ {2}ready /);
+});
+
 test("GitHub behind TLS, as the real one is: the handshake is made inside the tunnel, so the proxy carries a token it cannot read", async () => {
   const w = await world();
   const tls = certificate();

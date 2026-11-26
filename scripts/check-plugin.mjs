@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Checks the plugin's own promises, which `claude plugin validate` cannot know:
 // the names a user types (`plugin:runners-io@runners-io`), the channel bound to
-// a server that exists, the remote MCP address, a bundle that is really there,
+// a server that exists and no other server (nothing of runners.io's is installed), a bundle that is really there,
 // a bundle that never declares the permission relay and offers only the four
 // subscription tools, a channel that reads GitHub and names no runners.io API but its telemetry endpoint, and both
 // hooks pointing at scripts that exist and run through the wrapper that says so when there is no Node.js. And one version: every field that names the plugin's version names the
@@ -98,9 +98,13 @@ if (against && !against.startsWith("-")) {
   }
 }
 
+// THE PLUGIN NEEDS NO runners.io ACCOUNT, so what it installs connects to nothing of runners.io's: the one server in
+// the manifest is the channel, a local process. The runners.io MCP server is for runners.io customers, and the sign-in
+// skill adds it with the user's yes; installed for everybody, every session of every user would connect to it.
 const servers = plugin.mcpServers ?? {};
-const remote = servers["runners-io-mcp"];
-check(remote?.type === "http" && remote?.url === "https://mcp.runners.io/mcp", "the remote MCP server is not https://mcp.runners.io/mcp over http");
+const others = Object.keys(servers).filter((name) => name !== "runners-io");
+check(others.length === 0, `the manifest installs a server other than the channel: ${others.join(", ")}`);
+check(!JSON.stringify(servers).includes("mcp.runners.io"), "the manifest names mcp.runners.io: the sign-in skill adds that server, with the user's yes");
 
 const channels = plugin.channels ?? [];
 check(channels.length === 1, `expected one channel, found ${channels.length}`);
@@ -119,6 +123,14 @@ const requests = channel.userConfig?.review_requests;
 check(JSON.stringify(requests?.options) === JSON.stringify(["off", "on"]) && requests?.default === "off", "the channel's review_requests option is not off|on with default off");
 const auto = channel.userConfig?.auto_subscribe;
 check(JSON.stringify(auto?.options) === JSON.stringify(["pr", "off"]) && auto?.default === "pr", "the channel's auto_subscribe option is not pr|off with default pr");
+// The telemetry setting: one switch for the hooks and the channel. Claude Code hands a hook every saved plugin setting
+// as CLAUDE_PLUGIN_OPTION_<NAME>; the channel gets it only if the manifest passes it, under the same name.
+const telemetrySetting = plugin.userConfig?.telemetry;
+check(
+  telemetrySetting?.type === "string" && JSON.stringify(telemetrySetting?.options) === JSON.stringify(["on", "off"]) && telemetrySetting?.default === "on",
+  "the manifest has no telemetry setting that is on|off with default on (userConfig.telemetry)",
+);
+check(local?.env?.CLAUDE_PLUGIN_OPTION_TELEMETRY === "${user_config.telemetry}", "the manifest does not pass the telemetry setting to the channel as CLAUDE_PLUGIN_OPTION_TELEMETRY");
 for (const [k, v] of Object.entries(local?.env ?? {})) {
   check(!/token|secret|password/i.test(k) && !/token|secret/i.test(String(v)), `the channel's env carries something secret-shaped: ${k}`);
 }
@@ -143,7 +155,7 @@ if (existsSync(bundlePath)) {
   // A Sentry key in a public plugin is a key anybody can post events against: reports go to runners.io only.
   check(!/sentry\.io|@sentry\/|\bdsn\b/i.test(bundle), "the bundle mentions Sentry or a DSN: fault reports go to runners.io's endpoint only");
   // Each way of turning telemetry off must be in the bundle that is shipped.
-  for (const name of ["RUNNERS_IO_TELEMETRY", "DO_NOT_TRACK", "DISABLE_TELEMETRY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"]) check(bundle.includes(name), `the bundle does not read ${name}, which turns telemetry off`);
+  for (const name of ["RUNNERS_IO_TELEMETRY", "DO_NOT_TRACK", "DISABLE_TELEMETRY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDE_PLUGIN_OPTION_TELEMETRY"]) check(bundle.includes(name), `the bundle does not read ${name}, which turns telemetry off`);
   // The doctor skill runs the bundle's `status`, which must print the setup checks.
   check(bundle.includes("setup checks (/runners-io:doctor):"), "the bundle's status command does not print the setup checks");
 }
@@ -156,6 +168,9 @@ if (existsSync(hooksFile)) {
   const pr = cmds.find((c) => c.command.includes("${CLAUDE_PLUGIN_ROOT}/hooks/pr-created.mjs"));
   check(pr, "no PostToolUse hook runs ${CLAUDE_PLUGIN_ROOT}/hooks/pr-created.mjs");
   check(pr && /Bash/.test(pr.matcher), "the PR hook does not match Bash, where gh pr create runs");
+  // A matcher is a regular expression tested anywhere in the tool's name: unanchored, it also fires for every tool
+  // whose name only contains one of these.
+  check(pr && pr.matcher.startsWith("^(") && pr.matcher.endsWith(")$"), "the PR hook's matcher is not anchored (^(...)$), so it fires for any tool whose name contains a match");
   check(existsSync(join(root, "hooks", "pr-created.mjs")), "hooks/pr-created.mjs does not exist");
   // The launch hook: it says what the machine is missing (hooks/readiness.mjs), which the channel cannot do in a
   // session started without its flag. Both hooks go through hooks/node.sh, or a machine with no Node.js hears nothing.
@@ -163,7 +178,7 @@ if (existsSync(hooksFile)) {
   const wrapper = 'sh "${CLAUDE_PLUGIN_ROOT}/hooks/node.sh" ';
   check(starts.some((c) => c === `${wrapper}session-start "\${CLAUDE_PLUGIN_ROOT}/hooks/session-start.mjs"`), "no SessionStart hook runs hooks/session-start.mjs through hooks/node.sh as session-start");
   check(pr && pr.command === `${wrapper}quiet "\${CLAUDE_PLUGIN_ROOT}/hooks/pr-created.mjs"`, "the PR hook does not run through hooks/node.sh as quiet");
-  for (const name of ["node.sh", "session-start.mjs", "readiness.mjs", "proxy.mjs", "launch.mjs", "telemetry.mjs"]) check(existsSync(join(root, "hooks", name)), `hooks/${name} does not exist`);
+  for (const name of ["node.sh", "session-start.mjs", "readiness.mjs", "proxy.mjs", "launch.mjs", "telemetry.mjs", "programs.mjs"]) check(existsSync(join(root, "hooks", name)), `hooks/${name} does not exist`);
 }
 
 const skills = join(root, "skills");

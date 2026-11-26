@@ -7,7 +7,7 @@ import { after, test } from "node:test";
 import { type GhAuth, GitHubClient } from "../src/github.ts";
 import { setQuiet } from "../src/log.ts";
 import { githubFetch, proxyNote } from "../src/proxy.ts";
-import { bypassed, nodeProxiesItself, parseProxy, proxyFor, proxyVariable } from "../../hooks/proxy.mjs";
+import { bypassed, nodeProxiesItself, parseProxy, proxyFor, proxyVariable, sendRefusal, tlsChecksOff } from "../../hooks/proxy.mjs";
 import { type FakeGitHub, startFakeGitHub } from "./fake-github.mjs";
 import { type FakeProxy, startFakeProxy } from "./fake-proxy.mjs";
 
@@ -65,8 +65,42 @@ test("a SOCKS proxy, or a value that is no address, is one the channel cannot us
   assert.equal(parseProxy(""), null);
   assert.deepEqual(proxyFor({ HTTPS_PROXY: `socks5://ada:${SECRET}@proxy.corp:1080` }, "https://api.github.com"), { kind: "unusable", variable: "HTTPS_PROXY" });
   const note = proxyNote({ HTTPS_PROXY: `socks5://ada:${SECRET}@proxy.corp:1080` }, "https://api.github.com") ?? "";
-  assert.match(note, /HTTPS_PROXY.*cannot use/);
+  assert.equal(note, "HTTPS_PROXY names a proxy the channel cannot use (only http:// and https:// proxies): no request is made");
   assert.equal(note.includes(SECRET) || note.includes("proxy.corp"), false, note);
+});
+
+const PROXY_REFUSAL = "HTTPS_PROXY names a proxy the plugin cannot use, so no request is made: set it to an http:// or https:// proxy, or name the host in NO_PROXY";
+const TLS_REFUSAL =
+  "NODE_TLS_REJECT_UNAUTHORIZED=0 turns certificate checks off, so the GitHub login is not sent and no request is made: unset it (NODE_EXTRA_CA_CERTS adds a company's root certificate)";
+
+test("a proxy that is set and cannot be used is a refusal, never a way round it: no request, and a sentence that says what to set", () => {
+  for (const value of [`socks5://ada:${SECRET}@proxy.corp:1080`, "socks5h://proxy.corp:1080", "http://", "pac+https://proxy.corp/proxy.pac"]) {
+    const refusal = sendRefusal({ HTTPS_PROXY: value }, "https://api.github.com");
+    assert.deepEqual(refusal, { why: "proxy_unusable", variable: "HTTPS_PROXY", reason: PROXY_REFUSAL }, value);
+  }
+  assert.equal(sendRefusal({ https_proxy: "socks5://proxy.corp:1080" }, "https://api.github.com")?.reason, PROXY_REFUSAL.replace("HTTPS_PROXY", "https_proxy"));
+  // The ways a request does go: no proxy, a proxy the channel uses, and a host the no_proxy list names.
+  assert.equal(sendRefusal({}, "https://api.github.com"), null);
+  assert.equal(sendRefusal({ HTTPS_PROXY: "http://proxy.corp:8080" }, "https://api.github.com"), null);
+  assert.equal(sendRefusal({ HTTPS_PROXY: "socks5://proxy.corp:1080", NO_PROXY: "api.github.com" }, "https://api.github.com"), null);
+  assert.deepEqual(sendRefusal({ HTTPS_PROXY: "socks5://proxy.corp:1080", NO_PROXY: "api.github.com" }, "https://ghe.corp.example/api/v3")?.why, "proxy_unusable");
+  // ALL_PROXY is not read: it neither sends a request through a proxy nor stops one.
+  assert.equal(sendRefusal({ ALL_PROXY: "socks5://proxy.corp:1080", all_proxy: "socks5://proxy.corp:1080" }, "https://api.github.com"), null);
+  assert.deepEqual(proxyFor({ ALL_PROXY: "http://proxy.corp:8080" }, "https://api.github.com"), { kind: "direct", why: "unset" });
+});
+
+test("certificate checks switched off is a refusal for a request that carries the login, and only for one", () => {
+  assert.equal(tlsChecksOff({ NODE_TLS_REJECT_UNAUTHORIZED: "0" }), true);
+  for (const value of [undefined, "", "1", "false", "00"]) assert.equal(tlsChecksOff({ NODE_TLS_REJECT_UNAUTHORIZED: value }), false, `${value}: Node.js switches the checks off for "0" and nothing else`);
+  const off = { NODE_TLS_REJECT_UNAUTHORIZED: "0" };
+  assert.deepEqual(sendRefusal(off, "https://api.github.com"), { why: "tls_checks_off", reason: TLS_REFUSAL });
+  assert.deepEqual(sendRefusal(off, "https://ghe.corp.example/api/v3")?.why, "tls_checks_off");
+  assert.equal(sendRefusal(off, "https://www.runners.io/api/plugin/telemetry", { login: false }), null, "a message with no login in it is not held back");
+  // The tests' fake GitHub is plain http on this machine: there is no certificate to check, and no real login is sent.
+  assert.equal(sendRefusal({ ...off, RUNNERS_IO_TEST_FAKE_GITHUB: "1" }, "http://127.0.0.1:8790"), null);
+  assert.deepEqual(sendRefusal(off, "http://127.0.0.1:8790")?.why, "tls_checks_off", "only under the tests' switch");
+  // Both at once: the certificate checks are said first, since they are the one that could give the login away.
+  assert.deepEqual(sendRefusal({ ...off, HTTPS_PROXY: "socks5://proxy.corp:1080" }, "https://api.github.com")?.why, "tls_checks_off");
 });
 
 test("no_proxy: a name matches itself and every name below it, a port matches only itself, * matches everything", () => {
@@ -208,9 +242,32 @@ test("a redirect is refused, as the client asks of every request: a token is nev
   await assert.rejects(() => viaProxy(`${gh.base}/repos/acme/widgets/pulls/7`, { headers: { authorization: `Bearer ${TOKEN}` }, redirect: "error" }), /redirect/);
 });
 
-test("a proxy the channel cannot use leaves the request as it was before: straight to GitHub", async () => {
+test("a proxy the channel cannot use: no request is made at all, not through it and not around it, and the login is not even read", async () => {
   const { gh, proxy } = await world();
-  const client = new GitHubClient(gh.base, auth, githubFetch({ HTTPS_PROXY: "socks5://127.0.0.1:1" }));
-  assert.equal((await client.getPull("acme/widgets", 7)).kind, "ok");
+  const env = { HTTPS_PROXY: "socks5://127.0.0.1:1", RUNNERS_IO_TEST_FAKE_GITHUB: "1" };
+  let logins = 0;
+  const counted = async (): Promise<GhAuth> => {
+    logins++;
+    return auth();
+  };
+  const client = new GitHubClient(gh.base, counted, githubFetch(env), { env });
+  const before = gh.requests.length;
+  const rest = await client.getPull("acme/widgets", 7);
+  assert.deepEqual(rest, { kind: "retry", reason: PROXY_REFUSAL, afterMs: 5 * 60_000 });
+  const graphql = await client.reviewState("acme/widgets", 7);
+  assert.equal(graphql.kind === "retry" && graphql.reason, PROXY_REFUSAL);
+  assert.equal(gh.requests.length, before, "GitHub was not asked");
   assert.equal(proxy.connects.length, 0);
+  assert.equal(logins, 0, "with nowhere to send it, the login is not read");
+  // The same client's fetch, used by itself (as the channel's messages to runners.io are sent): refused there too.
+  await assert.rejects(() => githubFetch(env)(`${gh.base}/repos/acme/widgets/pulls/7`), (e: Error) => e.name === "MachineError" && e.message === PROXY_REFUSAL);
+  assert.equal(gh.requests.length, before);
+  // Where Node.js was told to do the proxying itself, it is not asked either: it knows no more kinds than the channel.
+  let asked = 0;
+  const spy: typeof fetch = async () => (asked++, new Response("{}"));
+  await assert.rejects(() => githubFetch({ ...env, NODE_USE_ENV_PROXY: "1" }, spy, "24.16.0")(`${gh.base}/user`), (e: Error) => e.message === PROXY_REFUSAL);
+  assert.equal(asked, 0);
+  // A host the no_proxy list names is still asked directly: that is the user's own instruction.
+  const named = { ...env, NO_PROXY: "127.0.0.1" };
+  assert.equal((await new GitHubClient(gh.base, auth, githubFetch(named), { env: named }).getPull("acme/widgets", 7)).kind, "ok");
 });

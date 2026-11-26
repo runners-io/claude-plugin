@@ -1,4 +1,4 @@
-// Which way a request to GitHub goes: straight there, or through the proxy the environment names.
+// Which way a request to GitHub goes: straight there, through the proxy the environment names, or not at all.
 //
 // Read the way curl and the GitHub CLI read it, so the channel goes where `gh` already goes: `https_proxy` (then
 // `HTTPS_PROXY`) names the proxy, and `no_proxy` (then `NO_PROXY`) the hosts that are reached without it. Two callers
@@ -8,6 +8,14 @@
 // A proxy address can carry a user name and a password. They are parsed here, for the proxy's own login and nothing
 // else: `display` is the proxy's host and port only, and it is the only part that is ever put into a sentence, a log
 // line or a file.
+//
+// NOT AT ALL, in two cases (sendRefusal), because the other choice is to send a login somewhere the user did not mean:
+//   - the proxy variable is set to something the channel cannot use (a SOCKS proxy, a PAC address). Going straight to
+//     GitHub would walk around a proxy the user was told to use, so no request is made until the variable names an
+//     http:// or https:// proxy, or the no_proxy list names the host;
+//   - certificate checks are switched off (NODE_TLS_REJECT_UNAUTHORIZED=0). Whoever sits on the network could then
+//     answer as GitHub and be handed the login, so nothing that carries the login is sent.
+// ALL_PROXY is not read, for either purpose.
 //
 // Nothing here opens a connection. Dependency-free plain JavaScript, Node 20.
 
@@ -106,4 +114,64 @@ export function proxyFor(env = process.env, target = "https://api.github.com") {
   if (noProxy && bypassed(env[noProxy], host, port)) return { kind: "direct", why: "no_proxy", variable: noProxy };
   const proxy = parseProxy(env[variable]);
   return proxy ? { kind: "proxy", variable, proxy } : { kind: "unusable", variable };
+}
+
+/** Whether Node.js was told not to check certificates: it switches the checks off for the value `0` and no other. */
+export function tlsChecksOff(env = process.env) {
+  return env.NODE_TLS_REJECT_UNAUTHORIZED === "0";
+}
+
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+
+/** The tests' fake GitHub: plain http on this machine, under the tests' own switch. It is handed no real login. */
+function testsFake(env, target) {
+  if (env.RUNNERS_IO_TEST_FAKE_GITHUB !== "1") return false;
+  try {
+    return LOOPBACK.has(new URL(target).hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Why no request to `target` may be made, or null when one may:
+ *   { why: "tls_checks_off", reason }              certificate checks are off, and the request would carry the login
+ *   { why: "proxy_unusable", variable, reason }    the proxy variable is set to something the channel cannot use
+ * `reason` is one sentence fit to show: it names the variable and what to set, never the variable's value. `login`
+ * false is a request that carries no GitHub login (a message to runners.io): only the proxy rule holds for it.
+ */
+export function sendRefusal(env = process.env, target = "https://api.github.com", { login = true } = {}) {
+  if (login && tlsChecksOff(env) && !testsFake(env, target)) {
+    return {
+      why: "tls_checks_off",
+      reason:
+        "NODE_TLS_REJECT_UNAUTHORIZED=0 turns certificate checks off, so the GitHub login is not sent and no request is made: " +
+        "unset it (NODE_EXTRA_CA_CERTS adds a company's root certificate)",
+    };
+  }
+  const route = proxyFor(env, target);
+  if (route.kind === "unusable") {
+    return {
+      why: "proxy_unusable",
+      variable: route.variable,
+      reason: `${route.variable} names a proxy the plugin cannot use, so no request is made: set it to an http:// or https:// proxy, or name the host in NO_PROXY`,
+    };
+  }
+  return null;
+}
+
+/**
+ * Whether the plugin reads github.com: RUNNERS_IO_GITHUB_API is unset or names api.github.com (or, in the plugin's own
+ * tests, the fake that stands in for it). Set to any other host, the plugin reads that host and only that host, so a
+ * repository whose remote is on github.com is not looked up: asked of another server, `owner/name` is another
+ * repository, and the answer would be reported as this one's. An address that cannot be read is no other host: the
+ * channel refuses to start on one.
+ */
+export function readsGitHubCom(env = process.env) {
+  const api = env.RUNNERS_IO_GITHUB_API || "https://api.github.com";
+  try {
+    return new URL(api).host === "api.github.com" || testsFake(env, api);
+  } catch {
+    return true;
+  }
 }

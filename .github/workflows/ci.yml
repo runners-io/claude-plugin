@@ -1,7 +1,10 @@
 name: ci
 
-# The plugin's checks, on the copy a user installs from. A GitHub-hosted runner, never one of our own: this is a
-# public repository, so a pull request from a fork can change what this file runs. It needs no secrets.
+# The plugin's checks, on the copy a user installs from. They run on a runners.io runner: the plugin's own CI is run by
+# the service its README's badge names. This is a public repository, so what makes that safe is said here: a pull
+# request from a fork runs nothing (the job's first step refuses it before anything is checked out), the repository
+# asks a maintainer to approve every outside contributor's workflow run before it starts, each job gets a machine of its
+# own that is destroyed afterwards, and the workflow needs no secrets and has a read-only token.
 on:
   push:
     branches: [main]
@@ -21,7 +24,7 @@ jobs:
     # A pull request from a fork runs nothing here: only pushes, a person's dispatch, and pull requests from a branch
     # of this repository (which is how a release is published). A fork's pull request FAILS this check at its first
     # step instead of skipping it: a ruleset requires the check by name, and GitHub counts a skipped one as passing.
-    runs-on: ubuntu-24.04
+    runs-on: runnersio-2vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - name: A pull request from a fork is refused

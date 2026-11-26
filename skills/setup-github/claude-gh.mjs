@@ -10,13 +10,14 @@
 // It never redefines `claude`, and refuses to write over a claude-gh the user defined themselves. The command
 // names claude by its absolute path when it can find it, so it does not depend on what is on PATH later.
 // Dependency-free plain JavaScript, Node 20.
-import { execFileSync, spawn } from "node:child_process";
-import { accessSync, chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { channelFlags, shellWord } from "../../hooks/launch.mjs";
+import { findProgram } from "../../hooks/programs.mjs";
 
 export const BEGIN = "# >>> runners.io claude channel >>>";
 export const END = "# <<< runners.io claude channel <<<";
@@ -151,13 +152,7 @@ export async function claudeGhPresent(env = process.env, { platform = process.pl
   if (!shellPath.startsWith("/") || !SHELLS.includes(shell)) return null;
   // SHELL is run with -lic, so it must be a login shell this machine lists, not any program a variable points at.
   if (!(shells ?? readListedShells()).has(shellPath)) return null;
-  for (const dir of (env.PATH ?? "").split(":")) {
-    if (!dir) continue;
-    try {
-      accessSync(join(dir, "claude-gh"), constants.X_OK);
-      return true;
-    } catch {}
-  }
+  if (findProgram("claude-gh", env, platform)) return true;
   const ask = shell === "fish" ? "type -q claude-gh" : "command -v claude-gh >/dev/null 2>&1";
   const tries = shell === "bash" ? [["-lic", ask], ["-ic", ask]] : [["-lic", ask]];
   let answered = false;
@@ -223,45 +218,92 @@ export function recordDecline(env = process.env, now = Date.now()) {
   }
 }
 
-/** A claude-gh found is believed this long before the shell is asked again. */
-const FOUND_FOR_MS = 24 * 60 * 60_000;
+/** The shell's answer, found or missing, is believed this long before the shell is asked again. */
+const REMEMBER_FOR_MS = 24 * 60 * 60_000;
+const SEEN = "claude-gh.json";
 
 /** The plugin's cache folder, the same one the channel shares its GitHub reads in. */
 export function cacheRootFor(env = process.env) {
   return join(env.XDG_CACHE_HOME || join(env.HOME || homedir(), ".cache"), "runners-io");
 }
 
+/** The remembered answer, or null: only from a plain file of this user's, in a plain folder of this user's. */
+function readSeen(cacheRoot) {
+  try {
+    if (!ownFolder(cacheRoot)) return null;
+    const st = lstatSync(join(cacheRoot, SEEN));
+    if (!st.isFile() || st.size > 4096 || (process.getuid !== undefined && st.uid !== process.getuid())) return null;
+    const seen = JSON.parse(readFileSync(join(cacheRoot, SEEN), "utf8"));
+    return seen && typeof seen === "object" && !Array.isArray(seen) ? seen : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Remembers an answer: a 0600 file in a 0700 folder of this user's, replaced in one step, never through a symlink. */
+function writeSeen(cacheRoot, value) {
+  const tmp = join(cacheRoot, `.${SEEN}.${process.pid}`);
+  try {
+    mkdirSync(cacheRoot, { recursive: true, mode: 0o700 });
+    if (!ownFolder(cacheRoot)) return false;
+    writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
+    // A rename replaces whatever has the name, a symlink included, and never writes to what a symlink points at.
+    renameSync(tmp, join(cacheRoot, SEEN));
+    return true;
+  } catch {
+    rmSync(tmp, { force: true });
+    return false;
+  }
+}
+
+/**
+ * Forgets the remembered answer, so the next launch asks the shell. `add` and `remove` call it: the user has just
+ * changed whether there is a claude-gh, and an answer from before would be wrong for the rest of its day.
+ */
+export function forgetClaudeGh(env = process.env, cacheRoot = cacheRootFor(env)) {
+  try {
+    if (ownFolder(cacheRoot)) rmSync(join(cacheRoot, SEEN), { force: true });
+  } catch {}
+}
+
+/**
+ * What the shell's usual rc file looked like when it was asked: its time of change and its size, `none` when there
+ * is no such file. A remembered `missing` is used only while this is unchanged, so a claude-gh the user adds by hand
+ * is seen at the next launch. A claude-gh defined in some other file is seen when the answer's day is up.
+ */
+function rcStamp(shellPath, env) {
+  try {
+    const st = statSync(rcFor(basename(shellPath), env));
+    return `${st.mtimeMs}:${st.size}`;
+  } catch (error) {
+    return error?.code === "ENOENT" ? "none" : "unknown";
+  }
+}
+
 /**
  * claudeGhPresent's answer for the SessionStart offer, or null (no offer) when the user has turned it off.
  *
- * Asking the shell runs the user's startup files, which can be slow or start things, so a claude-gh FOUND is
- * remembered for a day (per shell, in the cache folder: 0700, a 0600 file, never through a symlink or another
- * user's folder) and the shell is not started again until then. One MISSING is asked at every launch: that is
- * when the offer is made, and the user may have just added it. After the user says no (recordDecline), there is no
+ * Asking the shell runs the user's startup files (`$SHELL -lic`), which can be slow or start things, so it is not
+ * done at every launch: the shell's answer, FOUND or MISSING, is remembered for a day (per shell, in the cache
+ * folder: 0700, a 0600 file, never through a symlink or another user's folder) and the shell is not started again
+ * until then. A remembered MISSING still makes the offer; it is dropped at once when it may be out of date: the
+ * setup-github skill added or removed claude-gh (forgetClaudeGh), the shell's rc file changed, or a claude-gh is on
+ * PATH. No answer (the shell failed or hung) is not remembered. After the user says no (recordDecline), there is no
  * offer and no shell is started for DECLINE_FOR_MS; then it is offered once again.
  */
 export async function claudeGhForOffer(env = process.env, present = claudeGhPresent, { now = Date.now(), cacheRoot = cacheRootFor(env) } = {}) {
   if (env.RUNNERS_IO_NO_CLAUDE_GH_OFFER === "1") return null;
   if (declined(env, now)) return null;
   const shell = env.SHELL ?? "";
-  const file = join(cacheRoot, "claude-gh.json");
-  try {
-    if (ownFolder(cacheRoot) && !lstatSync(file).isSymbolicLink()) {
-      const seen = JSON.parse(readFileSync(file, "utf8"));
-      if (seen.shell === shell && typeof seen.at === "number" && now - seen.at >= 0 && now - seen.at < FOUND_FOR_MS) return true;
-    }
-  } catch {}
-  const answer = await present(env);
-  if (answer === true) {
-    try {
-      mkdirSync(cacheRoot, { recursive: true, mode: 0o700 });
-      if (ownFolder(cacheRoot)) {
-        const tmp = join(cacheRoot, `.claude-gh.json.${process.pid}`);
-        writeFileSync(tmp, JSON.stringify({ shell, at: now }), { mode: 0o600 });
-        renameSync(tmp, file);
-      }
-    } catch {}
+  const seen = readSeen(cacheRoot);
+  if (seen && seen.shell === shell && typeof seen.at === "number" && now - seen.at >= 0 && now - seen.at < REMEMBER_FOR_MS) {
+    // A file from before `found` was written holds a claude-gh that was found: only that was remembered then.
+    if (seen.found !== false) return true;
+    if (seen.rc === rcStamp(shell, env) && !findProgram("claude-gh", env)) return false;
   }
+  const answer = await present(env);
+  if (answer === true) writeSeen(cacheRoot, { shell, at: now, found: true });
+  else if (answer === false) writeSeen(cacheRoot, { shell, at: now, found: false, rc: rcStamp(shell, env) });
   return answer;
 }
 
@@ -308,13 +350,9 @@ function runShell(file, args, env, timeoutMs) {
   });
 }
 
+/** claude's absolute path from PATH's absolute folders (programs.mjs), or null. Nothing is run to find it. */
 function findClaude() {
-  try {
-    const out = execFileSync("/bin/sh", ["-c", "command -v claude"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-    return out.startsWith("/") ? out : null;
-  } catch {
-    return null;
-  }
+  return findProgram("claude");
 }
 
 function arg(argv, name) {
@@ -362,6 +400,9 @@ function main(argv) {
     process.stdout.write(`check afterwards with: ${check}\n`);
     return 0;
   }
+  // Whatever comes of it, the user has asked for claude-gh to be set up or taken out: the answer the launch offer
+  // remembered is forgotten, so the next launch asks the shell and sees what is there now.
+  forgetClaudeGh(process.env);
   try {
     const next = command === "add" ? addBlock(text, block) : removeBlock(text);
     if (next === text) {

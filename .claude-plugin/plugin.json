@@ -1,8 +1,8 @@
 {
   "name": "runners-io",
   "displayName": "runners.io",
-  "version": "0.4.1",
-  "description": "CI results and merge conflicts for your pull requests, read from GitHub with your own GitHub login and pushed into your Claude Code session as they happen (a Channels research preview). It watches the pull request for your branch, and one just opened by you in the same repository; Claude subscribes to any other. Plus the runners.io MCP server for runners.io customers.",
+  "version": "0.4.2",
+  "description": "GitHub Actions results and merge conflicts for your pull requests, read from GitHub with your own GitHub login and pushed into your Claude Code session as they happen (a Channels research preview). Works for any repository that uses GitHub Actions, with no runners.io account. It watches the pull request for your branch, and one just opened by you in the same repository; Claude subscribes to any other.",
   "author": {
     "name": "runners.io",
     "url": "https://www.runners.io"
@@ -24,10 +24,6 @@
   "privacyPolicyUrl": "https://www.runners.io/privacy",
   "termsOfServiceUrl": "https://www.runners.io/terms",
   "mcpServers": {
-    "runners-io-mcp": {
-      "type": "http",
-      "url": "https://mcp.runners.io/mcp"
-    },
     "runners-io": {
       "command": "node",
       "args": [
@@ -35,8 +31,21 @@
       ],
       "env": {
         "RUNNERS_IO_AUTO_SUBSCRIBE": "${user_config.auto_subscribe}",
-        "RUNNERS_IO_REVIEW_REQUESTS": "${user_config.review_requests}"
+        "RUNNERS_IO_REVIEW_REQUESTS": "${user_config.review_requests}",
+        "CLAUDE_PLUGIN_OPTION_TELEMETRY": "${user_config.telemetry}"
       }
+    }
+  },
+  "userConfig": {
+    "telemetry": {
+      "type": "string",
+      "title": "Send runners.io an install ping and reports of the plugin's own faults",
+      "description": "on (default): once when the plugin is installed or updated, and when the plugin's own code fails, it sends runners.io a small message with no repository, path, login or token in it (the README's Telemetry section lists every field). off: it sends runners.io nothing.",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "on"
     }
   },
   "channels": [
