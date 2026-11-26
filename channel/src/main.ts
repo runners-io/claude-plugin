@@ -5,15 +5,18 @@
  *   runners-io-channel status     the GitHub login, repository, branch and pull request it would watch, and every
  *                                 setup check as ready or NOT READY, with one live GitHub call (the doctor skill)
  *   runners-io-channel version
+ *   runners-io-channel telemetry-test   sends one report of a fault made on purpose, and says whether it was sent
  *
- * It reads GitHub directly with the user's own `gh` login, so it needs no runners.io account and sends nothing to
- * runners.io. Bundled to one file (dist/runners-io-channel.mjs) for Node 20
+ * It reads GitHub directly with the user's own `gh` login, so it needs no runners.io account. Two things are sent to
+ * runners.io and nothing else: a ping when the plugin is installed or updated, and a report when the plugin's own code
+ * fails (hooks/telemetry.mjs: what each holds, and how to turn both off). Bundled to one file (dist/runners-io-channel.mjs) for Node 20
  * or later, so the plugin installs nothing at run time.
  */
 import { removeRequests, resetRequests, takeRequests } from "./hookrequests.ts";
 import { SharedStore, defaultSharedRoot } from "./shared.ts";
 import { fakeGitHubAllowed, loadConfig } from "./config.ts";
 import { channelRow, liveRow } from "./doctor.ts";
+import { setTelemetry } from "./faults.ts";
 import { FirstCallRecorder } from "./firstcall.ts";
 import { ForkParents, findBranchPull } from "./forks.ts";
 import { inOwnHistory, readGitScope, readPushed } from "./git.ts";
@@ -25,12 +28,42 @@ import { githubFetch, proxyNote } from "./proxy.ts";
 import { ScopeStore, defaultScopeRoot, scopeFile } from "./scopes.ts";
 import { Subscriptions } from "./subscriptions.ts";
 import { INSTRUCTIONS } from "./instructions.ts";
-import { makeTools } from "./tools.ts";
+import { TOOL_NAMES, makeTools } from "./tools.ts";
 import { NO_EVENT_LOG, openEventLog } from "./eventlog.ts";
 import { findLaunch, pollsIn } from "../../hooks/launch.mjs";
 import { firstCallRows, launchChecks, liveEventsBlocker, mergeRows, readFirstCall, renderTable } from "../../hooks/readiness.mjs";
+import { createTelemetry, needsTunnel, telemetryLine } from "../../hooks/telemetry.mjs";
 
-export const VERSION = "0.3.16";
+export const VERSION = "0.4.0";
+
+/**
+ * What the channel sends to runners.io (hooks/telemetry.mjs): reports of its own faults, and the install ping where
+ * the launch hook cannot send it. Through a company proxy as the GitHub requests go (proxy.ts). With telemetry off, or
+ * under the tests, every call on it does nothing.
+ */
+const telemetry = createTelemetry({ component: "channel", version: VERSION, fetch: githubFetch(process.env) });
+setTelemetry(telemetry);
+
+let ending = false;
+
+/**
+ * A failure nothing caught ends the process with status 1, as it always has. First it is reported as the channel's own
+ * fault, unless it is the machine's or GitHub's (the deny-list), with the send's 2 seconds at most.
+ */
+function fatal(error: unknown, component = "channel"): void {
+  if (ending) return;
+  ending = true;
+  void telemetry.report(error, { component }).finally(() => process.exit(1));
+}
+
+process.on("uncaughtException", (error) => {
+  log(`uncaught: ${(error as Error)?.message ?? "an error with no message"}`);
+  fatal(error);
+});
+process.on("unhandledRejection", (error) => {
+  log(`unhandled: ${(error as Error)?.message ?? "a rejection with no message"}`);
+  fatal(error);
+});
 
 /**
  * Notes what GitHub answers, for the next launch's setup checks (firstcall.ts). Not under the tests' fake GitHub
@@ -84,6 +117,12 @@ function serve(): void {
     version: VERSION,
     instructions: INSTRUCTIONS,
     tools: makeTools({ subs, gh, readScope, eventLog, liveEvents, scopes, parents }),
+    // A tool that threw instead of answering, or a message that could not be answered: the client has been told; this
+    // reports it as the channel's own fault. The tool's name is sent only when it is one of the channel's own.
+    onFault: (error, tool) => {
+      const component = tool === null ? "channel:mcp" : (TOOL_NAMES as readonly string[]).includes(tool) ? `tool:${tool}` : "tool:unknown";
+      void telemetry.report(error, { component });
+    },
     onReady: () => {
       if (!liveEvents) {
         if (launch === "off") eventLog.write("channel_inactive", { launch });
@@ -107,7 +146,7 @@ function serve(): void {
       }).catch((error) => {
         log(`the poller stopped: ${(error as Error).message}`);
         eventLog.write("stop", { reason: "poller_error", error: (error as Error).message });
-        process.exit(1);
+        fatal(error, "channel:poller");
       });
     },
     onClose: () => {
@@ -122,6 +161,9 @@ function serve(): void {
   );
   const proxy = proxyNote(process.env, config.githubApi);
   if (proxy) log(proxy);
+  // The install ping is the launch hook's to send. Behind a company proxy the hook cannot go through, it is sent
+  // from here, where the request can (the same once-only claim, so never both). Never in a headless run.
+  if (launch !== "headless" && needsTunnel(process.env)) void telemetry.ping();
 }
 
 async function status(): Promise<void> {
@@ -154,6 +196,7 @@ async function status(): Promise<void> {
   process.stdout.write(
     `runners-io-channel ${VERSION}\n${login}\nrepository: ${scope.repo ?? "none"}, branch: ${scope.branch ?? "none"}, pull request: ${pr}\n` +
       `automatic subscription: ${config.autoSubscribe}, every ${config.pollSeconds} s; event log: ${config.eventLogDir ?? "off"}\n` +
+      `${telemetryLine(process.env)}\n` +
       `setup checks (/runners-io:doctor):\n${renderTable(rows)}\n`,
   );
 }
@@ -171,13 +214,20 @@ async function main(argv: string[]): Promise<void> {
     case "version":
       process.stdout.write(`${VERSION}\n`);
       return;
+    case "telemetry-test": {
+      // One report of a fault made on purpose, inside the same limits as a real one (once a day), so that somebody
+      // checking what the plugin sends, or that it arrives, has something to look at.
+      const word = await telemetry.internalError("telemetry_self_test");
+      process.stdout.write(`${telemetryLine(process.env)}\ntest report: ${word}\n`);
+      return;
+    }
     default:
-      process.stderr.write(`unknown command: ${command}. Commands: status, version.\n`);
+      process.stderr.write(`unknown command: ${command}. Commands: status, version, telemetry-test.\n`);
       process.exit(64);
   }
 }
 
 main(process.argv.slice(2)).catch((error) => {
   log((error as Error).message);
-  process.exit(1);
+  fatal(error);
 });

@@ -252,3 +252,39 @@ test("the check refuses a hook that does not run through the Node.js wrapper, a 
     assert.match(r.stderr, /the doctor skill is missing/);
   });
 });
+
+// The bundle may name one runners.io address, the telemetry endpoint, and holds no Sentry key: a public key is one
+// anybody can post events against. Each way of turning telemetry off must be in the bundle that ships.
+test("the check refuses a bundle that names another runners.io API, repoints the telemetry endpoint, mentions Sentry, or drops an opt-out", () => {
+  withTemp((root) => {
+    const plugin = join(root, "plugin");
+    cpSync(PLUGIN, plugin, { recursive: true, filter: (src) => basename(src) !== "node_modules" });
+    const file = join(plugin, "channel", "dist", "runners-io-channel.mjs");
+    const bundle = readFileSync(file, "utf8");
+    const withBundle = (text) => {
+      writeFileSync(file, text);
+      return spawnSync(process.execPath, [CHECK, plugin], { encoding: "utf8" });
+    };
+    assert.equal(withBundle(bundle).status, 0, "the copy passes as it is");
+    assert.ok(bundle.includes('"https://www.runners.io/api/plugin/telemetry"'), "the bundle holds the endpoint");
+
+    let r = withBundle(`${bundle}\nfetch("https://www.runners.io/api/billing/usage");\n`);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /names a runners\.io API other than its telemetry endpoint: https:\/\/www\.runners\.io\/api\/billing\/usage/);
+
+    r = withBundle(bundle.replace('"https://www.runners.io/api/plugin/telemetry"', '"https://evil.runners.io/api/plugin/telemetry"'));
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /names a runners\.io API other than its telemetry endpoint/);
+    assert.match(r.stderr, /does not hold the telemetry endpoint as the one constant/);
+
+    r = withBundle(`${bundle}\nconst dsn = "https://abc@o1.ingest.sentry.io/2";\n`);
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /mentions Sentry or a DSN/);
+
+    for (const name of ["RUNNERS_IO_TELEMETRY", "DO_NOT_TRACK", "DISABLE_TELEMETRY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"]) {
+      r = withBundle(bundle.replaceAll(name, "SOMETHING_ELSE"));
+      assert.equal(r.status, 1, name);
+      if (name !== "DISABLE_TELEMETRY") assert.match(r.stderr, new RegExp(`does not read ${name}, which turns telemetry off`));
+    }
+  });
+});

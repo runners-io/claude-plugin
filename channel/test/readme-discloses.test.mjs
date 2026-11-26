@@ -97,3 +97,41 @@ test("Security says how often the shell is started, and that only its own proces
   assert.match(para, /process group/);
   assert.doesNotMatch(para, /whatever it started in the background is stopped/, "not whatever: only the group");
 });
+
+// From version 0.4.0 the plugin itself sends runners.io two kinds of message (hooks/telemetry.mjs). The README is the
+// user's account of them: the address, every field by its name, what is never sent, how often, and how to turn it off.
+test("'What is sent' lists the plugin's two messages to runners.io: every field, the limits, what is never sent and how to turn it off", async () => {
+  const { INTERNAL_CODES, MAX_REPORTS_PER_DAY, TELEMETRY_URL, errorReport, installPing, telemetrySwitch } = await import("../../hooks/telemetry.mjs");
+  const sent = section("What is sent");
+  assert.doesNotMatch(readme, /sends nothing to runners\.io|\*\*To runners\.io, by the channel:\*\* nothing/, "the README still says nothing is sent");
+  assert.ok(sent.includes(`\`${TELEMETRY_URL}\``), "the one address the messages go to");
+  assert.match(sent, /from version 0\.4\.0/i);
+
+  // The fields, read from what the plugin's own builders produce: a field added there must be named here.
+  const id = "3f2a9c1e-0b7d-4c55-9a51-6c8e2f0d4b11";
+  const ping = installPing({ installId: id, version: "0.4.1", previousVersion: "0.4.0", platform: "linux", nodeVersion: "22.1.0" });
+  const fault = new TypeError("x");
+  const root = "/plugin";
+  fault.stack = `TypeError: x\n    at holdScope (file://${root}/channel/dist/runners-io-channel.mjs:2213:19)`;
+  const report = errorReport(fault, { installId: id, version: "0.4.1", component: "channel", code: INTERNAL_CODES[0], root, platform: "linux", nodeVersion: "22.1.0" });
+  assert.ok(ping && report, "the builders made both messages");
+  const fields = [...new Set([...Object.keys(ping), ...Object.keys(report)])];
+  assert.equal(fields.length, 11, `the plugin's messages hold ${fields.join(", ")}`);
+  for (const field of fields) assert.ok(sent.includes(`\`${field}\``), `the README does not name the field ${field}`);
+  assert.ok(sent.includes(`\`${report.frames[0]}\``), "an example of a frame, as one is sent");
+
+  assert.match(sent, /once after the plugin is installed and once more when its version changes/);
+  assert.match(sent, new RegExp(`at\\s+most ${MAX_REPORTS_PER_DAY} a day`));
+  assert.match(sent, /never sends the error's message, a file path, your username, your machine's name/);
+  assert.match(sent, /A failure that is not the plugin's own is not reported at all/);
+  assert.match(sent, /IP address/);
+  assert.match(sent, /no Sentry key/i);
+  assert.match(sent, /https:\/\/www\.runners\.io\/privacy/);
+
+  // How to turn it off: the two settings of its own, and Claude Code's two, each of which the plugin obeys.
+  for (const [name, value] of [["RUNNERS_IO_TELEMETRY", "off"], ["DO_NOT_TRACK", "1"], ["DISABLE_TELEMETRY", "1"], ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"]]) {
+    assert.ok(sent.includes(`\`${name}${name.startsWith("RUNNERS") || name === "DO_NOT_TRACK" ? `=${value}` : ""}\``), `the README does not name ${name}`);
+    assert.equal(telemetrySwitch({ [name]: value }).on, false, `${name} does not turn it off`);
+  }
+  assert.match(section("Settings in the environment"), /\| `RUNNERS_IO_TELEMETRY` \| on \| `off`: the plugin sends runners\.io nothing/);
+});

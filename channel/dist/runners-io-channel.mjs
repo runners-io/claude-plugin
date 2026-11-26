@@ -31,13 +31,13 @@ function takeRequests(root, claudePid, uid = process.getuid?.(), now = Date.now(
   const dir = join(requests, String(claudePid));
   if (!safeFolder(requests, uid) || !safeFolder(dir, uid)) return [];
   const out = [];
-  let names;
+  let names2;
   try {
-    names = readdirSync(dir);
+    names2 = readdirSync(dir);
   } catch {
     return [];
   }
-  for (const name of names) {
+  for (const name of names2) {
     if (!name.endsWith(".json")) continue;
     const file = join(dir, name);
     let text = "";
@@ -68,6 +68,13 @@ function removeRequests(root, claudePid, uid = process.getuid?.()) {
     else if (safeFolder(dir, uid)) rmSync(dir, { recursive: true, force: true });
   } catch {
   }
+}
+
+// src/errors.ts
+function machineError(message, options) {
+  const error = new Error(message, options);
+  error.name = "MachineError";
+  return error;
 }
 
 // src/shared.ts
@@ -140,8 +147,8 @@ ${token}`).digest("hex").slice(0, 20)}`;
   /** Throws unless `dir` is a real folder (not a symlink) owned by this user. */
   mustBeMine(dir) {
     const s = lstatSync2(dir);
-    if (s.isSymbolicLink() || !s.isDirectory()) throw new Error(`${dir} is not a plain folder`);
-    if (this.uid !== void 0 && s.uid !== this.uid) throw new Error(`${dir} belongs to another user`);
+    if (s.isSymbolicLink() || !s.isDirectory()) throw machineError(`${dir} is not a plain folder`);
+    if (this.uid !== void 0 && s.uid !== this.uid) throw machineError(`${dir} belongs to another user`);
   }
   /** Deletes the other logins' folders (and any old format's) in which nothing has been written for a day. */
   pruneLogins(keep, now) {
@@ -274,14 +281,14 @@ function checkTokenUrl(raw, what, env = process.env) {
   try {
     url = new URL(raw);
   } catch {
-    throw new Error(`${what} is not a URL: ${raw}`);
+    throw machineError(`${what} is not a URL: ${raw}`);
   }
   if (isLoopback(url.hostname)) {
     if (fakeGitHubAllowed(env) && (url.protocol === "https:" || url.protocol === "http:")) return raw.replace(/\/+$/, "");
-    throw new Error(`${what} may name this machine only in the plugin's own tests (RUNNERS_IO_TEST_FAKE_GITHUB=1): ${raw}`);
+    throw machineError(`${what} may name this machine only in the plugin's own tests (RUNNERS_IO_TEST_FAKE_GITHUB=1): ${raw}`);
   }
   if (url.protocol === "https:") return raw.replace(/\/+$/, "");
-  throw new Error(`${what} must be https: ${raw}`);
+  throw machineError(`${what} must be https: ${raw}`);
 }
 function parseAuto(raw) {
   return (raw ?? "").trim().toLowerCase() === "off" ? "off" : "pr";
@@ -408,6 +415,18 @@ function channelRow(state, unavailableOn = null) {
   };
 }
 
+// src/faults.ts
+var telemetry = null;
+function setTelemetry(sender) {
+  telemetry = sender;
+}
+function internalError(code) {
+  try {
+    void telemetry?.internalError(code);
+  } catch {
+  }
+}
+
 // ../hooks/readiness.mjs
 import { execFile } from "node:child_process";
 import { createHash as createHash2 } from "node:crypto";
@@ -419,7 +438,7 @@ import { fileURLToPath } from "node:url";
 // ../hooks/proxy.mjs
 var PROXY_VARS = ["https_proxy", "HTTPS_PROXY"];
 var NO_PROXY_VARS = ["no_proxy", "NO_PROXY"];
-var set = (env, names) => names.find((n) => (env[n] ?? "").trim()) ?? null;
+var set = (env, names2) => names2.find((n) => (env[n] ?? "").trim()) ?? null;
 function proxyVariable(env = process.env) {
   return set(env, PROXY_VARS);
 }
@@ -520,8 +539,8 @@ function onOneLine(path) {
   return String(path).replace(/[\u0000-\u001f\u007f]/g, "?").slice(0, 200);
 }
 function tokenVariable(env = process.env, host = loginHost(env)) {
-  const names = host === "github.com" ? TOKEN_VARS : (env.GH_HOST ?? "").trim().toLowerCase() === host.toLowerCase() ? ENTERPRISE_TOKEN_VARS : [];
-  return names.find((n) => (env[n] ?? "").trim()) ?? null;
+  const names2 = host === "github.com" ? TOKEN_VARS : (env.GH_HOST ?? "").trim().toLowerCase() === host.toLowerCase() ? ENTERPRISE_TOKEN_VARS : [];
+  return names2.find((n) => (env[n] ?? "").trim()) ?? null;
 }
 function which(command, env = process.env, platform = process.platform) {
   const win = platform === "win32";
@@ -1718,8 +1737,8 @@ function fenced(...fields) {
 function fenceNames(...pairs) {
   return fenced(...pairs.map(([field, name]) => one(field, name)));
 }
-function jobs(names) {
-  const list = (names ?? []).map((j) => clean(j, 60)).filter(Boolean);
+function jobs(names2) {
+  const list = (names2 ?? []).map((j) => clean(j, 60)).filter(Boolean);
   if (!list.length) return "";
   const shown = list.slice(0, 5).join(", ");
   return list.length > 5 ? `${shown} and ${list.length - 5} more` : shown;
@@ -1810,13 +1829,13 @@ function toMessage(c, viewer = null) {
   let what;
   let todo;
   let link = "";
-  let names = "";
+  let names2 = "";
   switch (c.kind) {
     case "ci.workflow_started":
       what = (c.workflows ?? 1) > 1 ? `CI started on ${at}: ${c.workflows} workflows.` : `CI started on ${at}.`;
       todo = "No action is needed yet: ci.run_all_done says when all CI on this commit has finished.";
       link = runUrl;
-      names = (c.workflows ?? 1) > 1 ? fenced(one("one of them", clean(c.run?.name)), headBranch) : fenced(workflow, headBranch);
+      names2 = (c.workflows ?? 1) > 1 ? fenced(one("one of them", clean(c.run?.name)), headBranch) : fenced(workflow, headBranch);
       break;
     case "ci.workflow_failed": {
       const repo = REPO2.test(s.repo) ? s.repo : "";
@@ -1824,20 +1843,20 @@ function toMessage(c, viewer = null) {
       what = `CI failed on ${at}.`;
       todo = readLog("the failed job's log", how, notYours(s, viewer, c.run));
       link = runUrl;
-      names = fenced(workflow, headBranch, ["failed jobs", quotedList(c.failedJobs)]);
+      names2 = fenced(workflow, headBranch, ["failed jobs", quotedList(c.failedJobs)]);
       break;
     }
     case "ci.workflow_succeeded":
       what = `CI passed on ${at}.`;
       todo = "No action is needed for one workflow: ci.run_all_done says when all of them have finished.";
       link = runUrl;
-      names = fenced(workflow, headBranch);
+      names2 = fenced(workflow, headBranch);
       break;
     case "ci.workflow_cancelled":
       what = `CI cancelled on ${at}.`;
       todo = "A cancelled run is not a failure: do not change code for it. Tell the user if they were waiting on it.";
       link = runUrl;
-      names = fenced(workflow, headBranch);
+      names2 = fenced(workflow, headBranch);
       break;
     case "ci.approval_waiting":
       if ((c.approval ?? (c.run?.status === "completed" && c.run.conclusion === "action_required" ? "maintainer" : "deployment")) === "maintainer") {
@@ -1848,21 +1867,21 @@ function toMessage(c, viewer = null) {
         todo = "An environment's required reviewer must approve it on GitHub; do not try to approve it yourself. Tell the user.";
       }
       link = runUrl;
-      names = fenced(workflow, headBranch);
+      names2 = fenced(workflow, headBranch);
       break;
     case "ci.run_all_done": {
       const all = allDoneText(c);
       what = `All CI workflows finished on ${at}: ${clean(c.conclusion, 30) || "finished"}. ${all.what}`;
       todo = all.todo;
       link = prUrl;
-      names = fenced(headBranch, ["failed workflows", quotedList(c.failedWorkflows)], ["cancelled workflows", quotedList(c.cancelledWorkflows)]);
+      names2 = fenced(headBranch, ["failed workflows", quotedList(c.failedWorkflows)], ["cancelled workflows", quotedList(c.cancelledWorkflows)]);
       break;
     }
     case "pr.conflict":
       what = `PR #${s.pr} has a merge conflict with its base branch.`;
       todo = "Offer the user to rebase onto the base branch or merge it in; do either only if the user says yes.";
       link = prUrl;
-      names = fenced(plainBranch);
+      names2 = fenced(plainBranch);
       break;
     case "pr.conflict_resolved":
       what = `PR #${s.pr} no longer has a merge conflict.`;
@@ -1884,7 +1903,7 @@ function toMessage(c, viewer = null) {
       what = `PR #${s.pr}: the branch on GitHub moved to ${clean(s.headSha, 40).slice(0, 7)}, which is not this session's own commit (not its HEAD or behind it), so someone else, another session or worktree, or a merge queue pushed or force-pushed it.`;
       todo = `If you have unpushed work on this branch, fetch and look (git fetch origin, then git log HEAD..origin/<branch>) before your next push; <branch> is the pull request's head branch${named ? ", named at the end" : ""}. Otherwise no action is needed.`;
       link = prUrl;
-      names = fenced(plainBranch);
+      names2 = fenced(plainBranch);
       break;
     }
     case "pr.labels_changed": {
@@ -1894,7 +1913,7 @@ function toMessage(c, viewer = null) {
       what = `PR #${s.pr} labels changed (${changed || "changed"}; named at the end).`;
       todo = "A label such as a hold can change whether it may be merged: tell the user if one does. Otherwise no action is needed.";
       link = prUrl;
-      names = fenced(["added labels", added], ["removed labels", removed]);
+      names2 = fenced(["added labels", added], ["removed labels", removed]);
       break;
     }
     case "pr.ready_for_review":
@@ -1918,7 +1937,7 @@ function toMessage(c, viewer = null) {
       what = `CI job failed on ${at}, while the run is still running${notes ? "; its annotations point at the files named at the end" : ""}.`;
       todo = readLog("the job's log", c.job && repo && isId(c.job.id) ? ` (gh run view --job ${c.job.id} --repo ${repo} --log-failed)` : "", notYours(s, viewer, c.run));
       link = jobUrl || runUrl;
-      names = fenced(job, workflow, headBranch, ["annotations", notes]);
+      names2 = fenced(job, workflow, headBranch, ["annotations", notes]);
       break;
     }
     case "ci.job_stuck_queued": {
@@ -1927,26 +1946,26 @@ function toMessage(c, viewer = null) {
       what = `CI job queued for ${min} min with no runner on ${at}${labels ? ", asking for a runner with the labels named at the end" : ""}. No runner with those labels may be online, or every one is busy.`;
       todo = "Tell the user if they are waiting on this CI: a code change cannot bring a runner online.";
       link = jobUrl || runUrl;
-      names = fenced(job, workflow, headBranch, ["runner labels", labels]);
+      names2 = fenced(job, workflow, headBranch, ["runner labels", labels]);
       break;
     }
     case "ci.flaky":
       what = `CI flaky on ${at}: a workflow failed and then passed on a re-run of the same commit (attempt ${c.run?.runAttempt ?? "?"}).`;
       todo = "Tell the user it looks flaky and which workflow it was; do not change code for it, and re-run it only if the user asks.";
       link = runUrl;
-      names = fenced(workflow, headBranch);
+      names2 = fenced(workflow, headBranch);
       break;
     case "base.red":
       what = "The base branch is red.";
       todo = `A failure on ${prList(c.prs, s.pr)} may be the base branch's, not the PR's: check the base branch before changing code, and do not merge while it is red. Tell the user if they were about to merge.`;
       link = baseLink(s);
-      names = fenced(one("base branch", clean(s.baseRef, 60)), ["failing workflows", quotedList(c.failing)]);
+      names2 = fenced(one("base branch", clean(s.baseRef, 60)), ["failing workflows", quotedList(c.failing)]);
       break;
     case "pr.approved":
       what = `PR #${s.pr} was approved by ${who(c)}.${decision(c)}`;
       todo = "Tell the user. Merge only if the user or their process says so.";
       link = reviewUrl;
-      names = fenced(reviewer(c));
+      names2 = fenced(reviewer(c));
       break;
     case "pr.changes_requested": {
       const member = c.review?.authorType === "member";
@@ -1954,7 +1973,7 @@ function toMessage(c, viewer = null) {
       what = `PR #${s.pr}: ${who(c)} requested changes.${decision(c)}`;
       todo = `Tell the user.${read} Change code, push or reply only if the user asks.`;
       link = reviewUrl;
-      names = fenced(reviewer(c));
+      names2 = fenced(reviewer(c));
       break;
     }
     case "pr.review_thread_added": {
@@ -1962,14 +1981,14 @@ function toMessage(c, viewer = null) {
       what = `PR #${s.pr}: ${who(c)} opened a review thread on a file named at the end. Unresolved threads: ${c.review?.unresolved ?? "?"}.`;
       todo = `Tell the user.${read} Change code, push or reply only if the user asks.`;
       link = reviewUrl;
-      names = fenced(reviewer(c), ["file", fileLine(c)]);
+      names2 = fenced(reviewer(c), ["file", fileLine(c)]);
       break;
     }
     case "pr.review_thread_resolved":
       what = `PR #${s.pr}: a review thread (opened by ${who(c)}, on a file named at the end) was resolved. Unresolved threads: ${c.review?.unresolved ?? "?"}.`;
       todo = "Tell the user if they were waiting on it.";
       link = reviewUrl || prUrl;
-      names = fenced(reviewer(c), ["file", fileLine(c)]);
+      names2 = fenced(reviewer(c), ["file", fileLine(c)]);
       break;
     case "pr.ready_to_merge":
       what = `PR #${s.pr}: GitHub reports its merge state as ${clean(c.review?.mergeState, 20)} on ${clean(s.headSha, 40).slice(0, 7)}.`;
@@ -1980,10 +1999,10 @@ function toMessage(c, viewer = null) {
       what = `The base branch of PR #${s.pr} is green again.`;
       todo = "Tell the user if a merge was waiting on it. Otherwise no action is needed.";
       link = baseLink(s);
-      names = fenced(one("base branch", clean(s.baseRef, 60)));
+      names2 = fenced(one("base branch", clean(s.baseRef, 60)));
       break;
   }
-  const content = `${what} ${todo} ${REPLY} ${link} ${names}`;
+  const content = `${what} ${todo} ${REPLY} ${link} ${names2}`;
   const meta = { kind: c.kind, repo: clean(s.repo, 140), pr: String(s.pr) };
   const add = (key, value) => {
     if (value && META_KEY.test(key)) meta[key] = value;
@@ -2046,8 +2065,8 @@ function prList(prs, fallback) {
   if (list.length === 1) return `PR ${list[0]}`;
   return `PRs ${list.slice(0, -1).join(", ")} and ${list.at(-1)}`;
 }
-function labelList(names) {
-  return (names ?? []).map((n) => clean(n, 40)).filter(Boolean).slice(0, 10).join(", ");
+function labelList(names2) {
+  return (names2 ?? []).map((n) => clean(n, 40)).filter(Boolean).slice(0, 10).join(", ");
 }
 function baseLink(s) {
   if (!REPO2.test(s.repo) || !s.baseRef) return "";
@@ -2346,10 +2365,10 @@ var ScopeStore = class {
     mkdirSync3(folder, { recursive: true, mode: 448 });
     const before = lstatSync4(folder);
     const foreign = this.distrust({ uid: before.uid, mode: 0, isSymbolicLink: () => before.isSymbolicLink() }, "its folder");
-    if (foreign) throw new Error(foreign);
+    if (foreign) throw machineError(foreign);
     chmodSync2(folder, 448);
     const why2 = this.distrust(lstatSync4(folder), "its folder");
-    if (why2) throw new Error(why2);
+    if (why2) throw machineError(why2);
     const doc = `${JSON.stringify({ version: SCOPE_FORMAT, scopes: this.scopes }, null, 2)}
 `;
     const tmp = `${file}.${process.pid}.${randomBytes2(4).toString("hex")}.tmp`;
@@ -2422,8 +2441,8 @@ async function readGhAuth(env = process.env, run2 = runCommand, apiBase = "https
   }
   const host = loginHost2(apiBase);
   const enterpriseHost = (env.GH_HOST ?? "").trim().toLowerCase();
-  const names = host === "github.com" ? ["GH_TOKEN", "GITHUB_TOKEN"] : enterpriseHost === host.toLowerCase() ? ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"] : [];
-  for (const name of names) {
+  const names2 = host === "github.com" ? ["GH_TOKEN", "GITHUB_TOKEN"] : enterpriseHost === host.toLowerCase() ? ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"] : [];
+  for (const name of names2) {
     const value = env[name]?.trim();
     if (value) return { kind: "ok", token: value, source: "env" };
   }
@@ -3008,6 +3027,7 @@ function startMcp(opts) {
           result = await opts.tools.call(name, args);
         } catch (error) {
           log(`tool ${name}: ${error.message}`);
+          opts.onFault?.(error, name);
           result = { text: `the ${name} tool failed: ${error.message}`, isError: true };
         }
         await reply(id, { content: [{ type: "text", text: result.text }], isError: result.isError === true });
@@ -3028,6 +3048,10 @@ function startMcp(opts) {
         await fail(id, -32601, `method not found: ${method}`);
     }
   };
+  const unhandled = (e) => {
+    log(`mcp: ${e.message}`);
+    opts.onFault?.(e, null);
+  };
   const lines = createInterface({ input: opts.input, crlfDelay: Number.POSITIVE_INFINITY });
   lines.on("line", (line) => {
     if (!line.trim()) return;
@@ -3039,9 +3063,9 @@ function startMcp(opts) {
       return;
     }
     if (Array.isArray(msg)) {
-      for (const m of msg) void handle(m).catch((e) => log(`mcp: ${e.message}`));
+      for (const m of msg) void handle(m).catch(unhandled);
     } else if (msg && typeof msg === "object") {
-      void handle(msg).catch((e) => log(`mcp: ${e.message}`));
+      void handle(msg).catch(unhandled);
     }
   });
   lines.on("close", () => opts.onClose());
@@ -3124,8 +3148,8 @@ var DAY_MS = 864e5;
 var APPEND = constants2.O_WRONLY | constants2.O_APPEND | constants2.O_CREAT | (constants2.O_NOFOLLOW ?? 0);
 function mustBeMine(dir, uid) {
   const s = lstatSync5(dir);
-  if (s.isSymbolicLink() || !s.isDirectory()) throw new Error(`${dir} is not a plain folder`);
-  if (uid !== void 0 && s.uid !== uid) throw new Error(`${dir} belongs to another user`);
+  if (s.isSymbolicLink() || !s.isDirectory()) throw machineError(`${dir} is not a plain folder`);
+  if (uid !== void 0 && s.uid !== uid) throw machineError(`${dir} belongs to another user`);
 }
 function openEventLog(dir, options) {
   const now = options.now ?? (() => /* @__PURE__ */ new Date());
@@ -3610,6 +3634,8 @@ async function runPoller(deps) {
     }
     const held2 = hold.map((p) => p.number);
     const leftOut = unowned.length - hold.length;
+    if (leftOut < 0) internalError("scope_holdings_negative");
+    if (held2.length > limits.total) internalError("scope_holdings_over_cap");
     subs.scopeHoldings.set(key, { held: held2, leftOut, more: d.full, problem: null });
     if (leftOut === 0) return { ...d, saidCap: false };
     if (d.saidCap) return d;
@@ -4175,7 +4201,7 @@ function openTunnel(proxy, authority, signal) {
     req.once("connect", (res, socket, head) => {
       if (res.statusCode !== 200) {
         socket.destroy();
-        return settle(() => reject(new Error(`the proxy ${proxy.display} answered HTTP ${res.statusCode} to CONNECT`)));
+        return settle(() => reject(machineError(`the proxy ${proxy.display} answered HTTP ${res.statusCode} to CONNECT`)));
       }
       socket.setTimeout(0);
       socket.on("error", () => void 0);
@@ -4185,13 +4211,13 @@ function openTunnel(proxy, authority, signal) {
     req.once("response", (res) => {
       res.resume();
       req.destroy();
-      settle(() => reject(new Error(`the proxy ${proxy.display} answered HTTP ${res.statusCode} to CONNECT`)));
+      settle(() => reject(machineError(`the proxy ${proxy.display} answered HTTP ${res.statusCode} to CONNECT`)));
     });
     req.once("timeout", () => {
       req.destroy();
-      settle(() => reject(new Error(`the proxy ${proxy.display} did not answer in time`)));
+      settle(() => reject(machineError(`the proxy ${proxy.display} did not answer in time`)));
     });
-    req.once("error", (error) => settle(() => reject(new Error(`the proxy ${proxy.display} could not be reached (${why(error)})`, { cause: error }))));
+    req.once("error", (error) => settle(() => reject(machineError(`the proxy ${proxy.display} could not be reached (${why(error)})`, { cause: error }))));
     req.end();
   });
 }
@@ -4231,7 +4257,7 @@ async function throughProxy(proxy, url, init) {
       signal?.removeEventListener("abort", onAbort);
       tunnel.destroy();
       if (signal?.aborted) return reject(signal.reason);
-      reject(error instanceof TypeError ? error : new Error(`GitHub through the proxy ${proxy.display}: ${why(error)}`, { cause: error }));
+      reject(error instanceof TypeError ? error : machineError(`GitHub through the proxy ${proxy.display}: ${why(error)}`, { cause: error }));
     };
     const onAbort = () => {
       req.destroy();
@@ -4255,7 +4281,7 @@ async function throughProxy(proxy, url, init) {
       if (REDIRECTS.has(status2) && init.redirect !== "manual") {
         res.resume();
         req.destroy();
-        return fail(new TypeError(`GitHub answered a redirect (HTTP ${status2}), which is never followed: the token stays with the address it was read for`));
+        return fail(Object.assign(new TypeError(`GitHub answered a redirect (HTTP ${status2}), which is never followed: the token stays with the address it was read for`), { status: status2 }));
       }
       const chunks = [];
       let size = 0;
@@ -4263,7 +4289,7 @@ async function throughProxy(proxy, url, init) {
         size += chunk.length;
         if (size > MAX_BODY_BYTES) {
           req.destroy();
-          return fail(new Error("the answer is larger than the channel reads"));
+          return fail(machineError("the answer is larger than the channel reads"));
         }
         chunks.push(chunk);
       });
@@ -4307,6 +4333,7 @@ var INSTRUCTIONS = [
 ].join(" ");
 
 // src/tools.ts
+var TOOL_NAMES = ["subscribe", "unsubscribe", "list_subscriptions", "ci_status", "mute", "unmute"];
 var CHANNEL_NOTE = 'Results arrive as <channel source="runners-io"> events if this session was started with the runners-io channel; if none arrive, call ci_status to check.';
 var WATCH_COST = `Each watch reads GitHub on the user's own GitHub login and its hourly limit, shared with gh: about 24 GitHub requests an hour while the pull request is quiet, more while its CI runs, and about 60 GraphQL points an hour for the review kinds (a watch whose events name no review kind costs no review reads). A session watches at most ${MAX_SUBSCRIPTIONS} pull requests.`;
 var SCOPE_COST = ` With scope: "repo", it watches the open pull requests the signed-in GitHub login opened in the whole repository instead, ones opened later included, with no further subscribe call, and keeps that for this project across restarts; after gh pr create there, call subscribe only if no scope covers the repository (list_subscriptions shows the scopes). Each pull request a scope holds is a watch like any other: it costs the same and counts towards the same ${MAX_SUBSCRIPTIONS}, so a scope takes only the places nothing else has, the newest open pull requests first, and says how many it left out (list_subscriptions shows them too); a subscribe for one pull request takes the place of the scope's oldest. Reading the repository's list is one more request a minute, free while the list is unchanged; the newest 100 open pull requests are read. A scope's pull requests push what the current branch's does: every kind but ${AUTO_QUIET_KINDS.join(", ")}. Other people's pull requests are covered only when asked for by name, so pass these only if the user asks: involves: "me" widens the scope to pull requests the login opened, is assigned to or is asked to review, read from that list with no further request (one the login only commented on, or was asked to review as a member of a team, is not counted), and involves: "all" to every open pull request in the repository.`;
@@ -4560,6 +4587,8 @@ The pull request is ${snap.state}, so it is not subscribed.` };
             }
           }
           let gaveWay = "";
+          const watchedBefore = deps.subs.list().length;
+          const isNew = !deps.subs.get(t.repo, t.pr);
           const room = full && deps.subs.list().length >= MAX_SUBSCRIPTIONS ? deps.subs.oldestScopeEntry() : void 0;
           if (room) {
             deps.subs.remove(room.repo, room.pr);
@@ -4568,6 +4597,7 @@ The pull request is ${snap.state}, so it is not subscribed.` };
           }
           const seen = deps.subs.get(t.repo, t.pr)?.last ?? null;
           deps.subs.add({ repo: t.repo, pr: t.pr, events: events.events, source: "tool", last: seen ?? snap });
+          if (isNew && deps.subs.list().length > Math.max(MAX_SUBSCRIPTIONS, watchedBefore)) internalError("watch_cap_exceeded");
           const lifted = deps.subs.mutes.remove({ repo: t.repo, pr: t.pr });
           (deps.eventLog ?? NO_EVENT_LOG).write("subscribe", {
             repo: t.repo,
@@ -4733,8 +4763,476 @@ ${note}` };
   };
 }
 
+// ../hooks/telemetry.mjs
+import { createHash as createHash5, randomUUID } from "node:crypto";
+import { closeSync as closeSync2, lstatSync as lstatSync6, mkdirSync as mkdirSync5, openSync as openSync2, readFileSync as readFileSync5, readdirSync as readdirSync5, rmSync as rmSync5, statSync as statSync3, writeFileSync as writeFileSync4 } from "node:fs";
+import { basename as basename2, dirname as dirname2, isAbsolute as isAbsolute4, join as join6, sep } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
+var TELEMETRY_URL = "https://www.runners.io/api/plugin/telemetry";
+var TEST_URL_ENV = "RUNNERS_IO_TEST_TELEMETRY_URL";
+var SEND_TIMEOUT_MS = 2e3;
+var MAX_BODY_BYTES2 = 1024;
+var MAX_FRAMES = 8;
+var MAX_REPORTS_PER_DAY = 5;
+var GONE_FOR_MS = 7 * 24 * 60 * 6e4;
+var INTERNAL_CODES = Object.freeze([
+  // A subscribe that found room left the session watching more pull requests than it may (channel/src/tools.ts).
+  "watch_cap_exceeded",
+  // A scope worked out that it leaves out fewer than no pull requests, or holds more than the session may (poller.ts).
+  "scope_holdings_negative",
+  "scope_holdings_over_cap",
+  // `runners-io-channel telemetry-test`: a report made on purpose, to see one arrive.
+  "telemetry_self_test"
+]);
+var VERSION = /^(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})$/;
+var UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+var COMPONENT = /^[a-z][a-z0-9-]{0,23}(:[a-z][a-z0-9_-]{0,39})?$/;
+var ERROR_NAME = /^[A-Z][A-Za-z0-9]{0,63}$/;
+var CODE = /^[a-z][a-z0-9_]{0,63}$/;
+var FUNCTION_NAME = /^[A-Za-z_$<][A-Za-z0-9_$.<>]{0,79}$/;
+var OWN_FILE = /^[a-z0-9][a-z0-9.-]{0,59}\.mjs$/;
+var FRAME = /^[A-Za-z_$<][A-Za-z0-9_$.<>]{0,79} [a-z0-9][a-z0-9.-]{0,59}\.mjs:[1-9][0-9]{0,6}:[1-9][0-9]{0,5}$/;
+var EXTERNAL = "<external>";
+var PLATFORMS = ["darwin", "linux", "win32", "freebsd", "openbsd", "netbsd", "sunos", "aix", "android"];
+var truthy = (value) => {
+  const v = String(value ?? "").trim().toLowerCase();
+  return v !== "" && v !== "0" && v !== "false" && v !== "no" && v !== "off";
+};
+function telemetrySwitch(env = process.env) {
+  const own = String(env.RUNNERS_IO_TELEMETRY ?? "").trim().toLowerCase();
+  if (own === "off" || own === "0" || own === "false" || own === "no") return { on: false, why: "RUNNERS_IO_TELEMETRY=off" };
+  if (truthy(env.DO_NOT_TRACK)) return { on: false, why: "DO_NOT_TRACK is set" };
+  if (truthy(env.DISABLE_TELEMETRY)) return { on: false, why: "DISABLE_TELEMETRY is set" };
+  if (truthy(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC)) return { on: false, why: "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set" };
+  const test = env[TEST_URL_ENV];
+  if (test !== void 0 && test !== "") {
+    return testEndpoint(test) ? { on: true } : { on: false, why: `${TEST_URL_ENV} is not a listener on 127.0.0.1` };
+  }
+  if (env.NODE_TEST_CONTEXT || env.RUNNERS_IO_TEST_FAKE_GITHUB === "1") return { on: false, why: "the plugin's own tests are running" };
+  return { on: true };
+}
+function testEndpoint(raw) {
+  try {
+    const url = new URL(String(raw));
+    if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.username || url.password) return null;
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+function telemetryEndpoint(env = process.env) {
+  if (!telemetrySwitch(env).on) return null;
+  const test = env[TEST_URL_ENV];
+  return test !== void 0 && test !== "" ? testEndpoint(test) : TELEMETRY_URL;
+}
+function needsTunnel(env = process.env) {
+  return proxyFor(env, TELEMETRY_URL).kind === "proxy" && !nodeProxiesItself(env);
+}
+function telemetryLine(env = process.env) {
+  const s = telemetrySwitch(env);
+  return s.on ? "telemetry: on (an install ping and reports of the plugin's own faults; RUNNERS_IO_TELEMETRY=off turns it off)" : `telemetry: off (${s.why}): nothing is sent to runners.io`;
+}
+function pluginRoot() {
+  try {
+    const self = fileURLToPath2(import.meta.url);
+    return basename2(self) === "telemetry.mjs" ? dirname2(dirname2(self)) : dirname2(dirname2(dirname2(self)));
+  } catch {
+    return null;
+  }
+}
+var PLUGIN_ROOT = pluginRoot();
+var DENIED_NAMES = /* @__PURE__ */ new Set([
+  "AbortError",
+  "TimeoutError",
+  "NetworkError",
+  "FetchError",
+  "HttpError",
+  "RequestError",
+  "GraphqlResponseError",
+  "ResponseStatusCodeError",
+  "ConnectTimeoutError",
+  "HeadersTimeoutError",
+  "BodyTimeoutError",
+  "SocketError",
+  "RequestAbortedError",
+  "ClientClosedError",
+  "ClientDestroyedError",
+  "SecureProxyConnectionError",
+  // Thrown by the plugin on purpose for a setting it refuses, a folder that is not this user's, a proxy that will not
+  // carry a request (channel/src/errors.ts): the machine's to fix, never the plugin's own fault.
+  "MachineError",
+  "ConfigError"
+]);
+var DENIED_CODES = /* @__PURE__ */ new Set([
+  "auth",
+  "retry",
+  "not_found",
+  "rate_limit",
+  "rate_limited",
+  "sso",
+  "forbidden",
+  "unauthorized",
+  "offline",
+  "econnrefused",
+  "econnreset",
+  "econnaborted",
+  "enotfound",
+  "etimedout",
+  "eai_again",
+  "epipe",
+  "ehostunreach",
+  "enetunreach",
+  "eproto",
+  "enoent",
+  "eacces",
+  "eperm",
+  "enospc",
+  "erofs",
+  "emfile",
+  "enfile",
+  "eexist",
+  "eisdir",
+  "enotdir",
+  "ebusy",
+  "eio"
+]);
+var DENIED_CODE_PATTERN = /^(http_[0-9]{3}|err_(tls|ssl|socket|http|http2|network|proxy|stream)_[a-z0-9_]+|und_err_[a-z0-9_]+|cert_[a-z0-9_]+|self_signed_[a-z0-9_]+|unable_to_[a-z0-9_]+|depth_zero_[a-z0-9_]+|channel_[a-z0-9_]+|problem[a-z0-9_]*)$/;
+var ERRNO = /^E[A-Z0-9]+$/;
+function deniedCode(code) {
+  if (typeof code !== "string" || code === "") return false;
+  const lower = code.toLowerCase();
+  return DENIED_CODES.has(lower) || DENIED_CODE_PATTERN.test(lower) || ERRNO.test(code);
+}
+function deniedOne(e) {
+  if (e === null || typeof e !== "object") return false;
+  if (typeof e.name === "string" && DENIED_NAMES.has(e.name)) return true;
+  if (deniedCode(e.code)) return true;
+  if (typeof e.errno === "number" || typeof e.syscall === "string") return true;
+  if (typeof e.status === "number" || typeof e.statusCode === "number") return true;
+  if (typeof e.cmd === "string" || Array.isArray(e.spawnargs) || typeof e.killed === "boolean") return true;
+  if (e.name === "TypeError" && e.message === "fetch failed") return true;
+  return false;
+}
+function denied(error) {
+  const seen = /* @__PURE__ */ new Set();
+  const queue = [error];
+  while (queue.length && seen.size < 16) {
+    const e = queue.shift();
+    if (e === null || typeof e !== "object" || seen.has(e)) continue;
+    seen.add(e);
+    if (deniedOne(e)) return true;
+    if (e.cause !== void 0) queue.push(e.cause);
+    if (Array.isArray(e.errors)) queue.push(...e.errors.slice(0, 8));
+  }
+  return false;
+}
+function errorName(error) {
+  if (error !== null && typeof error === "object") {
+    if (typeof error.name === "string" && ERROR_NAME.test(error.name)) return error.name;
+    const made = error.constructor?.name;
+    if (typeof made === "string" && ERROR_NAME.test(made)) return made;
+  }
+  return "Error";
+}
+function frameOf(line, root) {
+  const m = /^\s*at (?:(.+?) \()?(.+?):(\d+):(\d+)\)?$/.exec(line);
+  if (!m || !root) return EXTERNAL;
+  let file = m[2].replace(/^async /, "");
+  try {
+    if (file.startsWith("file://")) file = fileURLToPath2(file);
+  } catch {
+    return EXTERNAL;
+  }
+  if (!isAbsolute4(file) || !file.startsWith(root + sep) || file.includes(`${sep}node_modules${sep}`)) return EXTERNAL;
+  const name = basename2(file);
+  if (!OWN_FILE.test(name)) return EXTERNAL;
+  let fn = (m[1] ?? "").replace(/^async /, "").replace(/^new /, "").replace(/ \[as [^\]]*\]$/, "");
+  if (!FUNCTION_NAME.test(fn)) fn = "<anonymous>";
+  const frame = `${fn} ${name}:${m[3]}:${m[4]}`;
+  return FRAME.test(frame) ? frame : EXTERNAL;
+}
+function frameLines(error, root = PLUGIN_ROOT) {
+  const stack = error !== null && typeof error === "object" && typeof error.stack === "string" ? error.stack : "";
+  let text = stack;
+  const message = typeof error?.message === "string" ? error.message : "";
+  if (message) {
+    const at = text.indexOf(message);
+    if (at >= 0) text = text.slice(at + message.length);
+  }
+  const out = [];
+  for (const line of text.split("\n")) {
+    if (!/^\s*at /.test(line)) continue;
+    const frame = frameOf(line, root);
+    if (frame === EXTERNAL && out[out.length - 1] === EXTERNAL) continue;
+    out.push(frame);
+    if (out.length === MAX_FRAMES) break;
+  }
+  return out;
+}
+function fingerprintOf(name, frames, code = null) {
+  const own = frames.filter((f) => f !== EXTERNAL).slice(0, 3);
+  return createHash5("sha256").update([name, code ?? "", ...own].join("\n")).digest("hex").slice(0, 16);
+}
+var platformOf = (platform) => PLATFORMS.includes(platform) ? platform : null;
+function nodeMajorOf(version) {
+  const major = Number(String(version).split(".")[0]);
+  return Number.isInteger(major) && major >= 18 && major <= 99 ? major : null;
+}
+function installPing({ installId: installId2, version, previousVersion = null, updated = false, platform = process.platform, nodeVersion = process.versions.node }) {
+  const os = platformOf(platform);
+  const nodeMajor = nodeMajorOf(nodeVersion);
+  if (!UUID_V4.test(String(installId2)) || !VERSION.test(String(version)) || !os || nodeMajor === null) return null;
+  const previous = typeof previousVersion === "string" && VERSION.test(previousVersion) && previousVersion !== version ? previousVersion : null;
+  return {
+    kind: updated || previous ? "update" : "install",
+    install_id: installId2,
+    version,
+    ...previous ? { previous_version: previous } : {},
+    os,
+    node_major: nodeMajor
+  };
+}
+function errorReport(error, { installId: installId2, version, component, code = null, root = PLUGIN_ROOT, platform = process.platform, nodeVersion = process.versions.node }) {
+  if (denied(error)) return null;
+  if (code !== null && (!CODE.test(String(code)) || deniedCode(code))) return null;
+  const os = platformOf(platform);
+  const nodeMajor = nodeMajorOf(nodeVersion);
+  if (!UUID_V4.test(String(installId2)) || !VERSION.test(String(version)) || !COMPONENT.test(String(component)) || !os || nodeMajor === null) return null;
+  const frames = frameLines(error, root);
+  const name = errorName(error);
+  if (DENIED_NAMES.has(name)) return null;
+  const report = {
+    kind: "error",
+    install_id: installId2,
+    version,
+    os,
+    node_major: nodeMajor,
+    component,
+    error_name: name,
+    fingerprint: fingerprintOf(name, frames, code),
+    frames,
+    ...code !== null ? { code } : {}
+  };
+  while (Buffer.byteLength(JSON.stringify(report)) > MAX_BODY_BYTES2 && report.frames.length > 1) report.frames = report.frames.slice(0, -1);
+  if (Buffer.byteLength(JSON.stringify(report)) > MAX_BODY_BYTES2 || !report.frames.some((f) => f !== EXTERNAL)) return null;
+  return report;
+}
+function claimFolder(env) {
+  const root = stateRoot(env);
+  if (!root) return null;
+  const dir = join6(root, "telemetry");
+  try {
+    mkdirSync5(dir, { recursive: true, mode: 448 });
+    for (const d of [root, dir]) {
+      const st = lstatSync6(d);
+      if (!st.isDirectory() || st.isSymbolicLink() || process.getuid !== void 0 && st.uid !== process.getuid()) return null;
+    }
+    return dir;
+  } catch {
+    return null;
+  }
+}
+function claim(dir, name, text = "") {
+  let fd;
+  try {
+    fd = openSync2(join6(dir, name), "wx", 384);
+    if (text) writeFileSync4(fd, text);
+    return "made";
+  } catch (e) {
+    return e?.code === "EEXIST" ? "exists" : "failed";
+  } finally {
+    if (fd !== void 0) closeSync2(fd);
+  }
+}
+var names = (dir) => {
+  try {
+    return readdirSync5(dir);
+  } catch {
+    return [];
+  }
+};
+function readOwn(dir, name) {
+  try {
+    const st = lstatSync6(join6(dir, name));
+    if (!st.isFile() || st.size > 256 || process.getuid !== void 0 && st.uid !== process.getuid()) return null;
+    return readFileSync5(join6(dir, name), "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+function installId(dir) {
+  const have = readOwn(dir, "install-id");
+  if (have !== null && UUID_V4.test(have)) return have;
+  if (have !== null) rmSync5(join6(dir, "install-id"), { force: true });
+  const made = claim(dir, "install-id", randomUUID());
+  if (made === "failed") return null;
+  const now = readOwn(dir, "install-id");
+  return now !== null && UUID_V4.test(now) ? now : null;
+}
+var NEW_INSTALL_WINDOW_MS = 10 * 6e4;
+function installedBefore(root, nowMs) {
+  const ages = [];
+  try {
+    const st = statSync3(root);
+    if (st.birthtimeMs > 0) ages.push(st.birthtimeMs);
+  } catch {
+  }
+  for (const n of names(root)) {
+    if (n === "telemetry") continue;
+    try {
+      ages.push(statSync3(join6(root, n)).mtimeMs);
+    } catch {
+    }
+  }
+  return ages.some((at) => nowMs - at > NEW_INSTALL_WINDOW_MS);
+}
+var utcDay = (ms) => new Date(ms).toISOString().slice(0, 10);
+async function post(endpoint, message, send, timeoutMs) {
+  const body = JSON.stringify(message);
+  if (Buffer.byteLength(body) > MAX_BODY_BYTES2) return null;
+  const stop = new AbortController();
+  const timer = setTimeout(() => stop.abort(), timeoutMs);
+  try {
+    const answer = await send(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+      signal: stop.signal,
+      // A redirect is never followed: a message goes to the address above or nowhere.
+      redirect: "error"
+    });
+    try {
+      await answer.body?.cancel();
+    } catch {
+    }
+    return answer.status;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function createTelemetry({
+  component,
+  version,
+  env = process.env,
+  fetch: send = globalThis.fetch,
+  now = Date.now,
+  root = PLUGIN_ROOT,
+  platform = process.platform,
+  nodeVersion = process.versions.node,
+  timeoutMs = SEND_TIMEOUT_MS
+} = {}) {
+  const pending = /* @__PURE__ */ new Set();
+  const track = (promise) => {
+    pending.add(promise);
+    promise.finally(() => pending.delete(promise)).catch(() => {
+    });
+    return promise;
+  };
+  const ready2 = () => {
+    const endpoint = telemetryEndpoint(env);
+    if (!endpoint) return "off";
+    if (!VERSION.test(String(version)) || typeof send !== "function") return "off";
+    const dir = claimFolder(env);
+    if (!dir) return "no_state";
+    const until = Number(readOwn(dir, `gone-${version}`));
+    if (Number.isFinite(until) && until > now()) return "gone";
+    if (until) rmSync5(join6(dir, `gone-${version}`), { force: true });
+    return { endpoint, dir };
+  };
+  const gone = (dir) => {
+    rmSync5(join6(dir, `gone-${version}`), { force: true });
+    claim(dir, `gone-${version}`, String(now() + GONE_FOR_MS));
+  };
+  const answerWord = (status2) => status2 === null ? "failed" : status2 === 410 ? "gone" : status2 === 429 ? "limited" : "sent";
+  async function ping() {
+    const at = ready2();
+    if (typeof at === "string") return at;
+    const { endpoint, dir } = at;
+    const mine = `ping-${version}`;
+    const before = names(dir);
+    if (before.includes(mine)) return "already";
+    const id = installId(dir);
+    if (!id) return "no_state";
+    const earlier = before.filter((n) => n.startsWith("ping-") && VERSION.test(n.slice(5))).map((n) => {
+      try {
+        return { name: n, at: statSync3(join6(dir, n)).mtimeMs };
+      } catch {
+        return { name: n, at: 0 };
+      }
+    }).sort((a, b) => b.at - a.at);
+    const hadState = installedBefore(dirname2(dir), now());
+    const message = installPing({ installId: id, version, previousVersion: earlier[0]?.name.slice(5) ?? null, updated: hadState, platform, nodeVersion });
+    if (!message) return "off";
+    const made = claim(dir, mine);
+    if (made !== "made") return made === "exists" ? "already" : "no_state";
+    const status2 = await post(endpoint, message, send, timeoutMs);
+    for (const e of earlier) rmSync5(join6(dir, e.name), { force: true });
+    if (status2 === 410) gone(dir);
+    return answerWord(status2);
+  }
+  async function report(error, { component: part = component, code = null } = {}) {
+    try {
+      if (denied(error)) return "denied";
+      const at = ready2();
+      if (typeof at === "string") return at;
+      const { endpoint, dir } = at;
+      const id = installId(dir);
+      if (!id) return "no_state";
+      const message = errorReport(error, { installId: id, version, component: part, code, root, platform, nodeVersion });
+      if (!message) return "denied";
+      const day = utcDay(now());
+      for (const n of names(dir)) if ((n.startsWith("fault-") || n.startsWith("slot-")) && !n.startsWith(`fault-${day}-`) && !n.startsWith(`slot-${day}-`)) rmSync5(join6(dir, n), { force: true });
+      const fault = claim(dir, `fault-${day}-${version}-${message.fingerprint}`);
+      if (fault !== "made") return fault === "exists" ? "duplicate" : "no_state";
+      let slot = "exists";
+      for (let n = 1; n <= MAX_REPORTS_PER_DAY && slot === "exists"; n++) slot = claim(dir, `slot-${day}-${n}`);
+      if (slot !== "made") return slot === "exists" ? "capped" : "no_state";
+      const status2 = await post(endpoint, message, send, timeoutMs);
+      if (status2 === 410) gone(dir);
+      return answerWord(status2);
+    } catch {
+      return "failed";
+    }
+  }
+  function internalError2(code) {
+    if (!INTERNAL_CODES.includes(code)) return Promise.resolve("denied");
+    const error = new Error(code);
+    error.name = "InternalError";
+    Error.captureStackTrace?.(error, internalError2);
+    return track(report(error, { code }));
+  }
+  return {
+    /** The install ping, when this version has not sent one. */
+    ping: () => track(ping().catch(() => "failed")),
+    /** A fault of the plugin's own. `component` overrides the process's (tool:ci_status); `code` is internalError's. */
+    report: (error, options) => track(report(error, options)),
+    /** One of the plugin's own consistency checks failed. Only the codes in INTERNAL_CODES are sent. */
+    internalError: internalError2,
+    /** Resolves when every send that was started has ended: at most the 2-second limit away. */
+    settle: () => Promise.allSettled([...pending]).then(() => void 0)
+  };
+}
+
 // src/main.ts
-var VERSION = "0.3.16";
+var VERSION2 = "0.4.0";
+var telemetry2 = createTelemetry({ component: "channel", version: VERSION2, fetch: githubFetch(process.env) });
+setTelemetry(telemetry2);
+var ending = false;
+function fatal(error, component = "channel") {
+  if (ending) return;
+  ending = true;
+  void telemetry2.report(error, { component }).finally(() => process.exit(1));
+}
+process.on("uncaughtException", (error) => {
+  log(`uncaught: ${error?.message ?? "an error with no message"}`);
+  fatal(error);
+});
+process.on("unhandledRejection", (error) => {
+  log(`unhandled: ${error?.message ?? "a rejection with no message"}`);
+  fatal(error);
+});
 function firstCallRecorder(projectDir) {
   if (fakeGitHubAllowed(process.env) && !process.env.XDG_STATE_HOME) return null;
   return new FirstCallRecorder(process.env, projectDir);
@@ -4758,7 +5256,7 @@ function serve() {
   const liveEvents = pollsIn(launch);
   eventLog.write("start", {
     launch,
-    version: VERSION,
+    version: VERSION2,
     claude_pid: process.ppid,
     poll_seconds: config.pollSeconds,
     auto_subscribe: config.autoSubscribe,
@@ -4768,9 +5266,15 @@ function serve() {
     input: process.stdin,
     output: process.stdout,
     name: "runners-io",
-    version: VERSION,
+    version: VERSION2,
     instructions: INSTRUCTIONS,
     tools: makeTools({ subs, gh, readScope, eventLog, liveEvents, scopes, parents }),
+    // A tool that threw instead of answering, or a message that could not be answered: the client has been told; this
+    // reports it as the channel's own fault. The tool's name is sent only when it is one of the channel's own.
+    onFault: (error, tool) => {
+      const component = tool === null ? "channel:mcp" : TOOL_NAMES.includes(tool) ? `tool:${tool}` : "tool:unknown";
+      void telemetry2.report(error, { component });
+    },
     onReady: () => {
       if (!liveEvents) {
         if (launch === "off") eventLog.write("channel_inactive", { launch });
@@ -4794,7 +5298,7 @@ function serve() {
       }).catch((error) => {
         log(`the poller stopped: ${error.message}`);
         eventLog.write("stop", { reason: "poller_error", error: error.message });
-        process.exit(1);
+        fatal(error, "channel:poller");
       });
     },
     onClose: () => {
@@ -4804,10 +5308,11 @@ function serve() {
     }
   });
   log(
-    `started ${VERSION}; GitHub API ${config.githubApi}; automatic subscription: ${config.autoSubscribe}; event log: ${config.eventLogDir ?? "off"}`
+    `started ${VERSION2}; GitHub API ${config.githubApi}; automatic subscription: ${config.autoSubscribe}; event log: ${config.eventLogDir ?? "off"}`
   );
   const proxy = proxyNote(process.env, config.githubApi);
   if (proxy) log(proxy);
+  if (launch !== "headless" && needsTunnel(process.env)) void telemetry2.ping();
 }
 async function status() {
   const config = loadConfig();
@@ -4829,10 +5334,11 @@ async function status() {
   }
   const rows = mergeRows(local, live, firstCallRows(readFirstCall(process.env), checks), [channelRow(launch, liveEventsBlocker(process.env)?.provider ?? null)]);
   process.stdout.write(
-    `runners-io-channel ${VERSION}
+    `runners-io-channel ${VERSION2}
 ${login}
 repository: ${scope.repo ?? "none"}, branch: ${scope.branch ?? "none"}, pull request: ${pr}
 automatic subscription: ${config.autoSubscribe}, every ${config.pollSeconds} s; event log: ${config.eventLogDir ?? "off"}
+${telemetryLine(process.env)}
 setup checks (/runners-io:doctor):
 ${renderTable(rows)}
 `
@@ -4849,19 +5355,26 @@ async function main2(argv) {
       return;
     case "--version":
     case "version":
-      process.stdout.write(`${VERSION}
+      process.stdout.write(`${VERSION2}
 `);
       return;
+    case "telemetry-test": {
+      const word = await telemetry2.internalError("telemetry_self_test");
+      process.stdout.write(`${telemetryLine(process.env)}
+test report: ${word}
+`);
+      return;
+    }
     default:
-      process.stderr.write(`unknown command: ${command}. Commands: status, version.
+      process.stderr.write(`unknown command: ${command}. Commands: status, version, telemetry-test.
 `);
       process.exit(64);
   }
 }
 main2(process.argv.slice(2)).catch((error) => {
   log(error.message);
-  process.exit(1);
+  fatal(error);
 });
 export {
-  VERSION
+  VERSION2 as VERSION
 };

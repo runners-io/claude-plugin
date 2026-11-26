@@ -5,6 +5,9 @@
 //     setup checks). A machine that is ready adds nothing. RUNNERS_IO_NO_SETUP_CHECKS=1 turns the offers off;
 //   - when this session was launched without the runners-io channel flag, tell the user how to relaunch it with
 //     live CI events on;
+//   - once after an install, and once more when the plugin's version changes, tell runners.io that this version is
+//     installed (telemetry.mjs: the install ping, what it holds and how it is turned off). Sent while the checks
+//     run, with a 2-second limit, and never again whether or not it arrived;
 //   - when the user has no `claude-gh` command, have Claude offer to set it up. A no is recorded (claude-gh.mjs
 //     decline) and the offer is not made again for 7 days, then once more. RUNNERS_IO_NO_CLAUDE_GH_OFFER=1 turns
 //     the offer off for good.
@@ -26,6 +29,7 @@ import { fileURLToPath } from "node:url";
 import { claudeGhForOffer } from "../skills/setup-github/claude-gh.mjs";
 import { SESSION_ID, channelFlags, findLaunch, relaunchSentence, shellWord } from "./launch.mjs";
 import { liveEventsBlocker, setupFor } from "./readiness.mjs";
+import { needsTunnel, runHook } from "./telemetry.mjs";
 
 const LAUNCHES = new Set(["startup", "resume", "fork"]);
 
@@ -121,8 +125,13 @@ function within(ms, promise) {
  * not a launch with a person at it. The claude-gh question and the setup checks run side by side; either failing
  * or running out of time leaves the other's answer standing.
  */
-export async function hookOutput(input, { env = process.env, launch = findLaunch(process.ppid), platform = process.platform, claudeGhFor = claudeGhForOffer, setup = setupFor, setupLimitMs = SETUP_LIMIT_MS } = {}) {
+export async function hookOutput(input, { env = process.env, launch = findLaunch(process.ppid), platform = process.platform, claudeGhFor = claudeGhForOffer, setup = setupFor, setupLimitMs = SETUP_LIMIT_MS, telemetry = null } = {}) {
   if (!isLaunch(input, launch)) return null;
+  // The install ping: only at a launch with a person at it (a script's headless runs are not installs), started before
+  // the checks so that it reads the state folder as the last launch left it, and sent while they run. Nothing here
+  // waits for it: whoever runs the hook gives it its 2 seconds once the hook's answer is written (runHook). Behind a
+  // company proxy that only the channel can go through, the channel sends it instead.
+  if (telemetry && !needsTunnel(env)) void telemetry.ping();
   const [claudeGh, found] = await Promise.all([
     Promise.resolve()
       .then(() => claudeGhFor(env))
@@ -144,18 +153,20 @@ function readStdin() {
   });
 }
 
-async function main() {
+async function main(telemetry) {
   let input;
   try {
     input = JSON.parse(await readStdin());
   } catch {
     return;
   }
-  const out = await hookOutput(input);
+  const out = await hookOutput(input, { telemetry });
   if (out) process.stdout.write(`${JSON.stringify(out)}\n`);
 }
 
 const invoked = process.argv[1] ? realpathSync(process.argv[1]) : "";
 if (invoked === realpathSync(fileURLToPath(import.meta.url))) {
-  main().catch(() => {}).finally(() => process.exit(0));
+  // Ends with status 0 whatever happened. A failure nothing caught is reported as the plugin's own fault first, unless
+  // it is the machine's (telemetry.mjs: the deny-list).
+  void runHook("hook:session-start", main);
 }

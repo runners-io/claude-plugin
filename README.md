@@ -7,8 +7,10 @@ read the failed job's log and fix it without being asked to go and look.
 The plugin bundles four things:
 
 - **A CI channel**: a small local process that reads your pull requests' CI **from GitHub, with your own GitHub login**,
-  and pushes each change into the session. It needs no runners.io account, works for any repository that uses GitHub
-  Actions, and sends nothing to runners.io. Channels are a Claude Code
+  and pushes each change into the session. It needs no runners.io account and works for any repository that uses GitHub
+  Actions. From version 0.4.0 the plugin sends runners.io two kinds of message and nothing else: one when it is
+  installed or updated, and one when the plugin's own code fails
+  ([what is sent](#what-is-sent-and-what-is-never-sent); `RUNNERS_IO_TELEMETRY=off` turns both off). Channels are a Claude Code
   [research preview](https://code.claude.com/docs/en/channels.md#research-preview), and this channel is in research
   preview too.
 - **Tools to choose what to watch**, per session: `subscribe`, `unsubscribe`, `list_subscriptions`, `ci_status`, `mute` and `unmute`.
@@ -34,11 +36,11 @@ in to github.com. If you don't have `gh`, the plugin's `setup-github` skill walk
 your agreement, and you sign in with `! gh auth login --web --scopes repo`.
 
 ```bash
-claude plugin marketplace add runners-io/claude-plugin#v0.3.16
+claude plugin marketplace add runners-io/claude-plugin#v0.4.0
 claude plugin install runners-io@runners-io
 ```
 
-This installs exactly one release: every release has a new version and a tag of its own (`v0.3.16` is this one), and
+This installs exactly one release: every release has a new version and a tag of its own (`v0.4.0` is this one), and
 the `#` and tag pin the marketplace to it. We do not move a release tag once it is published, so updating that
 marketplace never takes you past the release you chose. To move to a newer release, run
 `claude plugin marketplace remove runners-io` (which uninstalls the plugin), then the two commands above with the newer
@@ -66,7 +68,7 @@ Or from inside a session: `/plugin marketplace add runners-io/claude-plugin`, th
 To install from a copy you have checked out and read yourself:
 
 ```bash
-git clone --branch v0.3.16 --depth 1 https://github.com/runners-io/claude-plugin.git
+git clone --branch v0.4.0 --depth 1 https://github.com/runners-io/claude-plugin.git
 claude plugin marketplace add ./claude-plugin
 claude plugin install runners-io@runners-io
 ```
@@ -457,7 +459,40 @@ repository itself, to see that GitHub shows it to your login and whether it is a
 With `HTTPS_PROXY` set, these requests go to GitHub through your proxy's `CONNECT` tunnel
 ([Behind a company proxy](#behind-a-company-proxy)): the proxy learns the host and carries encrypted bytes.
 
-**To runners.io, by the channel:** nothing.
+**To runners.io, by the plugin itself (from version 0.4.0):** two kinds of message, and nothing else. Both go to
+`https://www.runners.io/api/plugin/telemetry`, each is under 1 KB, and each is sent once with a 2-second limit: a
+message that does not arrive is dropped, never sent again, and never slows or breaks the session.
+
+- **An install ping**, once after the plugin is installed and once more when its version changes. It holds `kind`
+  (`install` or `update`), `install_id` (a random UUID the plugin makes on your machine, which is tied to nothing: not
+  to you, your machine, your GitHub account or a runners.io account), `version`, `previous_version` (the version it
+  replaced, when there was one), `os` (for example `darwin`) and `node_major` (the major version of Node.js it runs
+  on). It is sent from the launch hook, at a launch with a person at it, never in a headless run (`claude -p`).
+- **A report when the plugin's own code fails.** It holds the same `install_id`, `version`, `os` and `node_major`, and:
+  `component` (which part of the plugin failed, for example `channel`, `hook:session-start` or `tool:ci_status`),
+  `error_name` (the kind of error, for example `TypeError`), `fingerprint` (16 characters that identify the fault),
+  `frames` (up to 8 lines naming a function and a line in the plugin's own files, such as
+  `holdScope runners-io-channel.mjs:2213:19`; a line outside the plugin's files is written `<external>`), and `code`
+  (a short code, when one of the plugin's own checks failed). At most one report per fault per version per day, and at
+  most 5 a day from one install.
+
+It never sends the error's message, a file path, your username, your machine's name, the folder you are working in,
+the name or number of any repository, branch or pull request, a GitHub login, a token, an environment variable, or
+anything from the [event log](#the-event-log). A failure that is not the plugin's own is not reported at all: GitHub
+refusing a request, a network or proxy error, a problem with git, with the GitHub CLI or with files on your machine.
+Your IP address reaches runners.io with the message, as it does with any request; the
+[privacy policy](https://www.runners.io/privacy) says what is kept and for how long. There is no Sentry key, or any
+other key, in the plugin. With `HTTPS_PROXY` set, the channel sends its messages through your proxy as it sends its
+GitHub requests; a hook cannot, so behind such a proxy the channel sends the install ping and a hook's own fault is not
+reported.
+
+**To turn both off**, set `RUNNERS_IO_TELEMETRY=off` or `DO_NOT_TRACK=1` in the environment Claude Code runs in: in
+the shell you start it from, or in the `env` block of Claude Code's `settings.json`, which reaches the plugin too. The
+plugin then sends runners.io nothing, makes no install ID, and everything else it does carries on unchanged. It also
+stays silent when it finds Claude Code's own `DISABLE_TELEMETRY` or `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` set in
+its environment. The doctor (`/runners-io:doctor`) says whether telemetry is on, and which setting turned it off.
+`node channel/dist/runners-io-channel.mjs telemetry-test` sends one report of a fault made on purpose, and says whether
+it was sent, for anybody who wants to see one.
 
 **To runners.io, by the MCP server the plugin also installs (`https://mcp.runners.io/mcp`):** Claude Code connects to
 it when a session starts, in every session, whether or not you use runners.io. Before you sign in, that connection
@@ -560,6 +595,7 @@ These are read from the environment you start Claude Code from. None is needed.
 | `RUNNERS_IO_POLL_SECONDS` | `20` | seconds between looks at a pull request whose CI is running, 5 to 300; the slower looks are never shorter than this |
 | `RUNNERS_IO_RATE_FLOOR` | `200` | below this many GitHub requests left in the hour, look four times less often (on top of the backoff at 30% and 15% left). Raise it when the same `gh` login also drives other tools |
 | `RUNNERS_IO_EVENT_LOG_DIR` | off | an absolute directory for the event log (below) |
+| `RUNNERS_IO_TELEMETRY` | on | `off`: the plugin sends runners.io nothing: no install ping and no report of its own faults ([what is sent](#what-is-sent-and-what-is-never-sent)). `DO_NOT_TRACK=1` does the same |
 | `https_proxy`, `HTTPS_PROXY` | unset | the `http://` or `https://` proxy the channel reaches GitHub through ([Behind a company proxy](#behind-a-company-proxy)); the lower-case name is read first |
 | `no_proxy`, `NO_PROXY` | unset | hosts asked directly, past the proxy |
 

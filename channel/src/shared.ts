@@ -26,6 +26,7 @@
  * Anything that goes wrong with it is not an outage: the session falls back to asking GitHub itself, as it did
  * before the store existed.
  */
+import { machineError } from "./errors.ts";
 import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -104,8 +105,8 @@ export class SharedStore {
   /** Throws unless `dir` is a real folder (not a symlink) owned by this user. */
   private mustBeMine(dir: string): void {
     const s = lstatSync(dir);
-    if (s.isSymbolicLink() || !s.isDirectory()) throw new Error(`${dir} is not a plain folder`);
-    if (this.uid !== undefined && s.uid !== this.uid) throw new Error(`${dir} belongs to another user`);
+    if (s.isSymbolicLink() || !s.isDirectory()) throw machineError(`${dir} is not a plain folder`);
+    if (this.uid !== undefined && s.uid !== this.uid) throw machineError(`${dir} belongs to another user`);
   }
 
   /** Deletes the other logins' folders (and any old format's) in which nothing has been written for a day. */

@@ -5,7 +5,7 @@ export interface FakeGitHub {
     rateLimited: null | { resetEpoch: number };
     secondaryLimited: boolean;
     scopes: string | null;
-    failNext: { pattern: RegExp; status: number; count: number }[];
+    failNext: { pattern: RegExp; status: number; count: number; headers?: Record<string, string>; body?: unknown }[];
     repos: Map<string, Record<string, unknown>>;
   };
   readonly requests: { path: string; status: number }[];

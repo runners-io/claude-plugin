@@ -31,6 +31,7 @@ import { isIP } from "node:net";
 import type { Duplex } from "node:stream";
 import { connect as tlsConnect } from "node:tls";
 
+import { machineError } from "./errors.ts";
 import { type Proxy, nodeProxiesItself, proxyFor, proxyVariable } from "../../hooks/proxy.mjs";
 
 type Env = Record<string, string | undefined>;
@@ -110,7 +111,7 @@ function openTunnel(proxy: Proxy, authority: string, signal: AbortSignal | undef
     req.once("connect", (res, socket, head) => {
       if (res.statusCode !== 200) {
         socket.destroy();
-        return settle(() => reject(new Error(`the proxy ${proxy.display} answered HTTP ${res.statusCode} to CONNECT`)));
+        return settle(() => reject(machineError(`the proxy ${proxy.display} answered HTTP ${res.statusCode} to CONNECT`)));
       }
       // The CONNECT's own time limit ends here: from now on the request's limit (the caller's signal) is the only one.
       socket.setTimeout(0);
@@ -124,13 +125,13 @@ function openTunnel(proxy: Proxy, authority: string, signal: AbortSignal | undef
     req.once("response", (res) => {
       res.resume();
       req.destroy();
-      settle(() => reject(new Error(`the proxy ${proxy.display} answered HTTP ${res.statusCode} to CONNECT`)));
+      settle(() => reject(machineError(`the proxy ${proxy.display} answered HTTP ${res.statusCode} to CONNECT`)));
     });
     req.once("timeout", () => {
       req.destroy();
-      settle(() => reject(new Error(`the proxy ${proxy.display} did not answer in time`)));
+      settle(() => reject(machineError(`the proxy ${proxy.display} did not answer in time`)));
     });
-    req.once("error", (error) => settle(() => reject(new Error(`the proxy ${proxy.display} could not be reached (${why(error)})`, { cause: error }))));
+    req.once("error", (error) => settle(() => reject(machineError(`the proxy ${proxy.display} could not be reached (${why(error)})`, { cause: error }))));
     req.end();
   });
 }
@@ -178,7 +179,7 @@ async function throughProxy(proxy: Proxy, url: URL, init: Init): Promise<Respons
       // The caller's limit ran out: its own reason (a TimeoutError), as fetch gives it.
       if (signal?.aborted) return reject(signal.reason);
       // As fetch reports a failed connection: Node's own error is the cause, where a certificate's code is read.
-      reject(error instanceof TypeError ? error : new Error(`GitHub through the proxy ${proxy.display}: ${why(error)}`, { cause: error }));
+      reject(error instanceof TypeError ? error : machineError(`GitHub through the proxy ${proxy.display}: ${why(error)}`, { cause: error }));
     };
     const onAbort = () => {
       req.destroy();
@@ -202,7 +203,8 @@ async function throughProxy(proxy: Proxy, url: URL, init: Init): Promise<Respons
       if (REDIRECTS.has(status) && init.redirect !== "manual") {
         res.resume();
         req.destroy();
-        return fail(new TypeError(`GitHub answered a redirect (HTTP ${status}), which is never followed: the token stays with the address it was read for`));
+        // It carries the status, as an HTTP answer does: an answer of GitHub's is never a fault of the plugin's.
+        return fail(Object.assign(new TypeError(`GitHub answered a redirect (HTTP ${status}), which is never followed: the token stays with the address it was read for`), { status }));
       }
       const chunks: Buffer[] = [];
       let size = 0;
@@ -210,7 +212,7 @@ async function throughProxy(proxy: Proxy, url: URL, init: Init): Promise<Respons
         size += chunk.length;
         if (size > MAX_BODY_BYTES) {
           req.destroy();
-          return fail(new Error("the answer is larger than the channel reads"));
+          return fail(machineError("the answer is larger than the channel reads"));
         }
         chunks.push(chunk);
       });

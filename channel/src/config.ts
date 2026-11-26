@@ -4,6 +4,7 @@
  * secret: the GitHub token is read from `gh auth token` at run time and kept
  * in memory (github.ts), never in argv, env set by the plugin, or a file.
  */
+import { machineError } from "./errors.ts";
 import { isAbsolute } from "node:path";
 
 export type AutoSubscribe = "pr" | "off";
@@ -55,14 +56,14 @@ export function checkTokenUrl(raw: string, what: string, env: Env = process.env)
   try {
     url = new URL(raw);
   } catch {
-    throw new Error(`${what} is not a URL: ${raw}`);
+    throw machineError(`${what} is not a URL: ${raw}`);
   }
   if (isLoopback(url.hostname)) {
     if (fakeGitHubAllowed(env) && (url.protocol === "https:" || url.protocol === "http:")) return raw.replace(/\/+$/, "");
-    throw new Error(`${what} may name this machine only in the plugin's own tests (RUNNERS_IO_TEST_FAKE_GITHUB=1): ${raw}`);
+    throw machineError(`${what} may name this machine only in the plugin's own tests (RUNNERS_IO_TEST_FAKE_GITHUB=1): ${raw}`);
   }
   if (url.protocol === "https:") return raw.replace(/\/+$/, "");
-  throw new Error(`${what} must be https: ${raw}`);
+  throw machineError(`${what} must be https: ${raw}`);
 }
 
 function parseAuto(raw: string | undefined): AutoSubscribe {

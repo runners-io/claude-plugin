@@ -55,6 +55,11 @@ export interface McpOptions {
   readonly onClose: () => void;
   /** The subscribe tools. Absent: the server declares no tools at all. */
   readonly tools?: ToolHost;
+  /**
+   * Told when a tool threw instead of answering, and when a message could not be handled or answered at all (`tool`
+   * null). The client is answered as before; this is where the channel reports a fault of its own (main.ts).
+   */
+  readonly onFault?: (error: unknown, tool: string | null) => void;
 }
 
 export interface McpServer {
@@ -114,6 +119,7 @@ export function startMcp(opts: McpOptions): McpServer {
           result = await opts.tools.call(name, args);
         } catch (error) {
           log(`tool ${name}: ${(error as Error).message}`);
+          opts.onFault?.(error, name);
           result = { text: `the ${name} tool failed: ${(error as Error).message}`, isError: true };
         }
         await reply(id, { content: [{ type: "text", text: result.text }], isError: result.isError === true });
@@ -135,6 +141,11 @@ export function startMcp(opts: McpOptions): McpServer {
     }
   };
 
+  const unhandled = (e: unknown) => {
+    log(`mcp: ${(e as Error).message}`);
+    opts.onFault?.(e, null);
+  };
+
   const lines = createInterface({ input: opts.input, crlfDelay: Number.POSITIVE_INFINITY });
   lines.on("line", (line) => {
     if (!line.trim()) return;
@@ -146,9 +157,9 @@ export function startMcp(opts: McpOptions): McpServer {
       return;
     }
     if (Array.isArray(msg)) {
-      for (const m of msg) void handle(m as Record<string, unknown>).catch((e) => log(`mcp: ${(e as Error).message}`));
+      for (const m of msg) void handle(m as Record<string, unknown>).catch(unhandled);
     } else if (msg && typeof msg === "object") {
-      void handle(msg as Record<string, unknown>).catch((e) => log(`mcp: ${(e as Error).message}`));
+      void handle(msg as Record<string, unknown>).catch(unhandled);
     }
   });
   lines.on("close", () => opts.onClose());

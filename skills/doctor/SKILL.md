@@ -14,7 +14,7 @@ Run this with the Bash tool, in the session's folder. This skill's base director
 node "<this skill's base directory>/../../channel/dist/runners-io-channel.mjs" status
 ```
 
-It reads the GitHub login the way the channel does, asks GitHub once whether it shows the folder's repository to that login (and once for the branch's open pull request; in a fork, once more, of the repository it was forked from, where a fork's pull request usually lives), and prints the login, the repository, the branch, the pull request, and then the checks. It sends nothing to runners.io and prints no token.
+It reads the GitHub login the way the channel does, asks GitHub once whether it shows the folder's repository to that login (and once for the branch's open pull request; in a fork, once more, of the repository it was forked from, where a fork's pull request usually lives), and prints the login, the repository, the branch, the pull request, and then the checks. One line says whether telemetry is on (the install ping and reports of the plugin's own faults: the README's "What is sent"), and when it is off, which setting turned it off. The command itself sends nothing to runners.io unless its own code fails, and prints no token and no install ID.
 
 Three lines are usually `ready` and say more in brackets when there is something to know:
 

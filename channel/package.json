@@ -1,6 +1,6 @@
 {
   "name": "runners-io-claude-channel",
-  "version": "0.3.16",
+  "version": "0.4.0",
   "private": true,
   "description": "The runners.io CI channel for Claude Code: a stdio MCP server that reads pull requests' CI from GitHub with the user's own login and pushes changes into the session.",
   "license": "MIT",
@@ -11,7 +11,7 @@
   "scripts": {
     "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node20 --legal-comments=none --banner:js='#!/usr/bin/env node' --outfile=dist/runners-io-channel.mjs",
     "typecheck": "tsc --noEmit -p .",
-    "test": "node --test test/*.test.ts test/*.test.mjs"
+    "test": "node --test --test-timeout=180000 test/*.test.ts test/*.test.mjs"
   },
   "devDependencies": {
     "@types/node": "22.20.5",

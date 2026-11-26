@@ -4,7 +4,7 @@ description: Install the GitHub CLI (gh) and sign it in, so the runners.io CI ch
 
 # Set up GitHub for the runners.io channel
 
-The runners.io CI channel reads your pull requests' CI from GitHub with **your own GitHub login**: the one the GitHub CLI (`gh`) holds. It sends nothing to runners.io. It needs `gh` installed and signed in to github.com. Once both are true, the channel starts watching by itself within about 20 seconds, with no restart.
+The runners.io CI channel reads your pull requests' CI from GitHub with **your own GitHub login**: the one the GitHub CLI (`gh`) holds. Nothing it reads from GitHub is sent to runners.io. It needs `gh` installed and signed in to github.com. Once both are true, the channel starts watching by itself within about 20 seconds, with no restart.
 
 **How you got here.** At every launch the plugin checks what this machine is missing and, when something is, shows the user one line and gives you the fix to offer. That offer is yours to make once, asking first; this skill is how a missing or signed-out `gh` is fixed. `/runners-io:doctor` runs every check and shows each as ready or not: run it after a fix, to confirm the line now reads ready. If the user says no to a fix, record it with the command the launch notice gave you (`node "<the plugin's folder>/hooks/readiness.mjs" decline <check id>`), so it is not offered again for 7 days.
 

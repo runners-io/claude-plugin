@@ -27,6 +27,7 @@
  * Discovery (`discoverRepoPulls`) turns a repository scope into the repository's open pull requests, with one
  * conditional request: an unchanged list is a 304, which GitHub does not count against the hourly limit.
  */
+import { machineError } from "./errors.ts";
 import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -270,10 +271,10 @@ export class ScopeStore {
     // would change the mode of whatever the link points at. Only a folder of our own is tightened, then checked again.
     const before = lstatSync(folder);
     const foreign = this.distrust({ uid: before.uid, mode: 0, isSymbolicLink: () => before.isSymbolicLink() }, "its folder");
-    if (foreign) throw new Error(foreign);
+    if (foreign) throw machineError(foreign);
     chmodSync(folder, 0o700);
     const why = this.distrust(lstatSync(folder), "its folder");
-    if (why) throw new Error(why);
+    if (why) throw machineError(why);
     const doc = `${JSON.stringify({ version: SCOPE_FORMAT, scopes: this.scopes }, null, 2)}\n`;
     // Written beside it and renamed over it, so a reader never sees half a file.
     const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;

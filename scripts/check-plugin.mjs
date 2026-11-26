@@ -3,7 +3,7 @@
 // the names a user types (`plugin:runners-io@runners-io`), the channel bound to
 // a server that exists, the remote MCP address, a bundle that is really there,
 // a bundle that never declares the permission relay and offers only the four
-// subscription tools, a channel that reads GitHub and not runners.io, and both
+// subscription tools, a channel that reads GitHub and names no runners.io API but its telemetry endpoint, and both
 // hooks pointing at scripts that exist and run through the wrapper that says so when there is no Node.js. And one version: every field that names the plugin's version names the
 // same one, and, with --against, a plugin that changed since <git ref> carries a newer version than it had there,
 // because an installed copy is cached by its version and a release that keeps the old one is a release nobody can
@@ -132,8 +132,18 @@ if (existsSync(bundlePath)) {
   check(!/\bimport\s+[^;]*from\s+["'](?!node:)[^"']+["']/.test(bundle), "the bundle imports a package: it must be self-contained");
   for (const tool of ["subscribe", "unsubscribe", "list_subscriptions", "ci_status", "mute", "unmute"]) check(bundle.includes(`"${tool}"`), `the bundle does not offer the ${tool} tool`);
   check(!bundle.includes('"reply"'), "the bundle mentions a reply tool: the channel is one way");
-  // The channel reads GitHub with the user's own login, and calls no runners.io API.
-  check(bundle.includes("api.github.com") && !bundle.includes("authorization_code") && !/runners\.io\/api\//.test(bundle), "the bundle does not read GitHub directly, or calls a runners.io API");
+  // The channel reads GitHub with the user's own login. The one runners.io address it may name is the telemetry
+  // endpoint (hooks/telemetry.mjs: an install ping and reports of the plugin's own faults), written out in full, so
+  // that no other runners.io API, and no address put together at run time, can pass.
+  const TELEMETRY = "https://www.runners.io/api/plugin/telemetry";
+  const apis = bundle.match(/[A-Za-z0-9.:/_-]*runners\.io\/api\/[A-Za-z0-9/_.-]*/g) ?? [];
+  check(bundle.includes("api.github.com") && !bundle.includes("authorization_code"), "the bundle does not read GitHub directly");
+  check(apis.every((a) => a === TELEMETRY), `the bundle names a runners.io API other than its telemetry endpoint: ${[...new Set(apis.filter((a) => a !== TELEMETRY))].join(", ")}`);
+  check(bundle.includes(`TELEMETRY_URL = "${TELEMETRY}"`), "the bundle does not hold the telemetry endpoint as the one constant a message is sent to");
+  // A Sentry key in a public plugin is a key anybody can post events against: reports go to runners.io only.
+  check(!/sentry\.io|@sentry\/|\bdsn\b/i.test(bundle), "the bundle mentions Sentry or a DSN: fault reports go to runners.io's endpoint only");
+  // Each way of turning telemetry off must be in the bundle that is shipped.
+  for (const name of ["RUNNERS_IO_TELEMETRY", "DO_NOT_TRACK", "DISABLE_TELEMETRY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"]) check(bundle.includes(name), `the bundle does not read ${name}, which turns telemetry off`);
   // The doctor skill runs the bundle's `status`, which must print the setup checks.
   check(bundle.includes("setup checks (/runners-io:doctor):"), "the bundle's status command does not print the setup checks");
 }
@@ -153,7 +163,7 @@ if (existsSync(hooksFile)) {
   const wrapper = 'sh "${CLAUDE_PLUGIN_ROOT}/hooks/node.sh" ';
   check(starts.some((c) => c === `${wrapper}session-start "\${CLAUDE_PLUGIN_ROOT}/hooks/session-start.mjs"`), "no SessionStart hook runs hooks/session-start.mjs through hooks/node.sh as session-start");
   check(pr && pr.command === `${wrapper}quiet "\${CLAUDE_PLUGIN_ROOT}/hooks/pr-created.mjs"`, "the PR hook does not run through hooks/node.sh as quiet");
-  for (const name of ["node.sh", "session-start.mjs", "readiness.mjs", "proxy.mjs", "launch.mjs"]) check(existsSync(join(root, "hooks", name)), `hooks/${name} does not exist`);
+  for (const name of ["node.sh", "session-start.mjs", "readiness.mjs", "proxy.mjs", "launch.mjs", "telemetry.mjs"]) check(existsSync(join(root, "hooks", name)), `hooks/${name} does not exist`);
 }
 
 const skills = join(root, "skills");

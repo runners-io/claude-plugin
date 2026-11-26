@@ -258,6 +258,12 @@ const invoked = process.argv[1] ? realpathSync(process.argv[1]) : "";
 if (invoked === realpathSync(fileURLToPath(import.meta.url))) {
   main().then(
     () => process.exit(0),
-    () => process.exit(0),
+    // A failure nothing caught: reported as the plugin's own fault unless it is the machine's (telemetry.mjs), within
+    // its 2 seconds, and then status 0 as always. Loaded only here, so a hook that works never pays for it.
+    (error) =>
+      import("./telemetry.mjs")
+        .then(({ createTelemetry, manifestVersion }) => createTelemetry({ component: "hook:pr-created", version: manifestVersion() }).report(error))
+        .catch(() => {})
+        .finally(() => process.exit(0)),
   );
 }

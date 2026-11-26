@@ -21,6 +21,7 @@
  * - Files older than `keepDays` (default 14) are deleted when the log opens.
  * - Writing never throws: a full or unwritable disk costs the record, never the channel.
  */
+import { machineError } from "./errors.ts";
 import { chmodSync, closeSync, constants, lstatSync, mkdirSync, openSync, readdirSync, unlinkSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
@@ -55,8 +56,8 @@ const APPEND = constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | (co
 /** Throws unless `dir` is a real folder (not a symlink) owned by `uid`. */
 function mustBeMine(dir: string, uid: number | undefined): void {
   const s = lstatSync(dir);
-  if (s.isSymbolicLink() || !s.isDirectory()) throw new Error(`${dir} is not a plain folder`);
-  if (uid !== undefined && s.uid !== uid) throw new Error(`${dir} belongs to another user`);
+  if (s.isSymbolicLink() || !s.isDirectory()) throw machineError(`${dir} is not a plain folder`);
+  if (uid !== undefined && s.uid !== uid) throw machineError(`${dir} belongs to another user`);
 }
 
 export function openEventLog(dir: string, options: EventLogOptions): EventLog {

@@ -19,7 +19,7 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
     rate: { remaining: 4999, limit: 5000, reset: null }, // the x-ratelimit-* headers of every answer (reset: epoch s)
     secondaryLimited: false, // a 403 with no rate-limit headers, only the message
     scopes: "repo, workflow", // x-oauth-scopes; null = a fine-grained token (no header)
-    failNext: [], // [{ pattern: RegExp, status, count }]
+    failNext: [], // [{ pattern: RegExp, status, count, headers?, body? }]
     restReviews: new Map(), // "o/r#n" -> [{ id, state, submitted_at }] (REST pulls/{n}/reviews)
     reviewComments: new Map(), // "o/r#n" -> [{ id, created_at, in_reply_to_id? }] (REST pulls/{n}/comments)
     reviewRequests: { viewer: "octocat", nodes: [] }, // what the review-requested:@me search answers
@@ -53,7 +53,7 @@ export async function startFakeGitHub({ token = "gho_fakeToken123" } = {}) {
     const fail = state.failNext.find((f) => f.count > 0 && f.pattern.test(url.pathname));
     if (fail) {
       fail.count--;
-      return send(req, res, fail.status, { message: "Not Found" });
+      return send(req, res, fail.status, fail.body ?? { message: "Not Found" }, fail.headers ?? {});
     }
     if (state.secondaryLimited) {
       return send(req, res, 403, { message: "You have exceeded a secondary rate limit. Please wait a few minutes before you try again." });

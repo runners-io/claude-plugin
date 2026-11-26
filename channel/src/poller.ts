@@ -36,6 +36,7 @@ import { BASE_EVERY_MS, BASE_IDLE_MS, baseVerdict, latestPerWorkflow } from "./r
 import { type Change, type EventKind, type Snapshot, allDoneChange, carry, diff, needsAttention } from "./state.ts";
 import type { HookRequest } from "./hookrequests.ts";
 import type { OpenPull, Scope, ScopeStore } from "./scopes.ts";
+import { internalError } from "./faults.ts";
 import { AUTO_EVENTS, type Entry, MAX_HOOK_SUBSCRIPTIONS, MAX_SUBSCRIPTIONS, type Subscriptions, wants } from "./subscriptions.ts";
 
 /**
@@ -578,6 +579,10 @@ export async function runPoller(deps: PollerDeps): Promise<void> {
     }
     const held = hold.map((p) => p.number);
     const leftOut = unowned.length - hold.length;
+    // `hold` is cut from `unowned` to fit the room there is: it can be neither longer than it nor than the session's
+    // limit, unless this code is wrong (faults.ts). The holdings are written as they were worked out either way.
+    if (leftOut < 0) internalError("scope_holdings_negative");
+    if (held.length > limits.total) internalError("scope_holdings_over_cap");
     subs.scopeHoldings.set(key, { held, leftOut, more: d.full, problem: null });
     if (leftOut === 0) return { ...d, saidCap: false };
     if (d.saidCap) return d;

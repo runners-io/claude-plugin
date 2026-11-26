@@ -19,6 +19,7 @@ import type { GitHubClient } from "./github.ts";
 import { fetchSnapshot } from "./poller.ts";
 import { DEFAULT_INVOLVES, INVOLVES, type Involves, type ScopeStore, isRepoName } from "./scopes.ts";
 import { EVENT_KINDS, type EventKind, isEventKind } from "./state.ts";
+import { internalError } from "./faults.ts";
 import { AUTO_QUIET_KINDS, type Entry, MAX_MUTES, MAX_SUBSCRIPTIONS, type Mute, type Subscriptions } from "./subscriptions.ts";
 
 export const TOOL_NAMES = ["subscribe", "unsubscribe", "list_subscriptions", "ci_status", "mute", "unmute"] as const;
@@ -418,6 +419,8 @@ export function makeTools(given: Deps): ToolHost {
             }
           }
           let gaveWay = "";
+          const watchedBefore = deps.subs.list().length;
+          const isNew = !deps.subs.get(t.repo, t.pr);
           const room = full && deps.subs.list().length >= MAX_SUBSCRIPTIONS ? deps.subs.oldestScopeEntry() : undefined;
           if (room) {
             deps.subs.remove(room.repo, room.pr);
@@ -430,6 +433,9 @@ export function makeTools(given: Deps): ToolHost {
           // first time (or a hand-over not yet looked at) starts from this read.
           const seen = deps.subs.get(t.repo, t.pr)?.last ?? null;
           deps.subs.add({ repo: t.repo, pr: t.pr, events: events.events, source: "tool", last: seen ?? snap });
+          // A new watch was let in only because there was room, or after a scope gave up a place: so it cannot have
+          // taken the session past the most it watches, unless this code is wrong (faults.ts).
+          if (isNew && deps.subs.list().length > Math.max(MAX_SUBSCRIPTIONS, watchedBefore)) internalError("watch_cap_exceeded");
           // Asked for by name: a mute of the whole pull request no longer holds. Kind and workflow mutes stay.
           const lifted = deps.subs.mutes.remove({ repo: t.repo, pr: t.pr });
           (deps.eventLog ?? NO_EVENT_LOG).write("subscribe", {
